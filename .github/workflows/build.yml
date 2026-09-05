@@ -1,0 +1,20 @@
+name: build-ios
+on:
+  workflow_dispatch:        # 仓库页面手动点 Run workflow 触发
+
+jobs:
+  build:
+    runs-on: macos-14       # 免费 macOS 跑机
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with: { channel: stable }
+      - run: flutter pub get
+      - run: flutter build ios --release --no-codesign   # 先不打签名
+      - name: 打包成 ipa
+        run: |
+          mkdir -p Payload
+          cp -r build/ios/iphoneos/*.app Payload/
+          zip -r app.ipa Payload
+      - uses: actions/upload-artifact@v4
+        with: { name: app-ipa, path: app.ipa }
