@@ -1,0 +1,195 @@
+{"template":"app"}
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_blue_plus: ^1.35.0     # BLE(已适配 iOS CoreBluetooth)
+  camera: ^0.11.0                # 相机预览 + 录像
+  permission_handler: ^11.3.1    # 权限申请
+  gal: ^2.3.0                    # 把视频存进相册
+  <key>NSCameraUsageDescription</key><string>录像需要相机权限</string>
+<key>NSMicrophoneUsageDescription</key><string>录像需要麦克风收音</string>
+<key>NSBluetoothAlwaysUsageDescription</key><string>需要连接手环读取心率</string>
+<key>NSPhotoLibraryAddUsageDescription</key><string>保存录像到相册</string>
+import 'dart:async';
+import 'package:flutter_blue_plus/flutter_blue_plus.dart';
+
+class BleHeartRate {
+  final _hrService = Guid('180D');
+  final _hrChar    = Guid('2A37');
+  BluetoothDevice? _device;
+  StreamSubscription? _sub;
+  int currentBpm = 0;          // 供 UI 读取
+  final _bpmStream = StreamController<int>.broadcast();
+  Stream<int> get bpmStream => _bpmStream.stream;
+
+  Future<void> connect() async {
+    // 1) 扫描(优先按 180D;找不到再退化为按设备名)
+    await FlutterBluePlus.startScan(timeout: const Duration(seconds: 8),
+        withServices: [_hrService]);
+    // 2) 取第一个匹配设备
+    final found = await FlutterBluePlus.scanResults.first;
+    final dev = found.firstWhere((r) => r.device.platformName
+        .contains('Xiaomi'), orElse: () => found.first);
+    _device = dev.device;
+    await FlutterBluePlus.stopScan();
+
+    // 3) 连接并发现服务
+    await _device!.connect(timeout: const Duration(seconds: 15));
+    final services = await _device!.discoverServices();
+    final svc = services.firstWhere((s) => s.uuid == _hrService);
+    final ch = svc.characteristics.firstWhere((c) => c.uuid == _hrChar);
+
+    // 4) 订阅心率通知
+    await ch.setNotifyValue(true);
+    _sub = ch.onValueReceived.listen(_parse);
+  }
+
+  void _parse(List<int> b) {
+    if (b.isEmpty) return;
+    final flags = b[0];
+    final is16 = (flags & 0x01) == 0x01;
+    int bpm = 0;
+    if (is16 && b.length >= 3) { bpm = (b[1]) | (b[2] << 8); }
+    else if (b.length >= 2)     { bpm = b[1]; }
+    if (bpm > 0 && bpm != currentBpm) {
+      currentBpm = bpm;
+      _bpmStream.add(bpm);       // 每次心率(~1Hz)推给 UI
+    }
+  }
+
+  Future<void> disconnect() async {
+    await _sub?.cancel();
+    await _device?.disconnect();
+  }
+}
+import 'dart:io';
+import 'package:camera/camera.dart';
+import 'package:flutter/material.dart';
+import 'package:gal/gal.dart';
+import 'ble_heart_rate.dart';
+
+class CameraPage extends StatefulWidget {
+  final BleHeartRate ble;
+  const CameraPage({super.key, required this.ble});
+  @override
+  State<CameraPage> createState() => _CameraPageState();
+}
+
+class _CameraPageState extends State<CameraPage> {
+  CameraController? _cam;
+  bool _recording = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _initCamera();
+  }
+
+  Future<void> _initCamera() async {
+    final cams = await availableCameras();
+    _cam = CameraController(cams.first, ResolutionPreset.high,
+        enableAudio: true);
+    await _cam!.initialize();
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _toggleRecord() async {
+    if (!_recording) {
+      await _cam!.startVideoRecording();
+    } else {
+      final file = await _cam!.stopVideoRecording();
+      if (await Gal.hasAccess(toAlbum: true)) {
+        await Gal.putVideo(file.path);     // 存进系统相册
+      }
+    }
+    setState(() => _recording = !_recording);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_cam == null || !_cam!.value.isInitialized) {
+      return const Scaffold(body: Center(child: CircularProgressIndicator()));
+    }
+    return Scaffold(
+      body: Stack(children: [
+        Positioned.fill(child: CameraPreview(_cam!)),
+        // ── 心率叠加层:BLE 每次推送都重建这里 ──
+        StreamBuilder<int>(
+          stream: widget.ble.bpmStream,
+          builder: (_, snap) => Positioned(
+            top: 60, right: 20,
+            child: Container(
+              padding: const EdgeInsets.all(10),
+              decoration: BoxDecoration(
+                  color: Colors.black54,
+                  borderRadius: BorderRadius.circular(20)),
+              child: Row(children: [
+                const Icon(Icons.favorite, color: Colors.red),
+                Text(' ${snap.data ?? widget.ble.currentBpm} bpm',
+                    style: const TextStyle(
+                        color: Colors.white, fontSize: 24, bold: false)),
+              ]),
+            ),
+          ),
+        ),
+        // ── 录像按钮 ──
+        Positioned(
+          bottom: 40, left: 0, right: 0,
+          child: Center(child: FloatingActionButton(
+            onPressed: _toggleRecord,
+            child: Icon(_recording ? Icons.stop : Icons.circle),
+          )),
+        ),
+      ]),
+    );
+  }
+}
+import 'package:flutter/material.dart';
+import 'ble_heart_rate.dart';
+import 'camera_page.dart';
+
+void main() => runApp(const MyApp());
+
+class MyApp extends StatelessWidget {
+  const MyApp({super.key});
+  @override
+  Widget build(BuildContext context) => MaterialApp(
+        home: const HomePage(), debugShowCheckedModeBanner: false);
+}
+
+class HomePage extends StatefulWidget {
+  const HomePage({super.key});
+  @override
+  State<HomePage> createState() => _HomePageState();
+}
+
+class _HomePageState extends State<HomePage> {
+  final ble = BleHeartRate();
+  String status = '未连接';
+
+  @override
+  void initState() { super.initState(); _start(); }
+
+  Future<void> _start() async {
+    setState(() => status = '正在连接手环…');
+    try {
+      await ble.connect();
+      if (mounted) setState(() => status = '已连接,点击开始录像');
+    } catch (e) {
+      if (mounted) setState(() => status = '连接失败:$e');
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+        body: Center(child: Column(mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Text(status, style: const TextStyle(fontSize: 18)),
+            const SizedBox(height: 20),
+            ElevatedButton(
+              onPressed: () => Navigator.push(context,
+                  MaterialPageRoute(builder: (_) => CameraPage(ble: ble))),
+              child: const Text('进入相机'),
+            ),
+          ])));
+}
