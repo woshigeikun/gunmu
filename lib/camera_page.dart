@@ -1072,55 +1072,65 @@ class _CameraPageState extends State<CameraPage> {
       backgroundColor: Colors.black,
       body: Stack(
         children: [
-          // ── 相机预览:固定取景比例(竖屏 3:4 / 横屏 4:3),cover 裁切不变形 ──
+          // ── 相机预览 ──
+          // 竖屏:完整显示相机默认比例(不裁剪,居中,黑边补齐)
+          // 横屏:固定 4:3 取景框,cover 裁切不变形
           if (cam != null && cam.value.isInitialized)
             Positioned.fill(
-              child: LayoutBuilder(
-                builder: (context, cons) {
-                  final sw = cons.maxWidth;
-                  final sh = cons.maxHeight;
-                  // 目标显示比例(宽/高):竖屏 9:16,横屏 4:3
-                  final tA = isLandscape ? 4.0 / 3.0 : 9.0 / 16.0;
-                  double tw, th;
-                  if (sw / sh > tA) {
-                    th = sh;
-                    tw = th * tA;
-                  } else {
-                    tw = sw;
-                    th = tw / tA;
-                  }
-                  // 相机画面自身比例
-                  final a = cam.value.aspectRatio <= 0
-                      ? tA
-                      : cam.value.aspectRatio;
-                  // cover:内部画面不小于取景框,溢出部分裁掉
-                  double iw = th * a, ih = th;
-                  if (iw < tw) {
-                    iw = tw;
-                    ih = tw / a;
-                  }
-                  return Center(
-                    child: SizedBox(
-                      width: tw,
-                      height: th,
-                      child: ClipRect(
-                        child: OverflowBox(
-                          alignment: Alignment.center,
-                          minWidth: iw,
-                          maxWidth: iw,
-                          minHeight: ih,
-                          maxHeight: ih,
+              child: isLandscape
+                  ? LayoutBuilder(
+                      builder: (context, cons) {
+                        final sw = cons.maxWidth;
+                        final sh = cons.maxHeight;
+                        // 横屏目标比例 4:3(宽/高)
+                        const tA = 4.0 / 3.0;
+                        double tw, th;
+                        if (sw / sh > tA) {
+                          th = sh;
+                          tw = th * tA;
+                        } else {
+                          tw = sw;
+                          th = tw / tA;
+                        }
+                        final a = cam.value.aspectRatio <= 0
+                            ? tA
+                            : cam.value.aspectRatio;
+                        double iw = th * a, ih = th;
+                        if (iw < tw) {
+                          iw = tw;
+                          ih = tw / a;
+                        }
+                        return Center(
                           child: SizedBox(
-                            width: iw,
-                            height: ih,
-                            child: CameraPreview(cam),
+                            width: tw,
+                            height: th,
+                            child: ClipRect(
+                              child: OverflowBox(
+                                alignment: Alignment.center,
+                                minWidth: iw,
+                                maxWidth: iw,
+                                minHeight: ih,
+                                maxHeight: ih,
+                                child: SizedBox(
+                                  width: iw,
+                                  height: ih,
+                                  child: CameraPreview(cam),
+                                ),
+                              ),
+                            ),
                           ),
-                        ),
+                        );
+                      },
+                    )
+                  // 竖屏:相机原始比例完整显示(默认比例)
+                  : Center(
+                      child: AspectRatio(
+                        aspectRatio: cam.value.aspectRatio <= 0
+                            ? 9.0 / 16.0
+                            : cam.value.aspectRatio,
+                        child: CameraPreview(cam),
                       ),
                     ),
-                  );
-                },
-              ),
             )
           else
             const Center(child: CircularProgressIndicator()),
