@@ -1083,25 +1083,30 @@ class _CameraPageState extends State<CameraPage> {
                   final sh = cons.maxHeight;
 
                   if (!isLandscape) {
-                    // 竖屏:9:16 全屏为显示框,相机画面 0 度 cover 填满
+                    // ── 竖屏:标准 9:16 取景框(宽:高=9:16),画面 cover 填满 ──
                     final a = cam.value.aspectRatio <= 0
                         ? 9.0 / 16.0
                         : cam.value.aspectRatio;
-                    final tRatio = sw / sh; // 屏幕比例(约9:16或更细长)
-                    double iw, ih;
-                    if (a > tRatio) {
-                      // 画面更宽:按高度填满,宽度超出裁左右
-                      ih = sh;
-                      iw = ih * a;
+                    // 在屏幕内取最大的 9:16 框
+                    const tA = 9.0 / 16.0; // 宽:高
+                    double tw, th;
+                    if (sw / sh > tA) {
+                      th = sh;
+                      tw = th * tA;
                     } else {
-                      // 画面更高/相近:按宽度填满,高度超出裁上下
-                      iw = sw;
-                      ih = iw / a;
+                      tw = sw;
+                      th = tw / tA;
+                    }
+                    // 相机画面 cover 填满该 9:16 框(不变形,裁掉多余)
+                    double iw = th * a, ih = th;
+                    if (iw < tw) {
+                      iw = tw;
+                      ih = tw / a;
                     }
                     return Center(
                       child: SizedBox(
-                        width: sw,
-                        height: sh,
+                        width: tw,
+                        height: th,
                         child: ClipRect(
                           child: OverflowBox(
                             alignment: Alignment.center,
