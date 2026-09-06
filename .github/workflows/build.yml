@@ -4,25 +4,21 @@ on:
 
 jobs:
   build:
-    runs-on: macos-14       # 免费 macOS 跑机
+    runs-on: macos-15       # 最新 macOS 镜像,自带最新 Xcode(26)
     steps:
       - uses: actions/checkout@v4
       - uses: subosito/flutter-action@v2
         with: { channel: stable }
 
-      # camera 插件在最新 Xcode 上编译失败(旧通知常量被移除,flutter issue 185031)
-      # 切到一个较旧的 Xcode 版本(版本号最低的那个)来规避。
-      - name: 选择兼容的 Xcode 版本
+      # camera_avfoundation 0.10.x 使用新版 AVCaptureSession 静态成员(如
+      # .wasInterruptedNotification),必须用最新 Xcode 编译(见 flutter issue 185031)。
+      # macos-15 镜像里可能有多个 Xcode,这里显式切到版本号最高的那个。
+      - name: 使用最新版 Xcode
         run: |
           echo "可用的 Xcode:"
           ls -d /Applications/Xcode*.app 2>/dev/null || true
-          # 优先用 Xcode 15.x(保留 AVCaptureSession 旧通知常量)
-          XCODE=$(ls -d /Applications/Xcode*.app 2>/dev/null | grep -E 'Xcode_15\.' | head -1)
-          if [ -z "$XCODE" ]; then
-            # 找不到 15.x 就退回版本号最低的(越旧越可能兼容)
-            XCODE=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | head -1)
-          fi
-          echo "切换到: $XCODE"
+          XCODE=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1)
+          echo "切换到(最新): $XCODE"
           sudo xcode-select -s "$XCODE"
           echo "--- 当前 Xcode 版本 ---"
           xcodebuild -version
