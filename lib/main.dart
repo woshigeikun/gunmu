@@ -31,7 +31,7 @@ class _HeartRateCameraAppState extends State<HeartRateCameraApp> {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: '心率录像',
+      title: '心率相机',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(colorSchemeSeed: Colors.red, useMaterial3: true),
       // 启动直接进入相机界面;手环连接改为相机页内的半页面板

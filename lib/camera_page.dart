@@ -395,7 +395,10 @@ class _CameraPageState extends State<CameraPage> {
                       ),
                       selected: sel,
                       selectedColor: Colors.white,
-                      backgroundColor: Colors.white10,
+                      backgroundColor: Colors.black,
+                      side: BorderSide(
+                        color: sel ? Colors.white : Colors.white24,
+                      ),
                       onSelected: (_) async {
                         Navigator.pop(ctx);
                         if (i != _camIndex) {
@@ -420,8 +423,8 @@ class _CameraPageState extends State<CameraPage> {
                     final ok = p.$1 >= minZ - 0.01 && p.$1 <= maxZ + 0.01;
                     final active = (_zoom - p.$1).abs() < 0.01;
                     final color = !ok
-                        ? Colors.white12
-                        : (active ? Colors.redAccent : Colors.white24);
+                        ? Colors.black26
+                        : (active ? Colors.redAccent : Colors.black);
                     return InkWell(
                       onTap: ok
                           ? () async {
@@ -441,6 +444,9 @@ class _CameraPageState extends State<CameraPage> {
                         decoration: BoxDecoration(
                           color: color,
                           borderRadius: BorderRadius.circular(10),
+                          border: Border.all(
+                            color: active ? Colors.redAccent : Colors.white24,
+                          ),
                         ),
                         child: Text(
                           p.$2,
@@ -525,7 +531,10 @@ class _CameraPageState extends State<CameraPage> {
                           ),
                           selected: sel,
                           selectedColor: Colors.redAccent,
-                          backgroundColor: Colors.white10,
+                          backgroundColor: Colors.black,
+                          side: BorderSide(
+                            color: sel ? Colors.redAccent : Colors.white24,
+                          ),
                           onSelected: (_) =>
                               setSheetState(() => _quality = q.$1),
                         );
@@ -550,7 +559,10 @@ class _CameraPageState extends State<CameraPage> {
                           ),
                           selected: sel,
                           selectedColor: Colors.redAccent,
-                          backgroundColor: Colors.white10,
+                          backgroundColor: Colors.black,
+                          side: BorderSide(
+                            color: sel ? Colors.redAccent : Colors.white24,
+                          ),
                           onSelected: (_) => setSheetState(() => _fps = f),
                         );
                       }).toList(),
@@ -1045,14 +1057,54 @@ class _CameraPageState extends State<CameraPage> {
       backgroundColor: Colors.black,
       body: Stack(
         children: [
-          // ── 相机预览:保持相机原始比例居中,不拉伸 ──
+          // ── 相机预览:固定取景比例(竖屏 3:4 / 横屏 4:3),cover 裁切不变形 ──
           if (cam != null && cam.value.isInitialized)
             Positioned.fill(
-              child: Center(
-                child: AspectRatio(
-                  aspectRatio: cam.value.aspectRatio,
-                  child: CameraPreview(cam),
-                ),
+              child: LayoutBuilder(
+                builder: (context, cons) {
+                  final sw = cons.maxWidth;
+                  final sh = cons.maxHeight;
+                  // 目标显示比例(宽/高)
+                  final tA = isLandscape ? 4.0 / 3.0 : 3.0 / 4.0;
+                  double tw, th;
+                  if (sw / sh > tA) {
+                    th = sh;
+                    tw = th * tA;
+                  } else {
+                    tw = sw;
+                    th = tw / tA;
+                  }
+                  // 相机画面自身比例
+                  final a = cam.value.aspectRatio <= 0
+                      ? tA
+                      : cam.value.aspectRatio;
+                  // cover:内部画面不小于取景框,溢出部分裁掉
+                  double iw = th * a, ih = th;
+                  if (iw < tw) {
+                    iw = tw;
+                    ih = tw / a;
+                  }
+                  return Center(
+                    child: SizedBox(
+                      width: tw,
+                      height: th,
+                      child: ClipRect(
+                        child: OverflowBox(
+                          alignment: Alignment.center,
+                          minWidth: iw,
+                          maxWidth: iw,
+                          minHeight: ih,
+                          maxHeight: ih,
+                          child: SizedBox(
+                            width: iw,
+                            height: ih,
+                            child: CameraPreview(cam),
+                          ),
+                        ),
+                      ),
+                    ),
+                  );
+                },
               ),
             )
           else
