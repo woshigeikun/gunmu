@@ -6,6 +6,7 @@ import 'package:ffmpeg_kit_flutter_new/ffprobe_kit.dart';
 import 'package:ffmpeg_kit_flutter_new/return_code.dart';
 import 'package:flutter/material.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:share_plus/share_plus.dart';
 
 import 'ble_heart_rate.dart';
 
@@ -115,8 +116,13 @@ class _CameraPageState extends State<CameraPage> {
     }
   }
 
-  /// ① 用 FFmpeg 把心率烧进视频右上角 ② 保存到文件目录
+  /// ① 用 FFmpeg 把心率烧进视频右上角 ② 保存到文件目录 ③ 弹分享面板
   Future<void> _burnAndSave(XFile raw) async {
+    // 分享面板锚点:在首个 await 前从 context 取好,避免跨 async 使用
+    final renderBox = context.findRenderObject() as RenderBox?;
+    final shareOrigin = renderBox != null
+        ? renderBox.localToGlobal(Offset.zero) & renderBox.size
+        : null;
     try {
       // 1) 解析原视频尺寸与时长(字幕坐标需要像素尺寸)
       final info = await FFprobeKit.getMediaInformation(raw.path);
@@ -168,6 +174,16 @@ class _CameraPageState extends State<CameraPage> {
         File(outPath).deleteSync();
         File(raw.path).deleteSync();
       } catch (_) {}
+
+      // 5) 弹出系统分享面板(可"存储视频"到相册/发给微信等)
+      if (mounted) setState(() => _hint = '合成完成,弹出分享…');
+      await SharePlus.instance.share(
+        ShareParams(
+          files: [XFile(saved)],
+          text: '心率录像',
+          sharePositionOrigin: shareOrigin,
+        ),
+      );
       if (mounted) {
         setState(() => _hint = '已保存(带心率),可在"文件"App→本App→录像 查看');
       }

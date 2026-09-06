@@ -37,9 +37,9 @@ dependencies:
   flutter_blue_plus:
   camera:
   permission_handler:
-  gal:
   path_provider:
   ffmpeg_kit_flutter_new:
+  share_plus:
 
 dev_dependencies:
   flutter_test:
