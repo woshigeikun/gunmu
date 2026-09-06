@@ -1073,64 +1073,61 @@ class _CameraPageState extends State<CameraPage> {
       body: Stack(
         children: [
           // ── 相机预览 ──
-          // 竖屏:完整显示相机默认比例(不裁剪,居中,黑边补齐)
+          // 竖屏:系统相机风格 = cover 铺满全屏(放大居中裁切,无黑边)
           // 横屏:固定 4:3 取景框,cover 裁切不变形
           if (cam != null && cam.value.isInitialized)
             Positioned.fill(
-              child: isLandscape
-                  ? LayoutBuilder(
-                      builder: (context, cons) {
-                        final sw = cons.maxWidth;
-                        final sh = cons.maxHeight;
-                        // 横屏目标比例 4:3(宽/高)
-                        const tA = 4.0 / 3.0;
-                        double tw, th;
-                        if (sw / sh > tA) {
-                          th = sh;
-                          tw = th * tA;
-                        } else {
-                          tw = sw;
-                          th = tw / tA;
-                        }
-                        final a = cam.value.aspectRatio <= 0
-                            ? tA
-                            : cam.value.aspectRatio;
-                        double iw = th * a, ih = th;
-                        if (iw < tw) {
-                          iw = tw;
-                          ih = tw / a;
-                        }
-                        return Center(
+              child: LayoutBuilder(
+                builder: (context, cons) {
+                  final sw = cons.maxWidth;
+                  final sh = cons.maxHeight;
+                  // 竖屏目标 = 整个屏幕(cover 全屏);横屏目标 = 4:3 框
+                  final useFull = !isLandscape;
+                  double tw, th;
+                  if (useFull) {
+                    tw = sw;
+                    th = sh;
+                  } else {
+                    const tA = 4.0 / 3.0;
+                    if (sw / sh > tA) {
+                      th = sh;
+                      tw = th * tA;
+                    } else {
+                      tw = sw;
+                      th = tw / tA;
+                    }
+                  }
+                  final a = cam.value.aspectRatio <= 0
+                      ? (useFull ? sw / sh : 4.0 / 3.0)
+                      : cam.value.aspectRatio;
+                  // cover:内部画面不小于显示区,溢出部分裁掉
+                  double iw = th * a, ih = th;
+                  if (iw < tw) {
+                    iw = tw;
+                    ih = tw / a;
+                  }
+                  return Center(
+                    child: SizedBox(
+                      width: tw,
+                      height: th,
+                      child: ClipRect(
+                        child: OverflowBox(
+                          alignment: Alignment.center,
+                          minWidth: iw,
+                          maxWidth: iw,
+                          minHeight: ih,
+                          maxHeight: ih,
                           child: SizedBox(
-                            width: tw,
-                            height: th,
-                            child: ClipRect(
-                              child: OverflowBox(
-                                alignment: Alignment.center,
-                                minWidth: iw,
-                                maxWidth: iw,
-                                minHeight: ih,
-                                maxHeight: ih,
-                                child: SizedBox(
-                                  width: iw,
-                                  height: ih,
-                                  child: CameraPreview(cam),
-                                ),
-                              ),
-                            ),
+                            width: iw,
+                            height: ih,
+                            child: CameraPreview(cam),
                           ),
-                        );
-                      },
-                    )
-                  // 竖屏:相机原始比例完整显示(默认比例)
-                  : Center(
-                      child: AspectRatio(
-                        aspectRatio: cam.value.aspectRatio <= 0
-                            ? 9.0 / 16.0
-                            : cam.value.aspectRatio,
-                        child: CameraPreview(cam),
+                        ),
                       ),
                     ),
+                  );
+                },
+              ),
             )
           else
             const Center(child: CircularProgressIndicator()),
@@ -1342,13 +1339,27 @@ class _CameraPageState extends State<CameraPage> {
                     style: const TextStyle(color: Colors.white70),
                   ),
                   const SizedBox(height: 8),
-                  FloatingActionButton.large(
-                    backgroundColor: _recording ? Colors.red : Colors.white,
-                    onPressed: _toggleRecord,
-                    child: Icon(
-                      _recording ? Icons.stop : Icons.circle,
-                      color: _recording ? Colors.white : Colors.red,
-                      size: 36,
+                  // 拍摄按钮:白圆环包裹内部红圆(录制中:红圆环+内部白圆)
+                  GestureDetector(
+                    onTap: _toggleRecord,
+                    child: Container(
+                      width: 76,
+                      height: 76,
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        color: _recording ? Colors.redAccent : Colors.white,
+                        border: Border.all(color: Colors.white, width: 5),
+                      ),
+                      child: Center(
+                        child: Container(
+                          width: 54,
+                          height: 54,
+                          decoration: BoxDecoration(
+                            shape: BoxShape.circle,
+                            color: _recording ? Colors.white : Colors.redAccent,
+                          ),
+                        ),
+                      ),
                     ),
                   ),
                 ],
