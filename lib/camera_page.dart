@@ -40,8 +40,13 @@ class _CameraPageState extends State<CameraPage> {
   double _zoom = 1.0; // 当前变焦倍数(等效 35mm 主摄按 26mm 起算)
 
   // 录制画质与帧率设置
-  ResolutionPreset _quality = ResolutionPreset.high; // 默认 高清(约720p)
+  // 默认 medium:iPhone 该档输出 4:3 画幅(480p 级别),即"默认预览 4:3"
+  ResolutionPreset _quality = ResolutionPreset.medium;
   int _fps = 30; // 默认 30 帧
+
+  // 手环连接面板状态
+  bool _connecting = false;
+  String _bleStatus = '未连接手环';
 
   /// 画质档位(供设置面板展示)
   static const List<(ResolutionPreset, String, String)> _qualityOptions = [
@@ -67,6 +72,8 @@ class _CameraPageState extends State<CameraPage> {
   final List<_HrSample> _samples = [];
   // 实时心率历史(用于屏幕曲线,最多保留 120 个点)
   final List<int> _history = [];
+  // 当前这段录像开始时手环是否已连接(未连接则整段不带心率 UI)
+  bool _recordHadBle = false;
 
   @override
   void initState() {
@@ -76,7 +83,8 @@ class _CameraPageState extends State<CameraPage> {
     widget.ble.bpmStream.listen((bpm) {
       _history.add(bpm);
       if (_history.length > 120) _history.removeAt(0);
-      if (_recording) {
+      // 仅当"本段录像开始时就已连接"才采样烧录;连接后才录的段照常
+      if (_recording && _recordHadBle) {
         _samples.add(_HrSample(_timer.elapsedMilliseconds, bpm));
       }
       _refresh();
@@ -136,6 +144,189 @@ class _CameraPageState extends State<CameraPage> {
       _camIndex = index;
       _zoom = 1.0; // 切换镜头后变焦回到 1x
     });
+  }
+
+  /// 打开"连接手环"半页面板(自下而上,占屏幕 2/3)
+  Future<void> _showBleSheet() async {
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: const Color(0xFF1C1C1E),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (ctx) {
+        final sheetHeight = MediaQuery.of(ctx).size.height * 2 / 3;
+        return StatefulBuilder(
+          builder: (context2, setSheetState) {
+            final connected = widget.ble.isConnected;
+            return SizedBox(
+              height: sheetHeight,
+              child: SafeArea(
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(24, 20, 24, 20),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Center(
+                        child: Container(
+                          width: 40,
+                          height: 4,
+                          decoration: BoxDecoration(
+                            color: Colors.white24,
+                            borderRadius: BorderRadius.circular(2),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(height: 16),
+                      const Text(
+                        '连接手环',
+                        style: TextStyle(
+                          color: Colors.white,
+                          fontSize: 20,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                      const SizedBox(height: 6),
+                      Text(
+                        '先在小米运动健康 App 中开启手环"心率广播",再连接',
+                        style: TextStyle(color: Colors.white54, fontSize: 12),
+                      ),
+                      const SizedBox(height: 20),
+
+                      // ── 连接状态与按钮 ──
+                      Container(
+                        width: double.infinity,
+                        padding: const EdgeInsets.all(16),
+                        decoration: BoxDecoration(
+                          color: Colors.white10,
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                        child: Column(
+                          children: [
+                            Row(
+                              children: [
+                                Icon(
+                                  connected
+                                      ? Icons.favorite
+                                      : Icons.bluetooth_disabled,
+                                  color: connected
+                                      ? Colors.redAccent
+                                      : Colors.white38,
+                                  size: 28,
+                                ),
+                                const SizedBox(width: 12),
+                                Expanded(
+                                  child: Text(
+                                    connected
+                                        ? '已连接 · 心率 ${widget.ble.currentBpm} bpm'
+                                        : _connecting
+                                        ? '正在扫描手环…(约 12 秒)'
+                                        : _bleStatus,
+                                    style: const TextStyle(
+                                      color: Colors.white,
+                                      fontSize: 15,
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ),
+                            if (connected) ...[
+                              const SizedBox(height: 12),
+                              Text(
+                                '${widget.ble.currentBpm}',
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 56,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                            ],
+                          ],
+                        ),
+                      ),
+
+                      const Spacer(),
+
+                      // 主操作按钮
+                      SizedBox(
+                        width: double.infinity,
+                        child: connected
+                            ? OutlinedButton.icon(
+                                style: OutlinedButton.styleFrom(
+                                  foregroundColor: Colors.white70,
+                                  side: const BorderSide(color: Colors.white24),
+                                ),
+                                onPressed: () async {
+                                  await widget.ble.disconnect();
+                                  setSheetState(() {});
+                                  if (mounted) {
+                                    setState(() {
+                                      _bleStatus = '未连接手环';
+                                      _history.clear();
+                                      _samples.clear();
+                                    });
+                                  }
+                                },
+                                icon: const Icon(Icons.link_off),
+                                label: const Text('断开连接'),
+                              )
+                            : FilledButton.icon(
+                                style: FilledButton.styleFrom(
+                                  backgroundColor: Colors.redAccent,
+                                ),
+                                onPressed: _connecting
+                                    ? null
+                                    : () => _connectBle(setSheetState),
+                                icon: const Icon(Icons.bluetooth_searching),
+                                label: Text(_connecting ? '连接中…' : '连接手环'),
+                              ),
+                      ),
+                      const SizedBox(height: 8),
+                      if (widget.ble.currentBpm > 0 && !connected)
+                        Center(
+                          child: Text(
+                            '上次心率:${widget.ble.currentBpm}',
+                            style: const TextStyle(
+                              color: Colors.white38,
+                              fontSize: 12,
+                            ),
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+
+  /// 执行连接;结果刷新面板与主界面状态
+  Future<void> _connectBle(StateSetter setSheetState) async {
+    setState(() {
+      _connecting = true;
+      _bleStatus = '正在扫描手环…(约 12 秒)';
+    });
+    if (mounted) setSheetState(() {});
+    try {
+      await widget.ble.connect();
+      if (!mounted) return;
+      setState(() {
+        _connecting = false;
+        _bleStatus = '已连接';
+      });
+      setSheetState(() {});
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _connecting = false;
+        _bleStatus = '连接失败,请确认已开启心率广播';
+      });
+      setSheetState(() {});
+    }
   }
 
   /// 打开镜头选择面板:平铺所有摄像头方向与可用变焦档位(含等效 mm)
@@ -421,6 +612,8 @@ class _CameraPageState extends State<CameraPage> {
           ..reset()
           ..start();
         _samples.clear();
+        // 录制开始时刻是否已连手环:决定本段是否显示/烧录心率
+        _recordHadBle = widget.ble.isConnected;
         // 每秒刷新一次界面,让计时数字走动
         _ticker?.cancel();
         _ticker = Timer.periodic(const Duration(seconds: 1), (_) {
@@ -473,6 +666,32 @@ class _CameraPageState extends State<CameraPage> {
     final shareOrigin = renderBox != null
         ? renderBox.localToGlobal(Offset.zero) & renderBox.size
         : null;
+
+    // 本段录像开始时未连接手环 → 无心率数据,直接保存原视频(不烧任何 UI)
+    if (!_recordHadBle) {
+      try {
+        final docs = await getApplicationDocumentsDirectory();
+        final folder = Directory('${docs.path}/录像');
+        if (!folder.existsSync()) folder.createSync(recursive: true);
+        final stamp = DateTime.now().millisecondsSinceEpoch;
+        final saved = '${folder.path}/$stamp.mp4';
+        await raw.saveTo(saved);
+        if (mounted) {
+          setState(() => _hint = '已保存录像(未连接手环,无心率)');
+        }
+        await SharePlus.instance.share(
+          ShareParams(
+            files: [XFile(saved)],
+            text: '录像',
+            sharePositionOrigin: shareOrigin,
+          ),
+        );
+      } catch (e) {
+        if (mounted) setState(() => _hint = '保存失败: $e');
+      }
+      return;
+    }
+
     try {
       // 1) 解析原视频尺寸与时长(字幕坐标需要像素尺寸)
       final info = await FFprobeKit.getMediaInformation(raw.path);
@@ -631,6 +850,7 @@ class _CameraPageState extends State<CameraPage> {
     // 逐条字幕:每条从采样时间点持续到下一个采样点(或视频末尾)
     for (var i = 0; i < eff.length; i++) {
       final s = eff[i];
+      if (s.bpm <= 0) continue; // 跳过无数据点
       final endMs = (i + 1 < eff.length)
           ? eff[i + 1].ms
           : (durationSec * 1000).round();
@@ -639,7 +859,7 @@ class _CameraPageState extends State<CameraPage> {
       if (e <= s.ms) e = s.ms + 800;
       sb.writeln(
         'Dialogue: 0,${_assTime(s.ms / 1000)},${_assTime(e / 1000)},HR,,0,0,0,,'
-        '${s.bpm > 0 ? '♥ ${s.bpm}' : '♥ --'}',
+        '♥ ${s.bpm}',
       );
     }
     File(path).writeAsStringSync(sb.toString());
@@ -825,12 +1045,20 @@ class _CameraPageState extends State<CameraPage> {
       backgroundColor: Colors.black,
       body: Stack(
         children: [
+          // ── 相机预览:保持相机原始比例居中,不拉伸 ──
           if (cam != null && cam.value.isInitialized)
-            Positioned.fill(child: CameraPreview(cam))
+            Positioned.fill(
+              child: Center(
+                child: AspectRatio(
+                  aspectRatio: cam.value.aspectRatio,
+                  child: CameraPreview(cam),
+                ),
+              ),
+            )
           else
             const Center(child: CircularProgressIndicator()),
 
-          // ── 顶部控制排:心率(右) + 镜头(左) + 设置(左) + 焦距 ──
+          // ── 顶部控制排 ──
           Positioned(
             top: topPad,
             left: isLandscape ? 24 : 16,
@@ -839,7 +1067,7 @@ class _CameraPageState extends State<CameraPage> {
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                // 左侧:镜头 + 设置按钮
+                // 左侧:镜头 + 设置按钮(纯黑圆底)
                 Row(
                   crossAxisAlignment: CrossAxisAlignment.center,
                   children: [
@@ -851,8 +1079,8 @@ class _CameraPageState extends State<CameraPage> {
                         size: 26,
                       ),
                       style: IconButton.styleFrom(
-                        backgroundColor: Colors.black38,
-                        disabledBackgroundColor: Colors.black12,
+                        backgroundColor: Colors.black,
+                        disabledBackgroundColor: Colors.black26,
                       ),
                     ),
                     IconButton(
@@ -865,8 +1093,8 @@ class _CameraPageState extends State<CameraPage> {
                         size: 22,
                       ),
                       style: IconButton.styleFrom(
-                        backgroundColor: Colors.black38,
-                        disabledBackgroundColor: Colors.black12,
+                        backgroundColor: Colors.black,
+                        disabledBackgroundColor: Colors.black26,
                       ),
                     ),
                     // 当前等效焦距 + 画质/帧率
@@ -880,7 +1108,7 @@ class _CameraPageState extends State<CameraPage> {
                             style: const TextStyle(
                               color: Colors.white70,
                               fontSize: 11,
-                              backgroundColor: Colors.black38,
+                              backgroundColor: Colors.black,
                             ),
                           ),
                           Text(
@@ -888,7 +1116,7 @@ class _CameraPageState extends State<CameraPage> {
                             style: const TextStyle(
                               color: Colors.white70,
                               fontSize: 11,
-                              backgroundColor: Colors.black38,
+                              backgroundColor: Colors.black,
                             ),
                           ),
                         ],
@@ -897,47 +1125,63 @@ class _CameraPageState extends State<CameraPage> {
                   ],
                 ),
 
-                // 右侧:实时心率数字
-                StreamBuilder<int>(
-                  stream: widget.ble.bpmStream,
-                  initialData: bpmNow,
-                  builder: (context, snap) {
-                    final bpm = snap.data ?? 0;
-                    return Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 14,
-                        vertical: 8,
-                      ),
-                      decoration: BoxDecoration(
-                        color: Colors.black54,
-                        borderRadius: BorderRadius.circular(24),
-                      ),
-                      child: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          const Icon(
-                            Icons.favorite,
-                            color: Colors.red,
-                            size: 22,
+                // 右侧:未连接(或本段无心率)→蓝牙按钮;已连接→实时心率胶囊
+                if (!(_recording ? _recordHadBle : widget.ble.isConnected) ||
+                    !widget.ble.isConnected)
+                  IconButton(
+                    onPressed: _showBleSheet,
+                    icon: const Icon(
+                      Icons.bluetooth_disabled,
+                      color: Colors.white,
+                      size: 24,
+                    ),
+                    style: IconButton.styleFrom(backgroundColor: Colors.black),
+                  )
+                else
+                  StreamBuilder<int>(
+                    stream: widget.ble.bpmStream,
+                    initialData: bpmNow,
+                    builder: (context, snap) {
+                      final bpm = snap.data ?? 0;
+                      return GestureDetector(
+                        onTap: _showBleSheet,
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 14,
+                            vertical: 8,
                           ),
-                          const SizedBox(width: 8),
-                          Text(
-                            '$bpm',
-                            style: const TextStyle(
-                              color: Colors.white,
-                              fontSize: 28,
-                              fontWeight: FontWeight.bold,
-                            ),
+                          decoration: BoxDecoration(
+                            color: Colors.black,
+                            borderRadius: BorderRadius.circular(24),
+                            border: Border.all(color: Colors.white12),
                           ),
-                          const Text(
-                            ' bpm',
-                            style: TextStyle(color: Colors.white70),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              const Icon(
+                                Icons.favorite,
+                                color: Colors.red,
+                                size: 22,
+                              ),
+                              const SizedBox(width: 8),
+                              Text(
+                                '$bpm',
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 28,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                              const Text(
+                                ' bpm',
+                                style: TextStyle(color: Colors.white70),
+                              ),
+                            ],
                           ),
-                        ],
-                      ),
-                    );
-                  },
-                ),
+                        ),
+                      );
+                    },
+                  ),
               ],
             ),
           ),
@@ -959,8 +1203,11 @@ class _CameraPageState extends State<CameraPage> {
               ),
             ),
 
-          // ── 实时心率曲线(录制中,底部按钮上方,自适应宽度)──
-          if (_recording && _history.length >= 2)
+          // ── 实时心率曲线(仅本段有心率数据时显示)──
+          if (_recording &&
+              _recordHadBle &&
+              widget.ble.isConnected &&
+              _history.length >= 2)
             Positioned(
               left: isLandscape ? 90 : 12,
               right: isLandscape ? 90 : 12,

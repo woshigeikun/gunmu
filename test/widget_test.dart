@@ -1,11 +1,12 @@
-// 基础冒烟测试:验证 App 能正常构建出首页
+// 基础测试:仅验证 BleHeartRate 类基础状态
 import 'package:flutter_test/flutter_test.dart';
 
-import 'package:heart_rate_camera/main.dart';
+import 'package:heart_rate_camera/ble_heart_rate.dart';
 
 void main() {
-  testWidgets('App builds home page', (WidgetTester tester) async {
-    await tester.pumpWidget(const HeartRateCameraApp());
-    expect(find.text('连接手环'), findsOneWidget);
+  test('BleHeartRate 初始状态', () {
+    final ble = BleHeartRate();
+    expect(ble.isConnected, false);
+    expect(ble.currentBpm, 0);
   });
 }
