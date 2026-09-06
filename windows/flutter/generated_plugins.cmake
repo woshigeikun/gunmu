@@ -3,6 +3,7 @@
 #
 
 list(APPEND FLUTTER_PLUGIN_LIST
+  ffmpeg_kit_flutter_new
   flutter_blue_plus_winrt
   gal
   permission_handler_windows

@@ -39,6 +39,7 @@ dependencies:
   permission_handler:
   gal:
   path_provider:
+  ffmpeg_kit_flutter_new:
 
 dev_dependencies:
   flutter_test:
