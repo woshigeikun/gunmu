@@ -6,8 +6,10 @@ import 'package:camera/camera.dart';
 import 'package:ffmpeg_kit_flutter_new/ffmpeg_kit.dart';
 import 'package:ffmpeg_kit_flutter_new/ffprobe_kit.dart';
 import 'package:ffmpeg_kit_flutter_new/return_code.dart';
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:permission_handler/permission_handler.dart';
 import 'package:share_plus/share_plus.dart';
 
 import 'ble_heart_rate.dart';
@@ -321,6 +323,18 @@ class _CameraPageState extends State<CameraPage> {
 
   /// 执行连接;结果刷新面板与主界面状态
   Future<void> _connectBle(StateSetter setSheetState) async {
+    // Android:扫描 BLE 需要位置/蓝牙权限
+    if (!kIsWeb && Platform.isAndroid) {
+      try {
+        final loc = await Permission.locationWhenInUse.request();
+        if (!loc.isGranted) {
+          if (mounted) {
+            setState(() => _bleStatus = '需要定位权限才能扫描手环');
+          }
+          return;
+        }
+      } catch (_) {}
+    }
     setState(() {
       _connecting = true;
       _bleStatus = '正在扫描手环…(约 12 秒)';
@@ -835,7 +849,11 @@ class _CameraPageState extends State<CameraPage> {
         ),
       );
       if (mounted) {
-        setState(() => _hint = '已保存(带心率),可在"文件"App→本App→录像 查看');
+        setState(
+          () => _hint = kIsWeb || !Platform.isAndroid
+              ? '已保存(带心率),可在"文件"App→本App→录像 查看'
+              : '视频已生成,请在分享面板中选择保存位置',
+        );
       }
     } catch (e) {
       if (mounted) setState(() => _hint = '合成保存失败: $e');
