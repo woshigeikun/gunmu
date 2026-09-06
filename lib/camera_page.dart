@@ -2,12 +2,13 @@ import 'dart:io';
 
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
-import 'package:gal/gal.dart';
 import 'package:path_provider/path_provider.dart';
 
 import 'ble_heart_rate.dart';
 
 /// 相机页:预览 + 实时心率叠加 + 录像
+/// 【诊断版 v3】:停止后只保存到"文件"App 目录,不调用任何相册原生代码,
+/// 用于二分定位闪退来源(camera 停止 vs 相册保存)。
 class CameraPage extends StatefulWidget {
   final BleHeartRate ble;
   const CameraPage({super.key, required this.ble});
@@ -19,7 +20,8 @@ class CameraPage extends StatefulWidget {
 class _CameraPageState extends State<CameraPage> {
   CameraController? _cam;
   bool _recording = false;
-  bool _busy = false; // 防止录像开始/停止过程中重复点击
+  bool _busy = false;
+  final Stopwatch _timer = Stopwatch();
   String _hint = '';
 
   @override
@@ -47,10 +49,12 @@ class _CameraPageState extends State<CameraPage> {
     final cam = _cam;
     if (cam == null || !cam.value.isInitialized || _busy) return;
     _busy = true;
+    _refresh();
     try {
       if (!_recording) {
         // ── 开始录像 ──
         await cam.startVideoRecording();
+        _timer..reset()..start();
         if (mounted) {
           setState(() {
             _recording = true;
@@ -59,12 +63,20 @@ class _CameraPageState extends State<CameraPage> {
         }
       } else {
         // ── 停止录像 ──
+        _timer.stop();
         final XFile file = await cam.stopVideoRecording();
         if (mounted) setState(() => _recording = false);
-        await _saveVideo(file); // 单独处理,内部自带 try/catch,不会崩
+
+        // 保护:录像时间太短(<1秒)时 iOS 端 stop 容易出问题,直接放弃该片段
+        if (_timer.elapsedMilliseconds < 1000) {
+          if (mounted) {
+            setState(() => _hint = '录像时间太短,已放弃(不足1秒)');
+          }
+        } else {
+          await _saveToDocuments(file); // 纯 Dart 保存,不碰相册
+        }
       }
     } catch (e) {
-      // 关键修复:任何录像异常都显示出来,而不是让 App 闪退
       if (mounted) {
         setState(() {
           _recording = false;
@@ -73,46 +85,32 @@ class _CameraPageState extends State<CameraPage> {
       }
     } finally {
       _busy = false;
+      _refresh();
     }
   }
 
-  /// 保存录像:① 复制到 App 文档目录(兜底,文件App可见)② 存相册
-  Future<void> _saveVideo(XFile file) async {
-    String docPath = '';
+  /// 保存到 App 文档目录(iPhone"文件"App 可见),纯 Dart 无原生崩溃风险
+  Future<void> _saveToDocuments(XFile file) async {
     try {
-      // ① 先复制一份到 Documents/录像 目录 —— 即使相册失败视频也不丢
       final dir = await getApplicationDocumentsDirectory();
       final folder = Directory('${dir.path}/录像');
       if (!folder.existsSync()) folder.createSync(recursive: true);
       final stamp = DateTime.now().millisecondsSinceEpoch;
-      final saved = '${folder.path}/$stamp.mp4';
+      // 保留原扩展名(.mov 或 .mp4),避免改容器格式
+      final dot = file.path.lastIndexOf('.');
+      final ext = dot >= 0 ? file.path.substring(dot) : '.mov';
+      final saved = '${folder.path}/$stamp$ext';
       await file.saveTo(saved);
-      docPath = saved;
-    } catch (_) {
-      // 文档兜底失败不致命,继续尝试相册
-    }
-
-    // ② 保存到系统相册
-    try {
-      final ok = await Gal.requestAccess(toAlbum: true);
-      if (ok) {
-        await Gal.putVideo(file.path);
-        if (mounted) {
-          setState(() =>
-              _hint = docPath.isEmpty ? '已保存到相册' : '已保存到相册与文件');
-        }
-      } else {
-        if (mounted) {
-          setState(() =>
-              _hint = docPath.isEmpty ? '相册权限被拒绝' : '相册权限被拒,已存到"文件"App');
-        }
+      if (mounted) {
+        setState(() => _hint = '已保存,可在iPhone"文件"App→本App→录像 中查看');
       }
     } catch (e) {
-      if (mounted) {
-        setState(() =>
-            _hint = docPath.isEmpty ? '保存失败: $e' : '相册保存失败: $e,已存到"文件"App');
-      }
+      if (mounted) setState(() => _hint = '保存失败: $e');
     }
+  }
+
+  void _refresh() {
+    if (mounted) setState(() {});
   }
 
   @override
@@ -193,7 +191,9 @@ class _CameraPageState extends State<CameraPage> {
                   Text(
                     _busy
                         ? '处理中…'
-                        : (_recording ? '● 录制中,点此停止' : '点击开始录像'),
+                        : (_recording
+                            ? '● ${_timer.elapsed.inSeconds}s 点此停止'
+                            : '点击开始录像'),
                     style: const TextStyle(color: Colors.white70),
                   ),
                   const SizedBox(height: 8),
@@ -217,6 +217,7 @@ class _CameraPageState extends State<CameraPage> {
 
   @override
   void dispose() {
+    _timer.stop();
     _cam?.dispose();
     super.dispose();
   }
