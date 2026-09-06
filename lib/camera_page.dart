@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:camera/camera.dart';
@@ -17,7 +18,7 @@ class _HrSample {
   _HrSample(this.ms, this.bpm);
 }
 
-/// 相机页:预览 + 实时心率叠加 + 录像 + FFmpeg 烧录心率进成片
+/// 相机页:预览 + 实时心率 + 心率曲线 + 前后摄切换 + 录像烧录
 class CameraPage extends StatefulWidget {
   final BleHeartRate ble;
   const CameraPage({super.key, required this.ble});
@@ -28,41 +29,75 @@ class CameraPage extends StatefulWidget {
 
 class _CameraPageState extends State<CameraPage> {
   CameraController? _cam;
+  List<CameraDescription> _cameras = [];
+  int _camIndex = 0;
   bool _recording = false;
   bool _busy = false;
   final Stopwatch _timer = Stopwatch();
+  Timer? _ticker; // 录制期间每秒刷新界面(修复计时不动 bug)
   String _hint = '';
 
-  // 录像期间的心率时间线
+  // 录像期间的心率时间线(用于烧录)
   final List<_HrSample> _samples = [];
-  int _recordStartMs = 0; // 录像开始时 Stopwatch 的读数
+  // 实时心率历史(用于屏幕曲线,最多保留 120 个点)
+  final List<int> _history = [];
 
   @override
   void initState() {
     super.initState();
     _initCamera();
-    // 订阅心率:录像中则记录 (时间, bpm)
+    // 订阅心率:录像中记录时间线;屏幕历史始终累积
     widget.ble.bpmStream.listen((bpm) {
+      _history.add(bpm);
+      if (_history.length > 120) _history.removeAt(0);
       if (_recording) {
-        _samples.add(
-          _HrSample(_timer.elapsedMilliseconds - _recordStartMs, bpm),
-        );
+        _samples.add(_HrSample(_timer.elapsedMilliseconds, bpm));
       }
+      _refresh();
     });
   }
 
   Future<void> _initCamera() async {
     try {
       final cams = await availableCameras();
-      _cam = CameraController(
-        cams.first,
-        ResolutionPreset.high,
-        enableAudio: true,
-      );
-      await _cam!.initialize();
-      if (mounted) setState(() {});
+      if (cams.isEmpty) throw Exception('没有可用摄像头');
+      _cameras = cams;
+      _camIndex = 0;
+      await _openCamera(0);
     } catch (e) {
       if (mounted) setState(() => _hint = '相机初始化失败: $e');
+    }
+  }
+
+  Future<void> _openCamera(int index) async {
+    final old = _cam;
+    _cam = null;
+    await old?.dispose().catchError((_) {});
+    final desc = _cameras[index];
+    final c = CameraController(desc, ResolutionPreset.high, enableAudio: true);
+    await c.initialize();
+    if (!mounted) {
+      await c.dispose();
+      return;
+    }
+    setState(() {
+      _cam = c;
+      _camIndex = index;
+    });
+  }
+
+  /// 切换前后摄像头(录制/处理中禁止)
+  Future<void> _switchCamera() async {
+    if (_recording || _busy || _cameras.length < 2) return;
+    _busy = true;
+    _refresh();
+    try {
+      await _openCamera((_camIndex + 1) % _cameras.length);
+    } catch (e) {
+      if (mounted) setState(() => _hint = '切换摄像头失败: $e');
+    } finally {
+      _busy = false;
+      _refresh();
     }
   }
 
@@ -78,8 +113,12 @@ class _CameraPageState extends State<CameraPage> {
         _timer
           ..reset()
           ..start();
-        _recordStartMs = 0;
         _samples.clear();
+        // 每秒刷新一次界面,让计时数字走动
+        _ticker?.cancel();
+        _ticker = Timer.periodic(const Duration(seconds: 1), (_) {
+          if (_recording && mounted) setState(() {});
+        });
         if (mounted) {
           setState(() {
             _recording = true;
@@ -88,11 +127,15 @@ class _CameraPageState extends State<CameraPage> {
         }
       } else {
         // ── 停止录像 ──
+        _ticker?.cancel();
         _timer.stop();
 
         // 保护:iOS 上录像过短(<1秒)时 stopVideoRecording 可能原生崩溃
         if (_timer.elapsedMilliseconds < 1000) {
           _timer.start();
+          _ticker = Timer.periodic(const Duration(seconds: 1), (_) {
+            if (_recording && mounted) setState(() {});
+          });
           if (mounted) {
             setState(() => _hint = '录像太短,请继续录满 1 秒再停止');
           }
@@ -142,7 +185,7 @@ class _CameraPageState extends State<CameraPage> {
         durationSec = _timer.elapsedMilliseconds / 1000.0;
       }
 
-      // 2) 生成 ASS 字幕:每个心率采样一条,右上角显示 ❤ bpm
+      // 2) 生成 ASS 字幕:每个心率采样一条,右上角显示 ❤ bpm(红色)
       final docs = await getApplicationDocumentsDirectory();
       final workDir = Directory('${docs.path}/work');
       if (!workDir.existsSync()) workDir.createSync(recursive: true);
@@ -192,7 +235,7 @@ class _CameraPageState extends State<CameraPage> {
     }
   }
 
-  /// 生成 ASS 字幕文件:右上角显示 ♥ 和 bpm
+  /// 生成 ASS 字幕文件:右上角显示 ♥ bpm,文本红色、黑描边
   void _writeAss(String path, int width, int height, double durationSec) {
     // 心率采样点若为空,给个占位值
     if (_samples.isEmpty) {
@@ -214,9 +257,10 @@ class _CameraPageState extends State<CameraPage> {
         'ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, '
         'Alignment, MarginL, MarginR, MarginV, Encoding',
       )
+      // ASS 颜色格式 &HAABBGGRR:主色纯红 = &H000000FF,黑描边 &H00000000
       ..writeln(
-        'Style: HR,Helvetica,$fontSize,&H00FFFFFF,&H000000FF,&H00000000,'
-        '&H80000000,1,0,0,0,100,100,0,0,1,3,1,9,0,30,40,1',
+        'Style: HR,Helvetica,$fontSize,&H000000FF,&H000000FF,&H00000000,'
+        '&H64000000,1,0,0,0,100,100,0,0,1,4,2,9,0,30,40,1',
       )
       ..writeln()
       ..writeln('[Events]')
@@ -260,6 +304,7 @@ class _CameraPageState extends State<CameraPage> {
   @override
   Widget build(BuildContext context) {
     final cam = _cam;
+    final bpmNow = widget.ble.currentBpm;
     return Scaffold(
       backgroundColor: Colors.black,
       body: Stack(
@@ -269,10 +314,10 @@ class _CameraPageState extends State<CameraPage> {
           else
             const Center(child: CircularProgressIndicator()),
 
-          // ── 心率叠加层(每次收到心率自动刷新)──
+          // ── 心率叠加层(右上角实时数字)──
           StreamBuilder<int>(
             stream: widget.ble.bpmStream,
-            initialData: widget.ble.currentBpm,
+            initialData: bpmNow,
             builder: (context, snap) {
               final bpm = snap.data ?? 0;
               return Positioned(
@@ -311,10 +356,30 @@ class _CameraPageState extends State<CameraPage> {
             },
           ),
 
+          // ── 切换摄像头按钮(左上角,录制中禁用)──
+          Positioned(
+            top: 60,
+            left: 16,
+            child: IconButton(
+              onPressed: (_recording || _busy || _cameras.length < 2)
+                  ? null
+                  : _switchCamera,
+              icon: const Icon(
+                Icons.cameraswitch,
+                color: Colors.white,
+                size: 28,
+              ),
+              style: IconButton.styleFrom(
+                backgroundColor: Colors.black38,
+                disabledBackgroundColor: Colors.black12,
+              ),
+            ),
+          ),
+
           // 状态/错误提示
           if (_hint.isNotEmpty)
             Positioned(
-              top: 60,
+              top: 110,
               left: 20,
               right: 60,
               child: Text(
@@ -322,6 +387,47 @@ class _CameraPageState extends State<CameraPage> {
                 style: const TextStyle(
                   color: Colors.yellowAccent,
                   fontSize: 12,
+                ),
+              ),
+            ),
+
+          // ── 实时心率曲线(录制中,底部按钮上方)──
+          if (_recording && _history.length >= 2)
+            Positioned(
+              left: 12,
+              right: 12,
+              bottom: 150,
+              height: 90,
+              child: Container(
+                decoration: BoxDecoration(
+                  color: Colors.black38,
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                padding: const EdgeInsets.all(8),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        const Icon(Icons.favorite, color: Colors.red, size: 14),
+                        const SizedBox(width: 4),
+                        Text(
+                          '心率曲线  $bpmNow bpm',
+                          style: const TextStyle(
+                            color: Colors.white70,
+                            fontSize: 11,
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 4),
+                    Expanded(
+                      child: CustomPaint(
+                        painter: _HrCurvePainter(_history),
+                        size: Size.infinite,
+                      ),
+                    ),
+                  ],
                 ),
               ),
             ),
@@ -364,8 +470,58 @@ class _CameraPageState extends State<CameraPage> {
 
   @override
   void dispose() {
+    _ticker?.cancel();
     _timer.stop();
     _cam?.dispose();
     super.dispose();
   }
+}
+
+/// 心率曲线画笔:横轴为最近的心率历史,纵轴按数据范围自适应
+class _HrCurvePainter extends CustomPainter {
+  final List<int> data;
+  _HrCurvePainter(this.data);
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (data.length < 2) return;
+    int minV = data.reduce((a, b) => a < b ? a : b);
+    int maxV = data.reduce((a, b) => a > b ? a : b);
+    if (maxV - minV < 10) {
+      // 太平时人为扩出上下界,曲线不至于拍平
+      minV = minV - 5 < 30 ? 30 : minV - 5;
+      maxV = maxV + 5;
+    }
+    final range = (maxV - minV).toDouble();
+
+    final line = Paint()
+      ..color = Colors.redAccent
+      ..strokeWidth = 2
+      ..style = PaintingStyle.stroke
+      ..strokeCap = StrokeCap.round;
+
+    final n = data.length;
+    final path = Path();
+    for (var i = 0; i < n; i++) {
+      final x = size.width * i / (n - 1);
+      final y =
+          size.height - ((data[i] - minV) / range) * size.height * 0.9 - 2;
+      if (i == 0) {
+        path.moveTo(x, y);
+      } else {
+        path.lineTo(x, y);
+      }
+    }
+    canvas.drawPath(path, line);
+
+    // 最后一个点画个圆点
+    final lastX = size.width;
+    final lastY =
+        size.height - ((data.last - minV) / range) * size.height * 0.9 - 2;
+    canvas.drawCircle(Offset(lastX, lastY), 4, Paint()..color = Colors.red);
+  }
+
+  @override
+  bool shouldRepaint(covariant _HrCurvePainter old) =>
+      old.data != data || old.data.length != data.length;
 }
