@@ -220,7 +220,7 @@ class _CameraPageState extends State<CameraPage> {
       if (e <= s.ms) e = s.ms + 800;
       sb.writeln(
         'Dialogue: 0,${_assTime(s.ms / 1000)},${_assTime(e / 1000)},HR,,0,0,0,,'
-        '${s.bpm > 0 ? '♥ $s.bpm' : '♥ --'}',
+        '${s.bpm > 0 ? '♥ ${s.bpm}' : '♥ --'}',
       );
     }
     File(path).writeAsStringSync(sb.toString());
