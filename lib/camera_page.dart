@@ -1113,7 +1113,7 @@ class _CameraPageState extends State<CameraPage> {
                             minHeight: vH,
                             maxHeight: vH,
                             child: RotatedBox(
-                              quarterTurns: 1, // 顺时针90°,把横向画面转成竖屏
+                              quarterTurns: 3, // 逆时针90°,把横向画面转成竖屏
                               child: SizedBox(
                                 width: rawW,
                                 height: rawH,
