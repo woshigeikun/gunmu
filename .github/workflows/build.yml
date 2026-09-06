@@ -9,6 +9,24 @@ jobs:
       - uses: actions/checkout@v4
       - uses: subosito/flutter-action@v2
         with: { channel: stable }
+
+      # camera 插件在最新 Xcode 上编译失败(旧通知常量被移除,flutter issue 185031)
+      # 切到一个较旧的 Xcode 版本(版本号最低的那个)来规避。
+      - name: 选择兼容的 Xcode 版本
+        run: |
+          echo "可用的 Xcode:"
+          ls -d /Applications/Xcode*.app 2>/dev/null || true
+          # 优先用 Xcode 15.x(保留 AVCaptureSession 旧通知常量)
+          XCODE=$(ls -d /Applications/Xcode*.app 2>/dev/null | grep -E 'Xcode_15\.' | head -1)
+          if [ -z "$XCODE" ]; then
+            # 找不到 15.x 就退回版本号最低的(越旧越可能兼容)
+            XCODE=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | head -1)
+          fi
+          echo "切换到: $XCODE"
+          sudo xcode-select -s "$XCODE"
+          echo "--- 当前 Xcode 版本 ---"
+          xcodebuild -version
+
       - run: flutter pub get
       - run: flutter build ios --release --no-codesign   # 先不打签名
       - name: 打包成 ipa
