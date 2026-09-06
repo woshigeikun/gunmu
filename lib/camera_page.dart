@@ -1073,7 +1073,7 @@ class _CameraPageState extends State<CameraPage> {
       body: Stack(
         children: [
           // ── 相机预览 ──
-          // 传感器画面为横向:竖屏时旋转 90° 后以竖屏模式填充(不变形、无黑边)
+          // 竖屏:0 度不旋转,按相机画面比例完整显示、居中(黑边补齐)
           // 横屏:固定 4:3 取景框,cover 裁切不变形
           if (cam != null && cam.value.isInitialized)
             Positioned.fill(
@@ -1081,52 +1081,23 @@ class _CameraPageState extends State<CameraPage> {
                 builder: (context, cons) {
                   final sw = cons.maxWidth;
                   final sh = cons.maxHeight;
-                  final a = cam.value.aspectRatio <= 0
-                      ? 4.0 / 3.0
-                      : cam.value.aspectRatio;
 
                   if (!isLandscape) {
-                    // ── 竖屏:横向画面顺时针转90° → 竖屏 cover ──
-                    // 旋转后视觉宽高比 = 1/a(竖)
-                    final sRatio = 1.0 / a;
-                    final tRatio = sw / sh;
-                    double vW, vH; // 旋转后的视觉尺寸
-                    if (sRatio > tRatio) {
-                      vH = sh;
-                      vW = vH * sRatio;
-                    } else {
-                      vW = sw;
-                      vH = vW / sRatio;
-                    }
-                    // 旋转前(横向)的原图尺寸:宽高互换
-                    final rawW = vH;
-                    final rawH = vW;
+                    // 竖屏:直接完整显示相机画面(0 度旋转,无拉伸无裁剪)
                     return Center(
-                      child: SizedBox(
-                        width: sw,
-                        height: sh,
-                        child: ClipRect(
-                          child: OverflowBox(
-                            alignment: Alignment.center,
-                            minWidth: vW,
-                            maxWidth: vW,
-                            minHeight: vH,
-                            maxHeight: vH,
-                            child: RotatedBox(
-                              quarterTurns: 3, // 逆时针90°,把横向画面转成竖屏
-                              child: SizedBox(
-                                width: rawW,
-                                height: rawH,
-                                child: CameraPreview(cam),
-                              ),
-                            ),
-                          ),
-                        ),
+                      child: AspectRatio(
+                        aspectRatio: cam.value.aspectRatio <= 0
+                            ? 9.0 / 16.0
+                            : cam.value.aspectRatio,
+                        child: CameraPreview(cam),
                       ),
                     );
                   }
 
                   // ── 横屏:4:3 取景框 cover ──
+                  final a = cam.value.aspectRatio <= 0
+                      ? 4.0 / 3.0
+                      : cam.value.aspectRatio;
                   const tA = 4.0 / 3.0;
                   double tw, th;
                   if (sw / sh > tA) {
