@@ -40,9 +40,9 @@ class _CameraPageState extends State<CameraPage> {
   double _zoom = 1.0; // 当前变焦倍数(等效 35mm 主摄按 26mm 起算)
 
   // 录制画质与帧率设置
-  // 默认 medium:iPhone 该档输出 4:3 画幅(480p 级别),即"默认预览 4:3"
-  ResolutionPreset _quality = ResolutionPreset.medium;
-  int _fps = 30; // 默认 30 帧
+  // 默认 超清(≈1080p)/60fps
+  ResolutionPreset _quality = ResolutionPreset.veryHigh;
+  int _fps = 60; // 默认 60 帧
 
   // 手环连接面板状态
   bool _connecting = false;
@@ -108,41 +108,56 @@ class _CameraPageState extends State<CameraPage> {
     _cam = null;
     await old?.dispose().catchError((_) {});
     final desc = _cameras[index];
-    final c = CameraController(desc, _quality, enableAudio: true, fps: _fps);
-    try {
-      await c.initialize();
-    } catch (e) {
-      // 该质量/帧率组合可能不被支持,回退默认质量再试一次
-      if (mounted) setState(() => _hint = '所选画质不支持,使用默认画质: $e');
-      final c2 = CameraController(
-        desc,
-        ResolutionPreset.high,
-        enableAudio: true,
-        fps: 30,
-      );
-      await c2.initialize();
-      if (!mounted) {
-        await c.dispose();
-        await c2.dispose();
-        return;
+
+    // 候选组合:当前设置 → 降帧率 → 降画质(逐级尝试,直到初始化成功)
+    final attempts = <(ResolutionPreset, int)>[
+      (_quality, _fps),
+      (_quality, 30),
+      if (_quality != ResolutionPreset.high)
+        (ResolutionPreset.high, 30)
+      else
+        (ResolutionPreset.medium, 30),
+      (ResolutionPreset.medium, 30),
+    ];
+
+    CameraController? okCam;
+    (ResolutionPreset, int)? used;
+    String? lastErr;
+    for (final a in attempts) {
+      final cand = CameraController(desc, a.$1, enableAudio: true, fps: a.$2);
+      try {
+        await cand.initialize();
+        okCam = cand;
+        used = a;
+        break;
+      } catch (e) {
+        lastErr = '$e';
+        await cand.dispose().catchError((_) {});
       }
-      setState(() {
-        _cam = c2;
-        _camIndex = index;
-        _zoom = 1.0;
-        _quality = ResolutionPreset.high;
-        _fps = 30;
-      });
+    }
+
+    if (okCam == null) {
+      if (mounted) {
+        setState(() => _hint = '相机初始化失败: $lastErr');
+      }
       return;
     }
     if (!mounted) {
-      await c.dispose();
+      await okCam.dispose();
       return;
     }
+    final (rPreset, rFps) = used!;
+    // 若发生降级,提示并把状态同步为实际值
+    final degraded = (rPreset != _quality) || (rFps != _fps);
+    _quality = rPreset;
+    _fps = rFps;
     setState(() {
-      _cam = c;
+      _cam = okCam;
       _camIndex = index;
       _zoom = 1.0; // 切换镜头后变焦回到 1x
+      if (degraded) {
+        _hint = '设备不支持所选画质,已自动调整为 $_qualityLabel/$rFps fps';
+      }
     });
   }
 
@@ -1064,8 +1079,8 @@ class _CameraPageState extends State<CameraPage> {
                 builder: (context, cons) {
                   final sw = cons.maxWidth;
                   final sh = cons.maxHeight;
-                  // 目标显示比例(宽/高)
-                  final tA = isLandscape ? 4.0 / 3.0 : 3.0 / 4.0;
+                  // 目标显示比例(宽/高):竖屏 9:16,横屏 4:3
+                  final tA = isLandscape ? 4.0 / 3.0 : 9.0 / 16.0;
                   double tw, th;
                   if (sw / sh > tA) {
                     th = sh;
