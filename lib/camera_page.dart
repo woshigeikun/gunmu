@@ -64,17 +64,21 @@ class _CameraPageState extends State<CameraPage> {
       } else {
         // ── 停止录像 ──
         _timer.stop();
+
+        // 保护:iOS 上录像过短(<1秒)时 stopVideoRecording 可能原生崩溃,
+        // 因此太短时直接忽略本次停止,继续录制
+        if (_timer.elapsedMilliseconds < 1000) {
+          _timer.start();
+          if (mounted) {
+            setState(() => _hint = '录像太短,请继续录满 1 秒再停止');
+          }
+          return;
+        }
+
         final XFile file = await cam.stopVideoRecording();
         if (mounted) setState(() => _recording = false);
 
-        // 保护:录像时间太短(<1秒)时 iOS 端 stop 容易出问题,直接放弃该片段
-        if (_timer.elapsedMilliseconds < 1000) {
-          if (mounted) {
-            setState(() => _hint = '录像时间太短,已放弃(不足1秒)');
-          }
-        } else {
-          await _saveToDocuments(file); // 纯 Dart 保存,不碰相册
-        }
+        await _saveToDocuments(file); // 纯 Dart 保存,不碰相册
       }
     } catch (e) {
       if (mounted) {
