@@ -43,7 +43,9 @@ class _CameraPageState extends State<CameraPage> {
     // 订阅心率:录像中则记录 (时间, bpm)
     widget.ble.bpmStream.listen((bpm) {
       if (_recording) {
-        _samples.add(_HrSample(_timer.elapsedMilliseconds - _recordStartMs, bpm));
+        _samples.add(
+          _HrSample(_timer.elapsedMilliseconds - _recordStartMs, bpm),
+        );
       }
     });
   }
@@ -145,7 +147,8 @@ class _CameraPageState extends State<CameraPage> {
       // 3) FFmpeg 烧录:字幕滤镜 + 重新编码为 mp4
       if (mounted) setState(() => _hint = '正在合成心率到视频…');
       final outPath = '${workDir.path}/$stamp.mp4';
-      final cmd = '-y -i "${raw.path}" -vf "ass=$assPath" '
+      final cmd =
+          '-y -i "${raw.path}" -vf "ass=$assPath" '
           '-c:v libx264 -preset veryfast -crf 22 '
           '-c:a aac -b:a 128k "$outPath"';
       final session = await FFmpegKit.execute(cmd);
@@ -190,18 +193,21 @@ class _CameraPageState extends State<CameraPage> {
       ..writeln()
       ..writeln('[V4+ Styles]')
       ..writeln(
-          'Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, '
-          'OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, '
-          'ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, '
-          'Alignment, MarginL, MarginR, MarginV, Encoding')
+        'Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, '
+        'OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, '
+        'ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, '
+        'Alignment, MarginL, MarginR, MarginV, Encoding',
+      )
       ..writeln(
-          'Style: HR,Helvetica,$fontSize,&H00FFFFFF,&H000000FF,&H00000000,'
-          '&H80000000,1,0,0,0,100,100,0,0,1,3,1,9,0,30,40,1')
+        'Style: HR,Helvetica,$fontSize,&H00FFFFFF,&H000000FF,&H00000000,'
+        '&H80000000,1,0,0,0,100,100,0,0,1,3,1,9,0,30,40,1',
+      )
       ..writeln()
       ..writeln('[Events]')
       ..writeln(
-          'Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, '
-          'Effect, Text');
+        'Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, '
+        'Effect, Text',
+      );
 
     // 逐条字幕:每条从采样时间点持续到下一个采样点(或视频末尾)
     for (var i = 0; i < _samples.length; i++) {
@@ -213,8 +219,9 @@ class _CameraPageState extends State<CameraPage> {
       var e = endMs;
       if (e <= s.ms) e = s.ms + 800;
       sb.writeln(
-          'Dialogue: 0,${_assTime(s.ms / 1000)},${_assTime(e / 1000)},HR,,0,0,0,,'
-          '${s.bpm > 0 ? '♥ $s.bpm' : '♥ --'}');
+        'Dialogue: 0,${_assTime(s.ms / 1000)},${_assTime(e / 1000)},HR,,0,0,0,,'
+        '${s.bpm > 0 ? '♥ $s.bpm' : '♥ --'}',
+      );
     }
     File(path).writeAsStringSync(sb.toString());
   }
@@ -296,7 +303,10 @@ class _CameraPageState extends State<CameraPage> {
               right: 60,
               child: Text(
                 _hint,
-                style: const TextStyle(color: Colors.yellowAccent, fontSize: 12),
+                style: const TextStyle(
+                  color: Colors.yellowAccent,
+                  fontSize: 12,
+                ),
               ),
             ),
 
@@ -313,8 +323,8 @@ class _CameraPageState extends State<CameraPage> {
                     _busy
                         ? '处理中…'
                         : (_recording
-                            ? '● ${_timer.elapsed.inSeconds}s 点此停止'
-                            : '点击开始录像'),
+                              ? '● ${_timer.elapsed.inSeconds}s 点此停止'
+                              : '点击开始录像'),
                     style: const TextStyle(color: Colors.white70),
                   ),
                   const SizedBox(height: 8),
