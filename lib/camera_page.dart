@@ -1073,7 +1073,7 @@ class _CameraPageState extends State<CameraPage> {
       body: Stack(
         children: [
           // ── 相机预览 ──
-          // 竖屏:系统相机风格 = cover 铺满全屏(放大居中裁切,无黑边)
+          // 传感器画面为横向:竖屏时旋转 90° 后以竖屏模式填充(不变形、无黑边)
           // 横屏:固定 4:3 取景框,cover 裁切不变形
           if (cam != null && cam.value.isInitialized)
             Positioned.fill(
@@ -1081,26 +1081,61 @@ class _CameraPageState extends State<CameraPage> {
                 builder: (context, cons) {
                   final sw = cons.maxWidth;
                   final sh = cons.maxHeight;
-                  // 竖屏目标 = 整个屏幕(cover 全屏);横屏目标 = 4:3 框
-                  final useFull = !isLandscape;
-                  double tw, th;
-                  if (useFull) {
-                    tw = sw;
-                    th = sh;
-                  } else {
-                    const tA = 4.0 / 3.0;
-                    if (sw / sh > tA) {
-                      th = sh;
-                      tw = th * tA;
-                    } else {
-                      tw = sw;
-                      th = tw / tA;
-                    }
-                  }
                   final a = cam.value.aspectRatio <= 0
-                      ? (useFull ? sw / sh : 4.0 / 3.0)
+                      ? 4.0 / 3.0
                       : cam.value.aspectRatio;
-                  // cover:内部画面不小于显示区,溢出部分裁掉
+
+                  if (!isLandscape) {
+                    // ── 竖屏:横向画面顺时针转90° → 竖屏 cover ──
+                    // 旋转后视觉宽高比 = 1/a(竖)
+                    final sRatio = 1.0 / a;
+                    final tRatio = sw / sh;
+                    double vW, vH; // 旋转后的视觉尺寸
+                    if (sRatio > tRatio) {
+                      vH = sh;
+                      vW = vH * sRatio;
+                    } else {
+                      vW = sw;
+                      vH = vW / sRatio;
+                    }
+                    // 旋转前(横向)的原图尺寸:宽高互换
+                    final rawW = vH;
+                    final rawH = vW;
+                    return Center(
+                      child: SizedBox(
+                        width: sw,
+                        height: sh,
+                        child: ClipRect(
+                          child: OverflowBox(
+                            alignment: Alignment.center,
+                            minWidth: vW,
+                            maxWidth: vW,
+                            minHeight: vH,
+                            maxHeight: vH,
+                            child: RotatedBox(
+                              quarterTurns: 1, // 顺时针90°,把横向画面转成竖屏
+                              child: SizedBox(
+                                width: rawW,
+                                height: rawH,
+                                child: CameraPreview(cam),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                    );
+                  }
+
+                  // ── 横屏:4:3 取景框 cover ──
+                  const tA = 4.0 / 3.0;
+                  double tw, th;
+                  if (sw / sh > tA) {
+                    th = sh;
+                    tw = th * tA;
+                  } else {
+                    tw = sw;
+                    th = tw / tA;
+                  }
                   double iw = th * a, ih = th;
                   if (iw < tw) {
                     iw = tw;
