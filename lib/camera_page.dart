@@ -39,6 +39,20 @@ class _CameraPageState extends State<CameraPage> {
   String _hint = '';
   double _zoom = 1.0; // 当前变焦倍数(等效 35mm 主摄按 26mm 起算)
 
+  // 录制画质与帧率设置
+  ResolutionPreset _quality = ResolutionPreset.high; // 默认 高清(约720p)
+  int _fps = 30; // 默认 30 帧
+
+  /// 画质档位(供设置面板展示)
+  static const List<(ResolutionPreset, String, String)> _qualityOptions = [
+    (ResolutionPreset.low, '标清', '≈480p'),
+    (ResolutionPreset.medium, '普通', '≈540p'),
+    (ResolutionPreset.high, '高清', '≈720p'),
+    (ResolutionPreset.veryHigh, '超清', '≈1080p'),
+    (ResolutionPreset.ultraHigh, '4K', '≈2160p'),
+    (ResolutionPreset.max, '最高', '设备上限'),
+  ];
+
   /// 常用变焦档位:倍数 + 等效焦距文案(26mm × 倍数)
   static const List<(double, String)> _zoomPresets = [
     (0.5, '0.5x · 13mm 超广'),
@@ -86,8 +100,33 @@ class _CameraPageState extends State<CameraPage> {
     _cam = null;
     await old?.dispose().catchError((_) {});
     final desc = _cameras[index];
-    final c = CameraController(desc, ResolutionPreset.high, enableAudio: true);
-    await c.initialize();
+    final c = CameraController(desc, _quality, enableAudio: true, fps: _fps);
+    try {
+      await c.initialize();
+    } catch (e) {
+      // 该质量/帧率组合可能不被支持,回退默认质量再试一次
+      if (mounted) setState(() => _hint = '所选画质不支持,使用默认画质: $e');
+      final c2 = CameraController(
+        desc,
+        ResolutionPreset.high,
+        enableAudio: true,
+        fps: 30,
+      );
+      await c2.initialize();
+      if (!mounted) {
+        await c.dispose();
+        await c2.dispose();
+        return;
+      }
+      setState(() {
+        _cam = c2;
+        _camIndex = index;
+        _zoom = 1.0;
+        _quality = ResolutionPreset.high;
+        _fps = 30;
+      });
+      return;
+    }
     if (!mounted) {
       await c.dispose();
       return;
@@ -240,6 +279,133 @@ class _CameraPageState extends State<CameraPage> {
         );
       },
     );
+  }
+
+  /// 画质/帧率设置面板;选好后重新打开相机使设置生效(需未在录像)
+  Future<void> _showSettingsSheet() async {
+    if (_recording || _busy) {
+      if (mounted) {
+        setState(() => _hint = '录像中不可修改画质,请先停止录像');
+      }
+      return;
+    }
+    await showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: const Color(0xFF1C1C1E),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (ctx) {
+        return StatefulBuilder(
+          builder: (context2, setSheetState) {
+            return SafeArea(
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(20, 16, 20, 24),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      '录制设置',
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontSize: 18,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                    const SizedBox(height: 16),
+                    const Text(
+                      '画质',
+                      style: TextStyle(color: Colors.white70, fontSize: 13),
+                    ),
+                    const SizedBox(height: 8),
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: _qualityOptions.map((q) {
+                        final sel = q.$1 == _quality;
+                        return ChoiceChip(
+                          label: Text(
+                            '${q.$2} ${q.$3}',
+                            style: TextStyle(
+                              fontSize: 12,
+                              color: sel ? Colors.black : Colors.white,
+                            ),
+                          ),
+                          selected: sel,
+                          selectedColor: Colors.redAccent,
+                          backgroundColor: Colors.white10,
+                          onSelected: (_) =>
+                              setSheetState(() => _quality = q.$1),
+                        );
+                      }).toList(),
+                    ),
+                    const SizedBox(height: 16),
+                    const Text(
+                      '帧率',
+                      style: TextStyle(color: Colors.white70, fontSize: 13),
+                    ),
+                    const SizedBox(height: 8),
+                    Wrap(
+                      spacing: 8,
+                      children: [24, 30, 60].map((f) {
+                        final sel = f == _fps;
+                        return ChoiceChip(
+                          label: Text(
+                            '$f fps',
+                            style: TextStyle(
+                              color: sel ? Colors.black : Colors.white,
+                            ),
+                          ),
+                          selected: sel,
+                          selectedColor: Colors.redAccent,
+                          backgroundColor: Colors.white10,
+                          onSelected: (_) => setSheetState(() => _fps = f),
+                        );
+                      }).toList(),
+                    ),
+                    const SizedBox(height: 20),
+                    const Text(
+                      '修改后需要重新启动相机预览生效。若设备不支持所选组合,将自动回退到 高清/30fps。',
+                      style: TextStyle(color: Colors.white38, fontSize: 11),
+                    ),
+                    const SizedBox(height: 12),
+                    SizedBox(
+                      width: double.infinity,
+                      child: FilledButton(
+                        onPressed: () {
+                          Navigator.pop(ctx);
+                          _applySettings();
+                        },
+                        child: const Text('应用并重启预览'),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+
+  /// 应用画质/帧率:重开当前镜头
+  Future<void> _applySettings() async {
+    if (_busy) return;
+    _busy = true;
+    _refresh();
+    try {
+      await _openCamera(_camIndex);
+      if (mounted) {
+        setState(() => _hint = '已应用画质设置,请开始录像');
+      }
+    } catch (e) {
+      if (mounted) setState(() => _hint = '应用设置失败: $e');
+    } finally {
+      _busy = false;
+      _refresh();
+    }
   }
 
   Future<void> _toggleRecord() async {
@@ -649,6 +815,12 @@ class _CameraPageState extends State<CameraPage> {
   Widget build(BuildContext context) {
     final cam = _cam;
     final bpmNow = widget.ble.currentBpm;
+    // 是否横屏(UI 元素随方向重新摆放)
+    final isLandscape =
+        MediaQuery.of(context).orientation == Orientation.landscape;
+    // 上边距:避开状态栏/刘海
+    final topPad = MediaQuery.of(context).padding.top + 12;
+
     return Scaffold(
       backgroundColor: Colors.black,
       body: Stack(
@@ -658,96 +830,140 @@ class _CameraPageState extends State<CameraPage> {
           else
             const Center(child: CircularProgressIndicator()),
 
-          // ── 心率叠加层(右上角实时数字)──
-          StreamBuilder<int>(
-            stream: widget.ble.bpmStream,
-            initialData: bpmNow,
-            builder: (context, snap) {
-              final bpm = snap.data ?? 0;
-              return Positioned(
-                top: 60,
-                right: 20,
-                child: Container(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 14,
-                    vertical: 8,
-                  ),
-                  decoration: BoxDecoration(
-                    color: Colors.black54,
-                    borderRadius: BorderRadius.circular(24),
-                  ),
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      const Icon(Icons.favorite, color: Colors.red, size: 22),
-                      const SizedBox(width: 8),
-                      Text(
-                        '$bpm',
-                        style: const TextStyle(
-                          color: Colors.white,
-                          fontSize: 28,
-                          fontWeight: FontWeight.bold,
-                        ),
+          // ── 顶部控制排:心率(右) + 镜头(左) + 设置(左) + 焦距 ──
+          Positioned(
+            top: topPad,
+            left: isLandscape ? 24 : 16,
+            right: isLandscape ? 24 : 16,
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                // 左侧:镜头 + 设置按钮
+                Row(
+                  crossAxisAlignment: CrossAxisAlignment.center,
+                  children: [
+                    IconButton(
+                      onPressed: (_recording || _busy) ? null : _showLensSheet,
+                      icon: const Icon(
+                        Icons.camera_alt,
+                        color: Colors.white,
+                        size: 26,
                       ),
-                      const Text(
-                        ' bpm',
-                        style: TextStyle(color: Colors.white70),
+                      style: IconButton.styleFrom(
+                        backgroundColor: Colors.black38,
+                        disabledBackgroundColor: Colors.black12,
                       ),
-                    ],
-                  ),
+                    ),
+                    IconButton(
+                      onPressed: (_recording || _busy)
+                          ? null
+                          : _showSettingsSheet,
+                      icon: const Icon(
+                        Icons.settings,
+                        color: Colors.white,
+                        size: 22,
+                      ),
+                      style: IconButton.styleFrom(
+                        backgroundColor: Colors.black38,
+                        disabledBackgroundColor: Colors.black12,
+                      ),
+                    ),
+                    // 当前等效焦距 + 画质/帧率
+                    Padding(
+                      padding: const EdgeInsets.only(left: 4),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            '${(_zoom * 26).round()}mm',
+                            style: const TextStyle(
+                              color: Colors.white70,
+                              fontSize: 11,
+                              backgroundColor: Colors.black38,
+                            ),
+                          ),
+                          Text(
+                            '$_qualityLabel  $_fps fps',
+                            style: const TextStyle(
+                              color: Colors.white70,
+                              fontSize: 11,
+                              backgroundColor: Colors.black38,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
                 ),
-              );
-            },
-          ),
 
-          // ── 镜头/变焦按钮(左上角,录制中禁用)──
-          Positioned(
-            top: 60,
-            left: 16,
-            child: IconButton(
-              onPressed: (_recording || _busy) ? null : _showLensSheet,
-              icon: const Icon(Icons.camera_alt, color: Colors.white, size: 26),
-              style: IconButton.styleFrom(
-                backgroundColor: Colors.black38,
-                disabledBackgroundColor: Colors.black12,
-              ),
+                // 右侧:实时心率数字
+                StreamBuilder<int>(
+                  stream: widget.ble.bpmStream,
+                  initialData: bpmNow,
+                  builder: (context, snap) {
+                    final bpm = snap.data ?? 0;
+                    return Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 14,
+                        vertical: 8,
+                      ),
+                      decoration: BoxDecoration(
+                        color: Colors.black54,
+                        borderRadius: BorderRadius.circular(24),
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          const Icon(
+                            Icons.favorite,
+                            color: Colors.red,
+                            size: 22,
+                          ),
+                          const SizedBox(width: 8),
+                          Text(
+                            '$bpm',
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 28,
+                              fontWeight: FontWeight.bold,
+                            ),
+                          ),
+                          const Text(
+                            ' bpm',
+                            style: TextStyle(color: Colors.white70),
+                          ),
+                        ],
+                      ),
+                    );
+                  },
+                ),
+              ],
             ),
           ),
 
-          // 当前等效焦距显示(左上角按钮下方)
-          Positioned(
-            top: 100,
-            left: 16,
-            child: Text(
-              '${(_zoom * 26).round()}mm',
-              style: const TextStyle(
-                color: Colors.white70,
-                fontSize: 11,
-                backgroundColor: Colors.black38,
-              ),
-            ),
-          ),
-
-          // 状态/错误提示
+          // 状态/错误提示(顶部控制排下方)
           if (_hint.isNotEmpty)
             Positioned(
-              top: 110,
+              top: topPad + (isLandscape ? 66 : 92),
               left: 20,
-              right: 60,
+              right: 20,
               child: Text(
                 _hint,
+                textAlign: TextAlign.center,
                 style: const TextStyle(
                   color: Colors.yellowAccent,
                   fontSize: 12,
+                  backgroundColor: Colors.black45,
                 ),
               ),
             ),
 
-          // ── 实时心率曲线(录制中,底部按钮上方)──
+          // ── 实时心率曲线(录制中,底部按钮上方,自适应宽度)──
           if (_recording && _history.length >= 2)
             Positioned(
-              left: 12,
-              right: 12,
+              left: isLandscape ? 90 : 12,
+              right: isLandscape ? 90 : 12,
               bottom: 150,
               height: 90,
               child: Container(
@@ -784,7 +1000,7 @@ class _CameraPageState extends State<CameraPage> {
               ),
             ),
 
-          // ── 录像按钮 ──
+          // ── 录像按钮(底部中央)──
           Positioned(
             bottom: 40,
             left: 0,
@@ -818,6 +1034,14 @@ class _CameraPageState extends State<CameraPage> {
         ],
       ),
     );
+  }
+
+  /// 当前画质档位的中文名(供顶栏显示)
+  String get _qualityLabel {
+    for (final q in _qualityOptions) {
+      if (q.$1 == _quality) return q.$2;
+    }
+    return '高清';
   }
 
   @override
