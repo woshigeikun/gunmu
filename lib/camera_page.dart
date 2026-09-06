@@ -345,27 +345,44 @@ class _CameraPageState extends State<CameraPage> {
       final curY = (marginTop + fontSize * 1.15).round();
 
       _writeAss(assPath, width, height, durationSec);
-      String? curvePath;
-      if (hasCurve) {
-        if (mounted) setState(() => _hint = '正在生成心率曲线…');
-        final img = await _renderCurveImage(curW, curH, durationSec);
-        final data = await img.toByteData(format: ui.ImageByteFormat.png);
-        curvePath = '${workDir.path}/$stamp.png';
-        File(curvePath).writeAsBytesSync(data!.buffer.asUint8List());
+      String? seqDir;
+      if (hasCurve && durationSec > 1) {
+        if (mounted) setState(() => _hint = '正在生成心率曲线动画…');
+        // 有效采样(升序时间)
+        final pts = _samples.where((s) => s.bpm > 0).toList();
+        seqDir = '${workDir.path}/${stamp}_seq';
+        final seq = Directory(seqDir);
+        if (seq.existsSync()) seq.deleteSync(recursive: true);
+        seq.createSync(recursive: true);
+
+        final frameCount = durationSec.ceil() + 1; // 每秒一帧,含起始与结束
+        var idx = 0; // pts 中最后一个 <= nowMs 的下标
+        for (var f = 0; f < frameCount; f++) {
+          final nowMs = (f * 1000).clamp(0, (durationSec * 1000).round());
+          // 该帧"当前心率":时间 <= nowMs 的最近一次采样
+          while (idx + 1 < pts.length && pts[idx + 1].ms <= nowMs) {
+            idx++;
+          }
+          final cur = pts[idx].bpm.toDouble();
+          final img = await _renderCurveFrame(curW, curH, nowMs, curBpm: cur);
+          final data = await img.toByteData(format: ui.ImageByteFormat.png);
+          final name = '${seq.path}/curve_${f.toString().padLeft(4, '0')}.png';
+          File(name).writeAsBytesSync(data!.buffer.asUint8List());
+        }
       }
 
-      // 3) FFmpeg 烧录:字幕滤镜 + (曲线 PNG overlay)+ 重新编码为 mp4
+      // 3) FFmpeg 烧录:字幕滤镜 + (曲线动画序列 overlay)+ 重新编码
       if (mounted) setState(() => _hint = '正在合成心率到视频…');
       final outPath = '${workDir.path}/$stamp.mp4';
       String cmd;
-      if (curvePath != null) {
-        // 双输入:0=原始视频(先烧字幕),1=曲线透明PNG(overlay)
+      if (seqDir != null) {
+        // 输入0=原始视频(先烧字幕),输入1=曲线动画序列(1帧/秒)
         cmd =
-            '-y -i "${raw.path}" -i "$curvePath" '
+            '-y -i "${raw.path}" -framerate 1 -i "$seqDir/curve_%04d.png" '
             '-filter_complex '
             '"[0:v]ass=$assPath[base];'
-            '[1:v]format=rgba,scale=$curW:$curH[ov];'
-            '[base][ov]overlay=x=$curX:y=$curY[outv]" '
+            '[1:v]scale=$curW:$curH,format=rgba,fps=30[ov];'
+            '[base][ov]overlay=x=$curX:y=$curY:eof_action=repeat[outv]" '
             '-map "[outv]" -map 0:a? '
             '-c:v libx264 -preset veryfast -crf 22 '
             '-c:a aac -b:a 128k "$outPath"';
@@ -389,7 +406,9 @@ class _CameraPageState extends State<CameraPage> {
       // 清理工作文件
       try {
         File(assPath).deleteSync();
-        if (curvePath != null) File(curvePath).deleteSync();
+        if (seqDir != null) {
+          Directory(seqDir).deleteSync(recursive: true);
+        }
         File(outPath).deleteSync();
         File(raw.path).deleteSync();
       } catch (_) {}
@@ -471,68 +490,114 @@ class _CameraPageState extends State<CameraPage> {
     return '$h:${two(m)}:${two(s)}.${two(cs)}';
   }
 
-  /// 生成"心率曲线"透明 PNG:画面右上角心率文字的正下方,大小与文字相近
-  Future<ui.Image> _renderCurveImage(int w, int h, double durationSec) async {
+  /// 渲染"最近10秒滑动窗口"心率曲线帧。
+  /// 窗口右端 = nowMs,横轴为最近 10 秒;纵轴固定为 [cur-30, cur+10](cur=当前心率);
+  /// 曲线区带边框,末端红点并标注当前心率数值。
+  Future<ui.Image> _renderCurveFrame(
+    int w,
+    int h,
+    int nowMs, {
+    required double curBpm,
+  }) async {
     final rec = ui.PictureRecorder();
     final canvas = Canvas(rec);
-    const pad = 4.0;
+    const winMs = 10000; // 10 秒窗口
 
-    // 有效采样(去掉占位的 0)
+    // 有效采样
     final pts = _samples.where((s) => s.bpm > 0).toList();
-    // 黑色半透明圆角底,保证亮背景上也清晰
-    final bg = Paint()..color = const Color(0x99000000);
-    canvas.drawRRect(
-      RRect.fromRectAndRadius(
-        Rect.fromLTWH(0, 0, w.toDouble(), h.toDouble()),
-        const Radius.circular(6),
-      ),
-      bg,
-    );
+    // 该帧取 [nowMs-10s, nowMs] 内的点
+    final inWin = pts
+        .where((s) => s.ms <= nowMs && s.ms >= nowMs - winMs)
+        .toList();
+    // 若窗口里没点但历史有更早数据,曲线从窗口左端开始画空窗(无点则只画边框)
+    final cur = curBpm <= 0
+        ? (pts.isEmpty ? 90.0 : pts.last.bpm.toDouble())
+        : curBpm;
 
-    if (pts.length >= 2) {
-      var minB = pts.first.bpm;
-      var maxB = pts.first.bpm;
-      for (final p in pts) {
-        if (p.bpm < minB) minB = p.bpm;
-        if (p.bpm > maxB) maxB = p.bpm;
-      }
-      if (maxB - minB < 8) {
-        minB = minB - 4 < 30 ? 30 : minB - 4;
-        maxB = maxB + 4;
-      }
-      final durMs = durationSec * 1000;
-      // 先画黑色粗线做描边,再画红线,视觉与 ASS 文本描边一致
+    // 半透明黑圆角底
+    final bg = Paint()..color = const Color(0x99000000);
+    final outer = RRect.fromRectAndRadius(
+      Rect.fromLTWH(0, 0, w.toDouble(), h.toDouble()),
+      const Radius.circular(6),
+    );
+    canvas.drawRRect(outer, bg);
+    // 边框(白色细线)
+    final border = Paint()
+      ..color = const Color(0xCCFFFFFF)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1.2;
+    canvas.drawRRect(outer, border);
+
+    // 纵轴范围:上 cur+10,下 cur-30
+    var topV = cur + 10;
+    var botV = cur - 30;
+    if (botV < 0) botV = 0;
+    if (topV - botV < 10) topV = botV + 10;
+    final rangeV = topV - botV;
+    const pad = 3.0;
+
+    double px(int ms) => (pad + (ms - (nowMs - winMs)) / winMs * (w - pad * 2))
+        .clamp(pad, w - pad)
+        .toDouble();
+    double py(double bpm) => ((h - pad) - (bpm - botV) / rangeV * (h - pad * 2))
+        .clamp(pad, h - pad)
+        .toDouble();
+
+    if (inWin.length >= 2) {
       Paint line(Color c, double width) => Paint()
         ..color = c
         ..style = PaintingStyle.stroke
         ..strokeWidth = width
         ..strokeCap = StrokeCap.round
         ..strokeJoin = StrokeJoin.round;
-      final ptsPath = Path();
-      for (var i = 0; i < pts.length; i++) {
-        final x = pad + (pts[i].ms / durMs) * (w - pad * 2);
-        final y =
-            (h - pad) - ((pts[i].bpm - minB) / (maxB - minB)) * (h - pad * 2);
+      final p = Path();
+      for (var i = 0; i < inWin.length; i++) {
+        final x = px(inWin[i].ms);
+        final y = py(inWin[i].bpm.toDouble());
         if (i == 0) {
-          ptsPath.moveTo(x.clamp(0, w).toDouble(), y.clamp(0, h).toDouble());
+          p.moveTo(x, y);
         } else {
-          ptsPath.lineTo(x.clamp(0, w).toDouble(), y.clamp(0, h).toDouble());
+          p.lineTo(x, y);
         }
       }
-      canvas.drawPath(ptsPath, line(Colors.black, 3.4));
-      canvas.drawPath(ptsPath, line(const Color(0xFFFF3B30), 1.8));
+      canvas.drawPath(p, line(Colors.black, 3.2));
+      canvas.drawPath(p, line(const Color(0xFFFF3B30), 1.8));
+    }
 
-      // 端点圆点
-      final last = pts.last;
-      final lx = pad + (last.ms / durMs) * (w - pad * 2);
-      final ly =
-          (h - pad) - ((last.bpm - minB) / (maxB - minB)) * (h - pad * 2);
+    // 末端红点 + 当前心率数字标注
+    if (inWin.isNotEmpty) {
+      final last = inWin.last;
+      final lx = px(last.ms);
+      final ly = py(last.bpm.toDouble());
       canvas.drawCircle(
-        Offset(lx.clamp(0, w).toDouble(), ly.clamp(0, h).toDouble()),
-        (w * 0.02).clamp(1.5, 4.0),
+        Offset(lx, ly),
+        (w * 0.018).clamp(1.6, 3.6),
         Paint()..color = const Color(0xFFFF3B30),
       );
+      // 数字文本:放在末端右侧,空间不足则放左侧
+      final fs = (h * 0.46).clamp(8.0, 60.0).toDouble();
+      final txt = TextPainter(
+        text: TextSpan(
+          text: last.bpm.toString(),
+          style: TextStyle(
+            color: const Color(0xFFFF3B30),
+            fontSize: fs,
+            fontWeight: FontWeight.bold,
+            shadows: const [Shadow(color: Colors.black, blurRadius: 2)],
+          ),
+        ),
+        textDirection: TextDirection.ltr,
+      )..layout();
+      double tx;
+      if (lx + txt.width + 4 <= w - pad) {
+        tx = lx + 4;
+      } else {
+        tx = lx - 4 - txt.width;
+      }
+      final ty = (ly - txt.height / 2).clamp(0.0, (h - txt.height).toDouble());
+      txt.paint(canvas, Offset(tx, ty));
     }
+
     final pic = rec.endRecording();
     return pic.toImage(w, h);
   }
