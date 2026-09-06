@@ -1073,7 +1073,7 @@ class _CameraPageState extends State<CameraPage> {
       body: Stack(
         children: [
           // ── 相机预览 ──
-          // 竖屏:0 度不旋转,按相机画面比例完整显示、居中(黑边补齐)
+          // 竖屏:0 度不旋转,cover 裁切填满 9:16 全屏(放大居中、左右裁边)
           // 横屏:固定 4:3 取景框,cover 裁切不变形
           if (cam != null && cam.value.isInitialized)
             Positioned.fill(
@@ -1083,13 +1083,39 @@ class _CameraPageState extends State<CameraPage> {
                   final sh = cons.maxHeight;
 
                   if (!isLandscape) {
-                    // 竖屏:直接完整显示相机画面(0 度旋转,无拉伸无裁剪)
+                    // 竖屏:9:16 全屏为显示框,相机画面 0 度 cover 填满
+                    final a = cam.value.aspectRatio <= 0
+                        ? 9.0 / 16.0
+                        : cam.value.aspectRatio;
+                    final tRatio = sw / sh; // 屏幕比例(约9:16或更细长)
+                    double iw, ih;
+                    if (a > tRatio) {
+                      // 画面更宽:按高度填满,宽度超出裁左右
+                      ih = sh;
+                      iw = ih * a;
+                    } else {
+                      // 画面更高/相近:按宽度填满,高度超出裁上下
+                      iw = sw;
+                      ih = iw / a;
+                    }
                     return Center(
-                      child: AspectRatio(
-                        aspectRatio: cam.value.aspectRatio <= 0
-                            ? 9.0 / 16.0
-                            : cam.value.aspectRatio,
-                        child: CameraPreview(cam),
+                      child: SizedBox(
+                        width: sw,
+                        height: sh,
+                        child: ClipRect(
+                          child: OverflowBox(
+                            alignment: Alignment.center,
+                            minWidth: iw,
+                            maxWidth: iw,
+                            minHeight: ih,
+                            maxHeight: ih,
+                            child: SizedBox(
+                              width: iw,
+                              height: ih,
+                              child: CameraPreview(cam),
+                            ),
+                          ),
+                        ),
                       ),
                     );
                   }
