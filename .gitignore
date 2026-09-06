@@ -46,3 +46,7 @@ app.*.map.json
 
 # Widget Preview related
 .widget_preview/
+
+# 本地产物
+final_ipa/
+app-ipa.zip
