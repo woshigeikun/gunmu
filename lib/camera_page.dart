@@ -338,11 +338,11 @@ class _CameraPageState extends State<CameraPage> {
       final fontSize = (height * 0.045).round().clamp(24, 200);
       const marginRight = 30.0;
       const marginTop = 40.0;
-      // 心率文字高度≈fontSize,曲线放在其下方:宽≈字号*2.6,高≈字号*1.0
-      final curW = (fontSize * 2.6).round().clamp(60, 600);
-      final curH = (fontSize * 1.0).round().clamp(24, 240);
+      // 心率文字高度≈fontSize,曲线放其下方;加右侧数字列与上下限标注,略加高
+      final curW = (fontSize * 3.0).round().clamp(80, 720);
+      final curH = (fontSize * 1.35).round().clamp(32, 320);
       final curX = (width - marginRight - curW).round();
-      final curY = (marginTop + fontSize * 1.15).round();
+      final curY = (marginTop + fontSize * 1.12).round();
 
       _writeAss(assPath, width, height, durationSec);
       String? seqDir;
@@ -492,7 +492,8 @@ class _CameraPageState extends State<CameraPage> {
 
   /// 渲染"最近10秒滑动窗口"心率曲线帧。
   /// 窗口右端 = nowMs,横轴为最近 10 秒;纵轴固定为 [cur-30, cur+10](cur=当前心率);
-  /// 曲线区带边框,末端红点并标注当前心率数值。
+  /// 曲线区带边框,框内左上/左下标注上下限(cur+10 / cur-30),
+  /// 曲线右端红点,右侧窄列用缩小字号显示当前心率。
   Future<ui.Image> _renderCurveFrame(
     int w,
     int h,
@@ -509,7 +510,7 @@ class _CameraPageState extends State<CameraPage> {
     final inWin = pts
         .where((s) => s.ms <= nowMs && s.ms >= nowMs - winMs)
         .toList();
-    // 若窗口里没点但历史有更早数据,曲线从窗口左端开始画空窗(无点则只画边框)
+    // 纵轴中心 = 该帧当前心率
     final cur = curBpm <= 0
         ? (pts.isEmpty ? 90.0 : pts.last.bpm.toDouble())
         : curBpm;
@@ -534,14 +535,54 @@ class _CameraPageState extends State<CameraPage> {
     if (botV < 0) botV = 0;
     if (topV - botV < 10) topV = botV + 10;
     final rangeV = topV - botV;
-    const pad = 3.0;
 
-    double px(int ms) => (pad + (ms - (nowMs - winMs)) / winMs * (w - pad * 2))
-        .clamp(pad, w - pad)
-        .toDouble();
+    // 右侧留一窄列给当前心率数字
+    final labelW = (w * 0.24).clamp(18.0, 90.0).toDouble();
+    final plotR = (w - labelW - 1).toDouble(); // 曲线绘图右边界
+    final pad = 3.0;
+
+    double px(int ms) =>
+        (pad + (ms - (nowMs - winMs)) / winMs * (plotR - pad * 2))
+            .clamp(pad, plotR)
+            .toDouble();
     double py(double bpm) => ((h - pad) - (bpm - botV) / rangeV * (h - pad * 2))
         .clamp(pad, h - pad)
         .toDouble();
+
+    // ── 上下限标注(小字,叠在绘图区上/下沿)──
+    double labelFont = (h * 0.24).clamp(7.0, 22.0).toDouble();
+    void drawLabel(String s, double x, double y, {bool top = true}) {
+      final tp = TextPainter(
+        text: TextSpan(
+          text: s,
+          style: TextStyle(
+            color: const Color(0xCCFFFFFF),
+            fontSize: labelFont,
+            fontWeight: FontWeight.w600,
+            shadows: const [Shadow(color: Colors.black, blurRadius: 1.5)],
+          ),
+        ),
+        textDirection: TextDirection.ltr,
+      )..layout();
+      tp.paint(canvas, Offset(x, y));
+    }
+
+    // 上限值画在绘图区左上角,下限值画在左下角(绘图区内,不与曲线打架时用对角)
+    drawLabel(topV.round().toString(), pad, 1.5);
+    final botTxt = botV.round().toString();
+    final botTP = TextPainter(
+      text: TextSpan(
+        text: botTxt,
+        style: TextStyle(
+          color: const Color(0xCCFFFFFF),
+          fontSize: labelFont,
+          fontWeight: FontWeight.w600,
+          shadows: const [Shadow(color: Colors.black, blurRadius: 1.5)],
+        ),
+      ),
+      textDirection: TextDirection.ltr,
+    )..layout();
+    botTP.paint(canvas, Offset(pad, h - botTP.height - 1));
 
     if (inWin.length >= 2) {
       Paint line(Color c, double width) => Paint()
@@ -564,18 +605,18 @@ class _CameraPageState extends State<CameraPage> {
       canvas.drawPath(p, line(const Color(0xFFFF3B30), 1.8));
     }
 
-    // 末端红点 + 当前心率数字标注
+    // ── 末端红点(绘图区右边界)+ 右侧窄列:当前心率(缩小字号)──
     if (inWin.isNotEmpty) {
       final last = inWin.last;
       final lx = px(last.ms);
       final ly = py(last.bpm.toDouble());
       canvas.drawCircle(
         Offset(lx, ly),
-        (w * 0.018).clamp(1.6, 3.6),
+        (w * 0.016).clamp(1.4, 3.2),
         Paint()..color = const Color(0xFFFF3B30),
       );
-      // 数字文本:放在末端右侧,空间不足则放左侧
-      final fs = (h * 0.46).clamp(8.0, 60.0).toDouble();
+
+      final fs = (h * 0.34).clamp(7.0, 26.0).toDouble(); // 缩小后的字号
       final txt = TextPainter(
         text: TextSpan(
           text: last.bpm.toString(),
@@ -588,12 +629,10 @@ class _CameraPageState extends State<CameraPage> {
         ),
         textDirection: TextDirection.ltr,
       )..layout();
-      double tx;
-      if (lx + txt.width + 4 <= w - pad) {
-        tx = lx + 4;
-      } else {
-        tx = lx - 4 - txt.width;
-      }
+      // 数字固定在右侧窄列,垂直居中于红点高度
+      final tx = (w - labelW + (labelW - txt.width) / 2)
+          .clamp(plotR + 1.0, w - txt.width - 1.0)
+          .toDouble();
       final ty = (ly - txt.height / 2).clamp(0.0, (h - txt.height).toDouble());
       txt.paint(canvas, Offset(tx, ty));
     }
