@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:ui' as ui;
 
 import 'package:camera/camera.dart';
 import 'package:ffmpeg_kit_flutter_new/ffmpeg_kit.dart';
@@ -36,6 +37,17 @@ class _CameraPageState extends State<CameraPage> {
   final Stopwatch _timer = Stopwatch();
   Timer? _ticker; // 录制期间每秒刷新界面(修复计时不动 bug)
   String _hint = '';
+  double _zoom = 1.0; // 当前变焦倍数(等效 35mm 主摄按 26mm 起算)
+
+  /// 常用变焦档位:倍数 + 等效焦距文案(26mm × 倍数)
+  static const List<(double, String)> _zoomPresets = [
+    (0.5, '0.5x · 13mm 超广'),
+    (1.0, '1x · 26mm 主摄'),
+    (2.0, '2x · 52mm'),
+    (3.0, '3x · 78mm'),
+    (5.0, '5x · 130mm'),
+    (10.0, '10x · 260mm'),
+  ];
 
   // 录像期间的心率时间线(用于烧录)
   final List<_HrSample> _samples = [];
@@ -83,22 +95,151 @@ class _CameraPageState extends State<CameraPage> {
     setState(() {
       _cam = c;
       _camIndex = index;
+      _zoom = 1.0; // 切换镜头后变焦回到 1x
     });
   }
 
-  /// 切换前后摄像头(录制/处理中禁止)
-  Future<void> _switchCamera() async {
-    if (_recording || _busy || _cameras.length < 2) return;
-    _busy = true;
-    _refresh();
+  /// 打开镜头选择面板:平铺所有摄像头方向与可用变焦档位(含等效 mm)
+  Future<void> _showLensSheet() async {
+    final cam = _cam;
+    if (cam == null || !cam.value.isInitialized) return;
+    if (_recording || _busy) return; // 录制/处理中禁止切换
+    double minZ = 1, maxZ = 1;
     try {
-      await _openCamera((_camIndex + 1) % _cameras.length);
-    } catch (e) {
-      if (mounted) setState(() => _hint = '切换摄像头失败: $e');
-    } finally {
-      _busy = false;
-      _refresh();
-    }
+      minZ = await cam.getMinZoomLevel();
+      maxZ = await cam.getMaxZoomLevel();
+    } catch (_) {}
+    if (!mounted) return;
+
+    // 过滤当前可达的档位(±0.01 容差)
+    final reachable = _zoomPresets
+        .where((p) => p.$1 >= minZ - 0.01 && p.$1 <= maxZ + 0.01)
+        .toList();
+    final isFront =
+        _cameras[_camIndex].lensDirection == CameraLensDirection.front;
+
+    await showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: const Color(0xFF1C1C1E),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (ctx) {
+        return SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(20, 16, 20, 24),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  '镜头与变焦',
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 18,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  '等效 35mm 焦距(主摄 26mm 起算)',
+                  style: TextStyle(color: Colors.white54, fontSize: 12),
+                ),
+                const SizedBox(height: 14),
+
+                // ── 摄像头方向 ──
+                Wrap(
+                  spacing: 10,
+                  children: List.generate(_cameras.length, (i) {
+                    final d = _cameras[i];
+                    final sel = i == _camIndex;
+                    final label = d.lensDirection == CameraLensDirection.front
+                        ? '前置摄像头'
+                        : '后置摄像头';
+                    return ChoiceChip(
+                      label: Text(
+                        label,
+                        style: TextStyle(
+                          color: sel ? Colors.black : Colors.white,
+                        ),
+                      ),
+                      selected: sel,
+                      selectedColor: Colors.white,
+                      backgroundColor: Colors.white10,
+                      onSelected: (_) async {
+                        Navigator.pop(ctx);
+                        if (i != _camIndex) {
+                          await _openCamera(i); // 会重置 zoom 为 1x
+                        }
+                      },
+                    );
+                  }),
+                ),
+                const SizedBox(height: 16),
+
+                // ── 变焦档位 ──
+                Text(
+                  isFront ? '前置摄像头通常为 1x' : '变焦档位',
+                  style: TextStyle(color: Colors.white70, fontSize: 13),
+                ),
+                const SizedBox(height: 8),
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: _zoomPresets.map((p) {
+                    final ok = p.$1 >= minZ - 0.01 && p.$1 <= maxZ + 0.01;
+                    final active = (_zoom - p.$1).abs() < 0.01;
+                    final color = !ok
+                        ? Colors.white12
+                        : (active ? Colors.redAccent : Colors.white24);
+                    return InkWell(
+                      onTap: ok
+                          ? () async {
+                              try {
+                                await cam.setZoomLevel(p.$1);
+                                if (mounted) setState(() => _zoom = p.$1);
+                              } catch (_) {}
+                              if (ctx.mounted) Navigator.pop(ctx);
+                            }
+                          : null,
+                      borderRadius: BorderRadius.circular(10),
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 14,
+                          vertical: 10,
+                        ),
+                        decoration: BoxDecoration(
+                          color: color,
+                          borderRadius: BorderRadius.circular(10),
+                        ),
+                        child: Text(
+                          p.$2,
+                          style: TextStyle(
+                            color: ok
+                                ? (active ? Colors.black : Colors.white)
+                                : Colors.white30,
+                            fontSize: 13,
+                            fontWeight: active ? FontWeight.bold : null,
+                          ),
+                        ),
+                      ),
+                    );
+                  }).toList(),
+                ),
+                if (reachable.isEmpty)
+                  const Padding(
+                    padding: EdgeInsets.only(top: 8),
+                    child: Text(
+                      '当前镜头无可选变焦档位',
+                      style: TextStyle(color: Colors.white38, fontSize: 12),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
   }
 
   Future<void> _toggleRecord() async {
@@ -185,21 +326,55 @@ class _CameraPageState extends State<CameraPage> {
         durationSec = _timer.elapsedMilliseconds / 1000.0;
       }
 
-      // 2) 生成 ASS 字幕:每个心率采样一条,右上角显示 ❤ bpm(红色)
+      // 2) 生成 ASS 字幕(右上角 ♥ bpm)+ 心率曲线 PNG(文字正下方)
       final docs = await getApplicationDocumentsDirectory();
       final workDir = Directory('${docs.path}/work');
       if (!workDir.existsSync()) workDir.createSync(recursive: true);
       final stamp = DateTime.now().millisecondsSinceEpoch;
       final assPath = '${workDir.path}/$stamp.ass';
-      _writeAss(assPath, width, height, durationSec);
+      final hasCurve = _samples.where((s) => s.bpm > 0).length >= 2;
 
-      // 3) FFmpeg 烧录:字幕滤镜 + 重新编码为 mp4
+      // 曲线区域尺寸:与心率文字一致(MarginR=30、MarginV=40、字号=高4.5%)
+      final fontSize = (height * 0.045).round().clamp(24, 200);
+      const marginRight = 30.0;
+      const marginTop = 40.0;
+      // 心率文字高度≈fontSize,曲线放在其下方:宽≈字号*2.6,高≈字号*1.0
+      final curW = (fontSize * 2.6).round().clamp(60, 600);
+      final curH = (fontSize * 1.0).round().clamp(24, 240);
+      final curX = (width - marginRight - curW).round();
+      final curY = (marginTop + fontSize * 1.15).round();
+
+      _writeAss(assPath, width, height, durationSec);
+      String? curvePath;
+      if (hasCurve) {
+        if (mounted) setState(() => _hint = '正在生成心率曲线…');
+        final img = await _renderCurveImage(curW, curH, durationSec);
+        final data = await img.toByteData(format: ui.ImageByteFormat.png);
+        curvePath = '${workDir.path}/$stamp.png';
+        File(curvePath).writeAsBytesSync(data!.buffer.asUint8List());
+      }
+
+      // 3) FFmpeg 烧录:字幕滤镜 + (曲线 PNG overlay)+ 重新编码为 mp4
       if (mounted) setState(() => _hint = '正在合成心率到视频…');
       final outPath = '${workDir.path}/$stamp.mp4';
-      final cmd =
-          '-y -i "${raw.path}" -vf "ass=$assPath" '
-          '-c:v libx264 -preset veryfast -crf 22 '
-          '-c:a aac -b:a 128k "$outPath"';
+      String cmd;
+      if (curvePath != null) {
+        // 双输入:0=原始视频(先烧字幕),1=曲线透明PNG(overlay)
+        cmd =
+            '-y -i "${raw.path}" -i "$curvePath" '
+            '-filter_complex '
+            '"[0:v]ass=$assPath[base];'
+            '[1:v]format=rgba,scale=$curW:$curH[ov];'
+            '[base][ov]overlay=x=$curX:y=$curY[outv]" '
+            '-map "[outv]" -map 0:a? '
+            '-c:v libx264 -preset veryfast -crf 22 '
+            '-c:a aac -b:a 128k "$outPath"';
+      } else {
+        cmd =
+            '-y -i "${raw.path}" -vf "ass=$assPath" '
+            '-c:v libx264 -preset veryfast -crf 22 '
+            '-c:a aac -b:a 128k "$outPath"';
+      }
       final session = await FFmpegKit.execute(cmd);
       final rc = await session.getReturnCode();
       if (!ReturnCode.isSuccess(rc)) {
@@ -214,6 +389,7 @@ class _CameraPageState extends State<CameraPage> {
       // 清理工作文件
       try {
         File(assPath).deleteSync();
+        if (curvePath != null) File(curvePath).deleteSync();
         File(outPath).deleteSync();
         File(raw.path).deleteSync();
       } catch (_) {}
@@ -237,10 +413,8 @@ class _CameraPageState extends State<CameraPage> {
 
   /// 生成 ASS 字幕文件:右上角显示 ♥ bpm,文本红色、黑描边
   void _writeAss(String path, int width, int height, double durationSec) {
-    // 心率采样点若为空,给个占位值
-    if (_samples.isEmpty) {
-      _samples.add(_HrSample(0, 0));
-    }
+    // 心率采样点若为空,用局部占位(不污染 _samples)
+    final eff = _samples.isEmpty ? [_HrSample(0, 0)] : _samples;
     // 字体大小按画面高度约 4%
     final fontSize = (height * 0.045).round().clamp(24, 200);
 
@@ -270,10 +444,10 @@ class _CameraPageState extends State<CameraPage> {
       );
 
     // 逐条字幕:每条从采样时间点持续到下一个采样点(或视频末尾)
-    for (var i = 0; i < _samples.length; i++) {
-      final s = _samples[i];
-      final endMs = (i + 1 < _samples.length)
-          ? _samples[i + 1].ms
+    for (var i = 0; i < eff.length; i++) {
+      final s = eff[i];
+      final endMs = (i + 1 < eff.length)
+          ? eff[i + 1].ms
           : (durationSec * 1000).round();
       // 至少显示 0.8 秒,防止过快闪没
       var e = endMs;
@@ -295,6 +469,72 @@ class _CameraPageState extends State<CameraPage> {
     final cs = ((sec - sec.floorToDouble()) * 100).round();
     String two(int v) => v.toString().padLeft(2, '0');
     return '$h:${two(m)}:${two(s)}.${two(cs)}';
+  }
+
+  /// 生成"心率曲线"透明 PNG:画面右上角心率文字的正下方,大小与文字相近
+  Future<ui.Image> _renderCurveImage(int w, int h, double durationSec) async {
+    final rec = ui.PictureRecorder();
+    final canvas = Canvas(rec);
+    const pad = 4.0;
+
+    // 有效采样(去掉占位的 0)
+    final pts = _samples.where((s) => s.bpm > 0).toList();
+    // 黑色半透明圆角底,保证亮背景上也清晰
+    final bg = Paint()..color = const Color(0x99000000);
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(
+        Rect.fromLTWH(0, 0, w.toDouble(), h.toDouble()),
+        const Radius.circular(6),
+      ),
+      bg,
+    );
+
+    if (pts.length >= 2) {
+      var minB = pts.first.bpm;
+      var maxB = pts.first.bpm;
+      for (final p in pts) {
+        if (p.bpm < minB) minB = p.bpm;
+        if (p.bpm > maxB) maxB = p.bpm;
+      }
+      if (maxB - minB < 8) {
+        minB = minB - 4 < 30 ? 30 : minB - 4;
+        maxB = maxB + 4;
+      }
+      final durMs = durationSec * 1000;
+      // 先画黑色粗线做描边,再画红线,视觉与 ASS 文本描边一致
+      Paint line(Color c, double width) => Paint()
+        ..color = c
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = width
+        ..strokeCap = StrokeCap.round
+        ..strokeJoin = StrokeJoin.round;
+      final ptsPath = Path();
+      for (var i = 0; i < pts.length; i++) {
+        final x = pad + (pts[i].ms / durMs) * (w - pad * 2);
+        final y =
+            (h - pad) - ((pts[i].bpm - minB) / (maxB - minB)) * (h - pad * 2);
+        if (i == 0) {
+          ptsPath.moveTo(x.clamp(0, w).toDouble(), y.clamp(0, h).toDouble());
+        } else {
+          ptsPath.lineTo(x.clamp(0, w).toDouble(), y.clamp(0, h).toDouble());
+        }
+      }
+      canvas.drawPath(ptsPath, line(Colors.black, 3.4));
+      canvas.drawPath(ptsPath, line(const Color(0xFFFF3B30), 1.8));
+
+      // 端点圆点
+      final last = pts.last;
+      final lx = pad + (last.ms / durMs) * (w - pad * 2);
+      final ly =
+          (h - pad) - ((last.bpm - minB) / (maxB - minB)) * (h - pad * 2);
+      canvas.drawCircle(
+        Offset(lx.clamp(0, w).toDouble(), ly.clamp(0, h).toDouble()),
+        (w * 0.02).clamp(1.5, 4.0),
+        Paint()..color = const Color(0xFFFF3B30),
+      );
+    }
+    final pic = rec.endRecording();
+    return pic.toImage(w, h);
   }
 
   void _refresh() {
@@ -356,22 +596,30 @@ class _CameraPageState extends State<CameraPage> {
             },
           ),
 
-          // ── 切换摄像头按钮(左上角,录制中禁用)──
+          // ── 镜头/变焦按钮(左上角,录制中禁用)──
           Positioned(
             top: 60,
             left: 16,
             child: IconButton(
-              onPressed: (_recording || _busy || _cameras.length < 2)
-                  ? null
-                  : _switchCamera,
-              icon: const Icon(
-                Icons.cameraswitch,
-                color: Colors.white,
-                size: 28,
-              ),
+              onPressed: (_recording || _busy) ? null : _showLensSheet,
+              icon: const Icon(Icons.camera_alt, color: Colors.white, size: 26),
               style: IconButton.styleFrom(
                 backgroundColor: Colors.black38,
                 disabledBackgroundColor: Colors.black12,
+              ),
+            ),
+          ),
+
+          // 当前等效焦距显示(左上角按钮下方)
+          Positioned(
+            top: 100,
+            left: 16,
+            child: Text(
+              '${(_zoom * 26).round()}mm',
+              style: const TextStyle(
+                color: Colors.white70,
+                fontSize: 11,
+                backgroundColor: Colors.black38,
               ),
             ),
           ),
