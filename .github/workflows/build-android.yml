@@ -17,8 +17,11 @@ jobs:
           java-version: '17'
 
       - run: flutter pub get
-      - run: flutter build apk --release
+
+      # 按 CPU 架构分包,避免单个 APK 过大(内含 FFmpeg 原生库)
+      - run: flutter build apk --release --split-per-abi
+
       - uses: actions/upload-artifact@v4
         with:
           name: app-apk
-          path: build/app/outputs/flutter-apk/app-release.apk
+          path: build/app/outputs/flutter-apk/*.apk

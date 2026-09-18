@@ -50,3 +50,7 @@ app.*.map.json
 # 本地产物
 final_ipa/
 app-ipa.zip
+
+# 本地构建产物
+final_apk/
+final_ipa/
