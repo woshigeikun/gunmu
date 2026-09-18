@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:io';
-import 'dart:math' as math;
 import 'dart:ui' as ui;
 
 import 'package:camera/camera.dart';
@@ -1110,41 +1109,36 @@ class _CameraPageState extends State<CameraPage> {
       backgroundColor: Colors.black,
       body: Stack(
         children: [
-          // ── 相机预览:始终按"横屏画布"渲染 ──
-          // 画布固定用长边×短边(与横屏时完全相同),竖屏时把整个画布整体旋转90°,
-          // 几何与内容都不重算 → 不拉伸、不裁切。横竖屏只影响 UI 布局与成片方向。
+          // ── 相机预览 ──
+          // 重要:iOS 相机插件会把"输出画面"随设备方向旋转,但 value.aspectRatio
+          // 始终返回捕获格式的原始比例(横向,如 1.78)。因此竖屏时纹理实际是竖向,
+          // 必须用 1/aspectRatio 的竖比例来显示,否则画面会被横向拉伸。
+          // 预览不做任何旋转;竖屏 cover 铺满全屏,横屏沿用 4:3 取景框。
           if (cam != null && cam.value.isInitialized)
             Positioned.fill(
               child: LayoutBuilder(
                 builder: (context, cons) {
-                  final longSide = math.max(cons.maxWidth, cons.maxHeight);
-                  final shortSide = math.min(cons.maxWidth, cons.maxHeight);
-                  final a = cam.value.aspectRatio <= 0
+                  final sw = cons.maxWidth;
+                  final sh = cons.maxHeight;
+                  final rawA = cam.value.aspectRatio <= 0
                       ? 4.0 / 3.0
                       : cam.value.aspectRatio;
-                  const tA = 4.0 / 3.0; // 宽:高
-                  // 在横屏画布上取 4:3 取景框(与横屏时完全一致的算法)
-                  double tw, th;
-                  if (longSide / shortSide > tA) {
-                    th = shortSide;
-                    tw = th * tA;
-                  } else {
-                    tw = longSide;
-                    th = tw / tA;
-                  }
-                  // 相机画面 cover 填满取景框(不变形,裁掉多余)
-                  double iw = th * a, ih = th;
-                  if (iw < tw) {
-                    iw = tw;
-                    ih = tw / a;
-                  }
-                  final canvas = SizedBox(
-                    width: longSide,
-                    height: shortSide,
-                    child: Center(
+
+                  // 竖屏:纹理已竖置 → 用竖比例 cover 铺满全屏
+                  if (!isLandscape) {
+                    final a = 1.0 / rawA;
+                    double iw, ih;
+                    if (a > sw / sh) {
+                      ih = sh;
+                      iw = ih * a;
+                    } else {
+                      iw = sw;
+                      ih = iw / a;
+                    }
+                    return Center(
                       child: SizedBox(
-                        width: tw,
-                        height: th,
+                        width: sw,
+                        height: sh,
                         child: ClipRect(
                           child: OverflowBox(
                             alignment: Alignment.center,
@@ -1160,12 +1154,44 @@ class _CameraPageState extends State<CameraPage> {
                           ),
                         ),
                       ),
+                    );
+                  }
+
+                  // 横屏:4:3 取景框(纹理为横向,比例一致,不拉伸)
+                  const tA = 4.0 / 3.0;
+                  double tw, th;
+                  if (sw / sh > tA) {
+                    th = sh;
+                    tw = th * tA;
+                  } else {
+                    tw = sw;
+                    th = tw / tA;
+                  }
+                  double iw = th * rawA, ih = th;
+                  if (iw < tw) {
+                    iw = tw;
+                    ih = tw / rawA;
+                  }
+                  return Center(
+                    child: SizedBox(
+                      width: tw,
+                      height: th,
+                      child: ClipRect(
+                        child: OverflowBox(
+                          alignment: Alignment.center,
+                          minWidth: iw,
+                          maxWidth: iw,
+                          minHeight: ih,
+                          maxHeight: ih,
+                          child: SizedBox(
+                            width: iw,
+                            height: ih,
+                            child: CameraPreview(cam),
+                          ),
+                        ),
+                      ),
                     ),
                   );
-                  // 竖屏:整个横屏画布旋转90°放入(尺寸恰好铺满竖屏)
-                  return isLandscape
-                      ? canvas
-                      : RotatedBox(quarterTurns: 1, child: canvas);
                 },
               ),
             )
