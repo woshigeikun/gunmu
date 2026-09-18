@@ -36,7 +36,8 @@ dependencies:
   cupertino_icons: ^1.0.8
   flutter_blue_plus:
   camera:
-  permission_handler:
+  # 固定 12.x:13.x 的安卓实现要求 compileSdk 37,超出当前 AGP 支持范围
+  permission_handler: ^12.0.3
   path_provider:
   ffmpeg_kit_flutter_new:
   share_plus:
