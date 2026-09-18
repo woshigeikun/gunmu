@@ -76,6 +76,8 @@ class _CameraPageState extends State<CameraPage> {
   final List<int> _history = [];
   // 当前这段录像开始时手环是否已连接(未连接则整段不带心率 UI)
   bool _recordHadBle = false;
+  // 本段录像是否为竖屏(竖屏则成片需旋转为竖向)
+  bool _recordPortrait = true;
 
   @override
   void initState() {
@@ -643,6 +645,9 @@ class _CameraPageState extends State<CameraPage> {
   Future<void> _toggleRecord() async {
     final cam = _cam;
     if (cam == null || !cam.value.isInitialized || _busy) return;
+    // 在 await 之前取当前方向(避免跨 async 使用 context)
+    final isPortraitNow =
+        MediaQuery.of(context).orientation == Orientation.portrait;
     _busy = true;
     _refresh();
     try {
@@ -655,6 +660,8 @@ class _CameraPageState extends State<CameraPage> {
         _samples.clear();
         // 录制开始时刻是否已连手环:决定本段是否显示/烧录心率
         _recordHadBle = widget.ble.isConnected;
+        // 记录本段录制方向:竖屏则成片需要旋转为竖向
+        _recordPortrait = isPortraitNow;
         // 每秒刷新一次界面,让计时数字走动
         _ticker?.cancel();
         _ticker = Timer.periodic(const Duration(seconds: 1), (_) {
@@ -752,6 +759,18 @@ class _CameraPageState extends State<CameraPage> {
         durationSec = _timer.elapsedMilliseconds / 1000.0;
       }
 
+      // 1.5) 方向处理:竖屏录制但视频仍是横向(宽>高)时,成片旋转为竖向。
+      //      旋转后宽高互换,后续字幕/曲线坐标一律按旋转后的尺寸计算。
+      //      transpose=1 顺时针90°;若方向相反改为 2(逆时针90°)。
+      final bool needRotate = _recordPortrait && width > height;
+      const int transposeMode = 1;
+      if (needRotate) {
+        final t = width;
+        width = height;
+        height = t;
+      }
+      final String vfPrefix = needRotate ? 'transpose=$transposeMode,' : '';
+
       // 2) 生成 ASS 字幕(右上角 ♥ bpm)+ 心率曲线 PNG(文字正下方)
       final docs = await getApplicationDocumentsDirectory();
       final workDir = Directory('${docs.path}/work');
@@ -802,11 +821,11 @@ class _CameraPageState extends State<CameraPage> {
       final outPath = '${workDir.path}/$stamp.mp4';
       String cmd;
       if (seqDir != null) {
-        // 输入0=原始视频(先烧字幕),输入1=曲线动画序列(1帧/秒)
+        // 输入0=原始视频(先旋转方向再烧字幕),输入1=曲线动画序列(1帧/秒)
         cmd =
             '-y -i "${raw.path}" -framerate 1 -i "$seqDir/curve_%04d.png" '
             '-filter_complex '
-            '"[0:v]ass=$assPath[base];'
+            '"[0:v]${vfPrefix}ass=$assPath[base];'
             '[1:v]scale=$curW:$curH,format=rgba,fps=30[ov];'
             '[base][ov]overlay=x=$curX:y=$curY:eof_action=repeat[outv]" '
             '-map "[outv]" -map 0:a? '
@@ -814,7 +833,7 @@ class _CameraPageState extends State<CameraPage> {
             '-c:a aac -b:a 128k "$outPath"';
       } else {
         cmd =
-            '-y -i "${raw.path}" -vf "ass=$assPath" '
+            '-y -i "${raw.path}" -vf "${vfPrefix}ass=$assPath" '
             '-c:v libx264 -preset veryfast -crf 22 '
             '-c:a aac -b:a 128k "$outPath"';
       }
@@ -1090,64 +1109,18 @@ class _CameraPageState extends State<CameraPage> {
       backgroundColor: Colors.black,
       body: Stack(
         children: [
-          // ── 相机预览 ──
-          // 竖屏:0 度不旋转,cover 裁切填满 9:16 全屏(放大居中、左右裁边)
-          // 横屏:固定 4:3 取景框,cover 裁切不变形
+          // ── 相机预览(横竖屏统一:始终用横屏那套 4:3 cover 渲染)──
+          // 横竖屏只影响 UI 布局与最终输出视频的旋转,预览逻辑保持同一套
           if (cam != null && cam.value.isInitialized)
             Positioned.fill(
               child: LayoutBuilder(
                 builder: (context, cons) {
                   final sw = cons.maxWidth;
                   final sh = cons.maxHeight;
-
-                  if (!isLandscape) {
-                    // ── 竖屏:标准 9:16 取景框(宽:高=9:16),画面 cover 填满 ──
-                    final a = cam.value.aspectRatio <= 0
-                        ? 9.0 / 16.0
-                        : cam.value.aspectRatio;
-                    // 在屏幕内取最大的 9:16 框
-                    const tA = 9.0 / 16.0; // 宽:高
-                    double tw, th;
-                    if (sw / sh > tA) {
-                      th = sh;
-                      tw = th * tA;
-                    } else {
-                      tw = sw;
-                      th = tw / tA;
-                    }
-                    // 相机画面 cover 填满该 9:16 框(不变形,裁掉多余)
-                    double iw = th * a, ih = th;
-                    if (iw < tw) {
-                      iw = tw;
-                      ih = tw / a;
-                    }
-                    return Center(
-                      child: SizedBox(
-                        width: tw,
-                        height: th,
-                        child: ClipRect(
-                          child: OverflowBox(
-                            alignment: Alignment.center,
-                            minWidth: iw,
-                            maxWidth: iw,
-                            minHeight: ih,
-                            maxHeight: ih,
-                            child: SizedBox(
-                              width: iw,
-                              height: ih,
-                              child: CameraPreview(cam),
-                            ),
-                          ),
-                        ),
-                      ),
-                    );
-                  }
-
-                  // ── 横屏:4:3 取景框 cover ──
                   final a = cam.value.aspectRatio <= 0
                       ? 4.0 / 3.0
                       : cam.value.aspectRatio;
-                  const tA = 4.0 / 3.0;
+                  const tA = 4.0 / 3.0; // 宽:高
                   double tw, th;
                   if (sw / sh > tA) {
                     th = sh;
@@ -1156,6 +1129,7 @@ class _CameraPageState extends State<CameraPage> {
                     tw = sw;
                     th = tw / tA;
                   }
+                  // 相机画面 cover 填满取景框(不变形,裁掉多余)
                   double iw = th * a, ih = th;
                   if (iw < tw) {
                     iw = tw;
