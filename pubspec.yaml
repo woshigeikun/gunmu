@@ -42,6 +42,7 @@ dependencies:
   ffmpeg_kit_flutter_new:
   share_plus:
   video_player:
+  sensors_plus:
 
 dev_dependencies:
   flutter_test:

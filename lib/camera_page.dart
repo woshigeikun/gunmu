@@ -14,6 +14,7 @@ import 'package:share_plus/share_plus.dart';
 import 'package:video_player/video_player.dart';
 
 import 'ble_heart_rate.dart';
+import 'gyro_test_page.dart';
 
 /// 一次心率采样:相对录像开始的时间(毫秒)+ 心率值
 class _HrSample {
@@ -150,6 +151,10 @@ class _CameraPageState extends State<CameraPage> {
   bool _renderBackground = false; // 用户是否选择"后台渲染"
   bool _renderDialogOpen = false; // 进度弹窗是否打开
   final List<ExportItem> _exports = []; // 已导出作品
+
+  // 运动稳定(占位开关,功能待实现;供后续切换使用)
+  // ignore: prefer_final_fields
+  bool _stabilizeEnabled = false;
 
   @override
   void initState() {
@@ -1465,6 +1470,12 @@ class _CameraPageState extends State<CameraPage> {
     );
   }
 
+  /// 打开陀螺仪测试页(运动稳定按钮的临时入口,稳定功能待实现)
+  Future<void> _openGyroTest() async {
+    await Navigator.of(context)
+        .push(MaterialPageRoute<void>(builder: (_) => const GyroTestPage()));
+  }
+
   /// 应用内播放导出的视频
   Future<void> _playExport(ExportItem item) async {
     final controller = VideoPlayerController.file(File(item.path));
@@ -2159,6 +2170,45 @@ class _CameraPageState extends State<CameraPage> {
                 ),
               ),
             ),
+
+          // ── 运动稳定按钮(录像按钮左侧,暂为占位;点击进入陀螺仪测试)──
+          Positioned(
+            bottom: 56,
+            left: isLandscape ? 40 : 28,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Container(
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: Colors.black.withValues(alpha: 0.55),
+                    border: Border.all(
+                      color: _stabilizeEnabled
+                          ? Colors.redAccent
+                          : Colors.white24,
+                      width: 1.5,
+                    ),
+                  ),
+                  child: IconButton(
+                    tooltip: '运动稳定',
+                    onPressed: _openGyroTest,
+                    icon: Icon(
+                      Icons.screen_rotation,
+                      size: 22,
+                      color: _stabilizeEnabled
+                          ? Colors.redAccent
+                          : Colors.white70,
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 4),
+                const Text(
+                  '运动稳定',
+                  style: TextStyle(color: Colors.white54, fontSize: 10),
+                ),
+              ],
+            ),
+          ),
 
           // ── 录像按钮(底部中央)──
           Positioned(
