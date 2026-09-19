@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:math' as math;
 import 'dart:ui' as ui;
 
 import 'package:camera/camera.dart';
@@ -10,6 +11,7 @@ import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'package:sensors_plus/sensors_plus.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:video_player/video_player.dart';
 
@@ -152,9 +154,20 @@ class _CameraPageState extends State<CameraPage> {
   bool _renderDialogOpen = false; // 进度弹窗是否打开
   final List<ExportItem> _exports = []; // 已导出作品
 
-  // 运动稳定(占位开关,功能待实现;供后续切换使用)
-  // ignore: prefer_final_fields
-  bool _stabilizeEnabled = false;
+  // ── 运动稳定(陀螺仪防抖)──
+  bool _stabilizeEnabled = false; // 开关(在弹窗里控制)
+  bool _stabRunning = false; // 是否已点"开始稳定"
+  double _stabAngleX = 0; // 积分得到的 X 角速度 → 角度(度)
+  double _stabOffsetY = 0; // 画面纵向位移(像素)
+  final double _stabGain = 1.6; // 每度对应的位移像素(可调)
+  static const double _stabMargin = 0.14; // 预留余量:画面放大量(可上下移动的范围)
+  final List<List<double>> _stabLog = []; // 记录的陀螺仪数据 [t, gx, gy, gz]
+  DateTime _stabLast = DateTime.now();
+  StreamSubscription<GyroscopeEvent>? _gyroSub;
+  double _minZoom = 1.0;
+  double _maxZoom = 1.0;
+  double _zoomAtGestureStart = 1.0;
+  Size _previewSize = Size.zero; // 当前预览显示区尺寸(用于计算可移动余量)
 
   @override
   void initState() {
@@ -1470,10 +1483,268 @@ class _CameraPageState extends State<CameraPage> {
     );
   }
 
-  /// 打开陀螺仪测试页(运动稳定按钮的临时入口,稳定功能待实现)
+  /// 打开陀螺仪测试页
   Future<void> _openGyroTest() async {
     await Navigator.of(context)
         .push(MaterialPageRoute<void>(builder: (_) => const GyroTestPage()));
+  }
+
+  // ─────────────── 运动稳定(陀螺仪补偿)───────────────
+
+  /// 读取当前镜头可用变焦范围
+  Future<void> _loadZoomRange() async {
+    final cam = _cam;
+    if (cam == null || !cam.value.isInitialized) return;
+    try {
+      _minZoom = await cam.getMinZoomLevel();
+      _maxZoom = await cam.getMaxZoomLevel();
+    } catch (_) {}
+  }
+
+  /// 切到最广视角(有超广角时为 0.5x,否则为该镜头最小变焦)
+  Future<void> _switchToWidest() async {
+    final cam = _cam;
+    if (cam == null) return;
+    try {
+      await cam.setZoomLevel(_minZoom);
+      if (mounted) setState(() => _zoom = _minZoom);
+    } catch (_) {}
+  }
+
+  /// 画面放大量对应的可移动范围(像素,单侧)
+  double _maxStabOffset() {
+    final h = _previewSize.height;
+    if (h <= 0) return 40;
+    return h * _stabMargin / 2;
+  }
+
+  /// 订阅陀螺仪:运行中持续积分并换算为画面位移
+  void _startGyroSession() {
+    _gyroSub?.cancel();
+    _stabLast = DateTime.now();
+    _gyroSub = gyroscopeEventStream(samplingPeriod: SensorInterval.gameInterval)
+        .listen((e) {
+          final now = DateTime.now();
+          final dt = now.difference(_stabLast).inMicroseconds / 1e6;
+          _stabLast = now;
+          if (dt <= 0 || dt > 0.2) return;
+          if (!_stabRunning) return;
+
+          // 积分 X 角速度 → 角度(度);轻微泄漏以抑制长期漂移
+          _stabAngleX += e.x * dt * 180 / math.pi;
+          _stabAngleX *= 0.9985;
+
+          // 记录陀螺仪数据[t, gx, gy, gz]
+          _stabLog.add([now.millisecondsSinceEpoch / 1000.0, e.x, e.y, e.z]);
+          if (_stabLog.length > 60000) _stabLog.removeAt(0);
+
+          // X 值增大 → 画面下移(超出余量则截断)
+          final maxPx = _maxStabOffset();
+          _stabOffsetY = (_stabAngleX * _stabGain).clamp(-maxPx, maxPx);
+
+          if (mounted) setState(() {});
+        }, onError: (_) {});
+  }
+
+  void _stopGyroSession() {
+    _gyroSub?.cancel();
+    _gyroSub = null;
+  }
+
+  /// 运动稳定弹窗(开关 + 陀螺仪测试 + 开始稳定)
+  Future<void> _showStabilizeSheet() async {
+    await _loadZoomRange();
+    if (!mounted) return;
+    await showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: const Color(0xFF1C1C1E),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (ctx) => StatefulBuilder(
+        builder: (context2, setSheetState) {
+          final zoomText = _zoom <= 1.001
+              ? '1.0x'
+              : '${_zoom.toStringAsFixed(1)}x';
+          final hasWide = _minZoom < 0.999;
+          return SafeArea(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(20, 16, 20, 24),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    '运动稳定',
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontSize: 18,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  const Text(
+                    '用陀螺仪补偿手抖:先用超广角并把画面放大留出余量,再开始稳定',
+                    style: TextStyle(color: Colors.white54, fontSize: 12),
+                  ),
+                  SwitchListTile(
+                    contentPadding: EdgeInsets.zero,
+                    value: _stabilizeEnabled,
+                    activeThumbColor: Colors.redAccent,
+                    title: const Text(
+                      '运动稳定',
+                      style: TextStyle(color: Colors.white, fontSize: 15),
+                    ),
+                    subtitle: Text(
+                      _stabilizeEnabled ? '已开启 · 可双指缩放画面' : '关闭',
+                      style: const TextStyle(
+                        color: Colors.white38,
+                        fontSize: 12,
+                      ),
+                    ),
+                    onChanged: (v) async {
+                      setState(() {
+                        _stabilizeEnabled = v;
+                        if (!v) {
+                          _stabRunning = false;
+                          _stabOffsetY = 0;
+                        }
+                      });
+                      if (v) {
+                        await _loadZoomRange();
+                        _startGyroSession();
+                      } else {
+                        _stopGyroSession();
+                      }
+                      setSheetState(() {});
+                    },
+                  ),
+                  const Divider(color: Colors.white12, height: 1),
+                  ListTile(
+                    contentPadding: EdgeInsets.zero,
+                    leading: const Icon(
+                      Icons.screen_rotation,
+                      color: Colors.white70,
+                    ),
+                    title: const Text(
+                      '陀螺仪测试',
+                      style: TextStyle(color: Colors.white, fontSize: 15),
+                    ),
+                    subtitle: const Text(
+                      '立方体随陀螺仪旋转,显示 XYZ 数据',
+                      style: TextStyle(color: Colors.white38, fontSize: 11),
+                    ),
+                    trailing: const Icon(
+                      Icons.chevron_right,
+                      color: Colors.white38,
+                    ),
+                    onTap: () {
+                      Navigator.pop(ctx);
+                      _openGyroTest();
+                    },
+                  ),
+                  if (_stabilizeEnabled) ...[
+                    const SizedBox(height: 8),
+                    Container(
+                      width: double.infinity,
+                      padding: const EdgeInsets.all(12),
+                      decoration: BoxDecoration(
+                        color: Colors.white10,
+                        borderRadius: BorderRadius.circular(10),
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            '当前变焦 $zoomText'
+                            '${hasWide ? '(支持超广角)' : '(镜头最小变焦)'}',
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 13,
+                            ),
+                          ),
+                          const SizedBox(height: 4),
+                          const Text(
+                            '① 切到最广 → ② 双指放大画面留出余量 → ③ 点开始稳定',
+                            style: TextStyle(
+                              color: Colors.white38,
+                              fontSize: 11,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 10),
+                    SizedBox(
+                      width: double.infinity,
+                      child: OutlinedButton.icon(
+                        style: OutlinedButton.styleFrom(
+                          foregroundColor: Colors.white70,
+                          side: const BorderSide(color: Colors.white24),
+                        ),
+                        onPressed: () async {
+                          await _switchToWidest();
+                          setSheetState(() {});
+                        },
+                        icon: const Icon(Icons.zoom_out_map, size: 18),
+                        label: Text('切到最广 ${_minZoom.toStringAsFixed(1)}x'),
+                      ),
+                    ),
+                    const SizedBox(height: 10),
+                    SizedBox(
+                      width: double.infinity,
+                      child: FilledButton.icon(
+                        style: FilledButton.styleFrom(
+                          backgroundColor: _stabRunning
+                              ? Colors.white24
+                              : Colors.redAccent,
+                        ),
+                        onPressed: () {
+                          setState(() {
+                            if (_stabRunning) {
+                              _stabRunning = false;
+                              _stabOffsetY = 0;
+                            } else {
+                              _stabAngleX = 0;
+                              _stabOffsetY = 0;
+                              _stabLog.clear();
+                              _stabLast = DateTime.now();
+                              _stabRunning = true;
+                            }
+                          });
+                          setSheetState(() {});
+                          if (_stabRunning) Navigator.pop(ctx);
+                        },
+                        icon: Icon(
+                          _stabRunning ? Icons.stop : Icons.play_arrow,
+                        ),
+                        label: Text(_stabRunning ? '停止稳定' : '开始稳定'),
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      '已记录 ${_stabLog.length} 条陀螺仪数据 · X 角度 '
+                      '${_stabAngleX.toStringAsFixed(1)}° · 画面位移 '
+                      '${_stabOffsetY.toStringAsFixed(0)}px',
+                      style: const TextStyle(
+                        color: Colors.white38,
+                        fontSize: 11,
+                      ),
+                    ),
+                  ] else ...[
+                    const SizedBox(height: 12),
+                    const Text(
+                      '开启后可:双指缩放画面留出余量、实时记录陀螺仪并补偿画面位移。',
+                      style: TextStyle(color: Colors.white38, fontSize: 11),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          );
+        },
+      ),
+    );
   }
 
   /// 应用内播放导出的视频
@@ -1792,35 +2063,103 @@ class _CameraPageState extends State<CameraPage> {
       body: Stack(
         children: [
           // ── 相机预览 ──
-          // 重要:iOS 相机插件会把"输出画面"随设备方向旋转,但 value.aspectRatio
-          // 始终返回捕获格式的原始比例(横向,如 1.78)。因此竖屏时纹理实际是竖向,
-          // 必须用 1/aspectRatio 的竖比例来显示,否则画面会被横向拉伸。
-          // 预览不做任何旋转;竖屏 cover 铺满全屏,横屏沿用 4:3 取景框。
+          // iOS 相机插件会把输出画面随设备方向旋转,但 value.aspectRatio 始终返回
+          // 捕获格式的原始比例(横向)。故竖屏时纹理实际是竖向,必须用 1/aspectRatio。
+          // 运动稳定开启时:画面额外放大 _stabMargin 形成余量,再按陀螺仪位移取景框。
           if (cam != null && cam.value.isInitialized)
             Positioned.fill(
-              child: LayoutBuilder(
-                builder: (context, cons) {
-                  final sw = cons.maxWidth;
-                  final sh = cons.maxHeight;
-                  final rawA = cam.value.aspectRatio <= 0
-                      ? 4.0 / 3.0
-                      : cam.value.aspectRatio;
+              child: GestureDetector(
+                // 运动稳定开启后:双指缩放画面(留出可移动余量)
+                onScaleStart: _stabilizeEnabled
+                    ? (_) => _zoomAtGestureStart = _zoom
+                    : null,
+                onScaleUpdate: _stabilizeEnabled
+                    ? (d) async {
+                        final camNow = _cam;
+                        if (camNow == null) return;
+                        final z = (_zoomAtGestureStart * d.scale).clamp(
+                          _minZoom <= 0 ? 1.0 : _minZoom,
+                          _maxZoom <= 0 ? 1.0 : _maxZoom,
+                        );
+                        if ((z - _zoom).abs() < 0.01) return;
+                        try {
+                          await camNow.setZoomLevel(z);
+                        } catch (_) {}
+                        if (mounted) setState(() => _zoom = z);
+                      }
+                    : null,
+                child: LayoutBuilder(
+                  builder: (context, cons) {
+                    final sw = cons.maxWidth;
+                    final sh = cons.maxHeight;
+                    // 记录显示区尺寸(供计算稳定可移动范围)
+                    _previewSize = Size(sw, sh);
+                    final rawA = cam.value.aspectRatio <= 0
+                        ? 4.0 / 3.0
+                        : cam.value.aspectRatio;
+                    // 稳定运行中:画面放大留出余量,并按陀螺仪位移
+                    final over = _stabRunning ? 1.0 + _stabMargin : 1.0;
+                    final dy = _stabRunning ? _stabOffsetY : 0.0;
 
-                  // 竖屏:纹理已竖置 → 用竖比例 cover 铺满全屏
-                  if (!isLandscape) {
-                    final a = 1.0 / rawA;
-                    double iw, ih;
-                    if (a > sw / sh) {
-                      ih = sh;
-                      iw = ih * a;
-                    } else {
-                      iw = sw;
-                      ih = iw / a;
+                    // 竖屏:纹理已竖置 → 用竖比例 cover 铺满全屏
+                    if (!isLandscape) {
+                      final a = 1.0 / rawA;
+                      double iw, ih;
+                      if (a > sw / sh) {
+                        ih = sh;
+                        iw = ih * a;
+                      } else {
+                        iw = sw;
+                        ih = iw / a;
+                      }
+                      iw *= over;
+                      ih *= over;
+                      return Center(
+                        child: SizedBox(
+                          width: sw,
+                          height: sh,
+                          child: ClipRect(
+                            child: OverflowBox(
+                              alignment: Alignment.center,
+                              minWidth: iw,
+                              maxWidth: iw,
+                              minHeight: ih,
+                              maxHeight: ih,
+                              child: Transform.translate(
+                                offset: Offset(0, dy),
+                                child: SizedBox(
+                                  width: iw,
+                                  height: ih,
+                                  child: CameraPreview(cam),
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                      );
                     }
+
+                    // 横屏:4:3 取景框(纹理为横向,比例一致,不拉伸)
+                    const tA = 4.0 / 3.0;
+                    double tw, th;
+                    if (sw / sh > tA) {
+                      th = sh;
+                      tw = th * tA;
+                    } else {
+                      tw = sw;
+                      th = tw / tA;
+                    }
+                    double iw = th * rawA, ih = th;
+                    if (iw < tw) {
+                      iw = tw;
+                      ih = tw / rawA;
+                    }
+                    iw *= over;
+                    ih *= over;
                     return Center(
                       child: SizedBox(
-                        width: sw,
-                        height: sh,
+                        width: tw,
+                        height: th,
                         child: ClipRect(
                           child: OverflowBox(
                             alignment: Alignment.center,
@@ -1828,53 +2167,20 @@ class _CameraPageState extends State<CameraPage> {
                             maxWidth: iw,
                             minHeight: ih,
                             maxHeight: ih,
-                            child: SizedBox(
-                              width: iw,
-                              height: ih,
-                              child: CameraPreview(cam),
+                            child: Transform.translate(
+                              offset: Offset(0, dy),
+                              child: SizedBox(
+                                width: iw,
+                                height: ih,
+                                child: CameraPreview(cam),
+                              ),
                             ),
                           ),
                         ),
                       ),
                     );
-                  }
-
-                  // 横屏:4:3 取景框(纹理为横向,比例一致,不拉伸)
-                  const tA = 4.0 / 3.0;
-                  double tw, th;
-                  if (sw / sh > tA) {
-                    th = sh;
-                    tw = th * tA;
-                  } else {
-                    tw = sw;
-                    th = tw / tA;
-                  }
-                  double iw = th * rawA, ih = th;
-                  if (iw < tw) {
-                    iw = tw;
-                    ih = tw / rawA;
-                  }
-                  return Center(
-                    child: SizedBox(
-                      width: tw,
-                      height: th,
-                      child: ClipRect(
-                        child: OverflowBox(
-                          alignment: Alignment.center,
-                          minWidth: iw,
-                          maxWidth: iw,
-                          minHeight: ih,
-                          maxHeight: ih,
-                          child: SizedBox(
-                            width: iw,
-                            height: ih,
-                            child: CameraPreview(cam),
-                          ),
-                        ),
-                      ),
-                    ),
-                  );
-                },
+                  },
+                ),
               ),
             )
           else
@@ -2171,7 +2477,7 @@ class _CameraPageState extends State<CameraPage> {
               ),
             ),
 
-          // ── 运动稳定按钮(录像按钮左侧,暂为占位;点击进入陀螺仪测试)──
+          // ── 运动稳定按钮(录像按钮左侧)──
           Positioned(
             bottom: 56,
             left: isLandscape ? 40 : 28,
@@ -2181,7 +2487,9 @@ class _CameraPageState extends State<CameraPage> {
                 Container(
                   decoration: BoxDecoration(
                     shape: BoxShape.circle,
-                    color: Colors.black.withValues(alpha: 0.55),
+                    color: _stabRunning
+                        ? Colors.redAccent
+                        : Colors.black.withValues(alpha: 0.55),
                     border: Border.all(
                       color: _stabilizeEnabled
                           ? Colors.redAccent
@@ -2191,24 +2499,72 @@ class _CameraPageState extends State<CameraPage> {
                   ),
                   child: IconButton(
                     tooltip: '运动稳定',
-                    onPressed: _openGyroTest,
+                    onPressed: (_recording || _busy)
+                        ? null
+                        : _showStabilizeSheet,
                     icon: Icon(
                       Icons.screen_rotation,
                       size: 22,
-                      color: _stabilizeEnabled
-                          ? Colors.redAccent
-                          : Colors.white70,
+                      color: _stabRunning
+                          ? Colors.white
+                          : (_stabilizeEnabled
+                                ? Colors.redAccent
+                                : Colors.white70),
                     ),
                   ),
                 ),
                 const SizedBox(height: 4),
-                const Text(
-                  '运动稳定',
-                  style: TextStyle(color: Colors.white54, fontSize: 10),
+                Text(
+                  _stabRunning ? '稳定中' : (_stabilizeEnabled ? '已开启' : '运动稳定'),
+                  style: TextStyle(
+                    color: _stabRunning ? Colors.redAccent : Colors.white54,
+                    fontSize: 10,
+                  ),
                 ),
               ],
             ),
           ),
+
+          // ── 稳定运行中的状态提示(点一下可调整)──
+          if (_stabRunning)
+            Positioned(
+              bottom: 150,
+              left: 16,
+              child: GestureDetector(
+                onTap: _showStabilizeSheet,
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 10,
+                    vertical: 6,
+                  ),
+                  decoration: BoxDecoration(
+                    color: Colors.black.withValues(alpha: 0.6),
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: Colors.redAccent, width: 0.8),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      const Icon(
+                        Icons.screen_rotation,
+                        color: Colors.redAccent,
+                        size: 14,
+                      ),
+                      const SizedBox(width: 6),
+                      Text(
+                        '稳定中 X ${_stabAngleX.toStringAsFixed(1)}° · '
+                        '位移 ${_stabOffsetY.toStringAsFixed(0)}px · '
+                        '${_stabLog.length} 条',
+                        style: const TextStyle(
+                          color: Colors.white70,
+                          fontSize: 11,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
 
           // ── 录像按钮(底部中央)──
           Positioned(
@@ -2272,6 +2628,7 @@ class _CameraPageState extends State<CameraPage> {
   void dispose() {
     _ticker?.cancel();
     _timer.stop();
+    _stopGyroSession();
     _cam?.dispose();
     super.dispose();
   }
