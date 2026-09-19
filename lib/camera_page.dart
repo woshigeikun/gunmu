@@ -49,6 +49,7 @@ class _CameraPageState extends State<CameraPage> {
   // 手环连接面板状态
   bool _connecting = false;
   bool _scanning = false;
+  bool _showAllDevices = false; // 是否展示全部设备(含非穿戴设备)
   String _bleStatus = '未连接';
 
   /// 画质档位(供设置面板展示)
@@ -318,72 +319,126 @@ class _CameraPageState extends State<CameraPage> {
                             stream: widget.ble.deviceList,
                             initialData: widget.ble.devicesNow,
                             builder: (context3, snap) {
-                              final list = snap.data ?? const <BleDeviceInfo>[];
-                              if (list.isEmpty) {
-                                return Center(
-                                  child: Text(
-                                    _scanning ? '正在搜索附近设备…' : '点上方"扫描设备"开始搜索',
+                              final all = snap.data ?? const <BleDeviceInfo>[];
+                              // 默认只显示"穿戴设备/明确广播心率"的设备,其余折叠
+                              final shown = _showAllDevices
+                                  ? all
+                                  : all.where((d) => d.showByDefault).toList();
+                              final hiddenCount = all.length - shown.length;
+
+                              Widget toggle() {
+                                if (!_showAllDevices && hiddenCount == 0) {
+                                  return const SizedBox.shrink();
+                                }
+                                return TextButton.icon(
+                                  onPressed: () => setSheetState(
+                                    () => _showAllDevices = !_showAllDevices,
+                                  ),
+                                  icon: Icon(
+                                    _showAllDevices
+                                        ? Icons.expand_less
+                                        : Icons.expand_more,
+                                    size: 18,
+                                    color: Colors.white54,
+                                  ),
+                                  label: Text(
+                                    _showAllDevices
+                                        ? '收起其他设备'
+                                        : '显示全部设备(+$hiddenCount)',
                                     style: const TextStyle(
-                                      color: Colors.white38,
-                                      fontSize: 13,
+                                      color: Colors.white54,
+                                      fontSize: 12,
                                     ),
                                   ),
                                 );
                               }
-                              return ListView.separated(
-                                itemCount: list.length,
-                                separatorBuilder: (_, _) => const Divider(
-                                  height: 1,
-                                  color: Colors.white12,
-                                ),
-                                itemBuilder: (context4, i) {
-                                  final d = list[i];
-                                  return ListTile(
-                                    contentPadding: EdgeInsets.zero,
-                                    leading: Icon(
-                                      d.advertisesHeartRate
-                                          ? Icons.favorite
-                                          : Icons.bluetooth,
-                                      color: d.advertisesHeartRate
-                                          ? Colors.redAccent
-                                          : Colors.white38,
-                                    ),
-                                    title: Text(
-                                      d.displayName,
-                                      style: const TextStyle(
-                                        color: Colors.white,
-                                        fontSize: 15,
-                                      ),
-                                    ),
-                                    subtitle: Text(
-                                      d.advertisesHeartRate
-                                          ? '支持心率广播 · 信号 ${d.rssi} dBm'
-                                          : '信号 ${d.rssi} dBm',
-                                      style: TextStyle(
-                                        color: d.advertisesHeartRate
-                                            ? Colors.redAccent
-                                            : Colors.white38,
-                                        fontSize: 11,
-                                      ),
-                                    ),
-                                    trailing: _connecting
-                                        ? const SizedBox(
-                                            width: 16,
-                                            height: 16,
-                                            child: CircularProgressIndicator(
-                                              strokeWidth: 2,
-                                            ),
-                                          )
-                                        : const Icon(
-                                            Icons.chevron_right,
+
+                              if (shown.isEmpty) {
+                                return Column(
+                                  children: [
+                                    Expanded(
+                                      child: Center(
+                                        child: Text(
+                                          _scanning
+                                              ? '正在搜索附近设备…'
+                                              : (all.isEmpty
+                                                    ? '点上方"扫描设备"开始搜索'
+                                                    : '未发现穿戴设备,\n可展开查看全部 ${all.length} 个设备'),
+                                          textAlign: TextAlign.center,
+                                          style: const TextStyle(
                                             color: Colors.white38,
+                                            fontSize: 13,
                                           ),
-                                    onTap: () => _connectDevice(
-                                      d.remoteId,
-                                      setSheetState,
+                                        ),
+                                      ),
                                     ),
-                                  );
-                                },
+                                    toggle(),
+                                  ],
+                                );
+                              }
+
+                              return Column(
+                                children: [
+                                  Expanded(
+                                    child: ListView.separated(
+                                      itemCount: shown.length,
+                                      separatorBuilder: (_, _) => const Divider(
+                                        height: 1,
+                                        color: Colors.white12,
+                                      ),
+                                      itemBuilder: (context4, i) {
+                                        final d = shown[i];
+                                        return ListTile(
+                                          contentPadding: EdgeInsets.zero,
+                                          leading: Icon(
+                                            d.advertisesHeartRate
+                                                ? Icons.favorite
+                                                : Icons.bluetooth,
+                                            color: d.advertisesHeartRate
+                                                ? Colors.redAccent
+                                                : Colors.white38,
+                                          ),
+                                          title: Text(
+                                            d.displayName,
+                                            style: const TextStyle(
+                                              color: Colors.white,
+                                              fontSize: 15,
+                                            ),
+                                          ),
+                                          subtitle: Text(
+                                            d.advertisesHeartRate
+                                                ? '支持心率广播 · 信号 ${d.rssi} dBm'
+                                                : '信号 ${d.rssi} dBm',
+                                            style: TextStyle(
+                                              color: d.advertisesHeartRate
+                                                  ? Colors.redAccent
+                                                  : Colors.white38,
+                                              fontSize: 11,
+                                            ),
+                                          ),
+                                          trailing: _connecting
+                                              ? const SizedBox(
+                                                  width: 16,
+                                                  height: 16,
+                                                  child:
+                                                      CircularProgressIndicator(
+                                                        strokeWidth: 2,
+                                                      ),
+                                                )
+                                              : const Icon(
+                                                  Icons.chevron_right,
+                                                  color: Colors.white38,
+                                                ),
+                                          onTap: () => _connectDevice(
+                                            d.remoteId,
+                                            setSheetState,
+                                          ),
+                                        );
+                                      },
+                                    ),
+                                  ),
+                                  toggle(),
+                                ],
                               );
                             },
                           ),
@@ -415,6 +470,7 @@ class _CameraPageState extends State<CameraPage> {
     }
     setState(() {
       _scanning = true;
+      _showAllDevices = false; // 每次重新扫描先折叠非穿戴设备
       _bleStatus = '正在搜索附近设备…';
     });
     if (mounted) setSheetState(() {});

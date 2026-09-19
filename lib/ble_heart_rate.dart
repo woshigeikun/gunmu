@@ -11,14 +11,47 @@ class BleDeviceInfo {
   /// 是否在广播里声明了标准心率服务(0x180D),即"明确支持心率广播"
   final bool advertisesHeartRate;
 
+  /// 设备名是否像穿戴设备(手环/手表/心率带),用于默认列表筛选
+  final bool likelyWearable;
+
   const BleDeviceInfo({
     required this.remoteId,
     required this.name,
     required this.rssi,
     required this.advertisesHeartRate,
+    required this.likelyWearable,
   });
 
   String get displayName => name.isEmpty ? '未命名设备' : name;
+
+  /// 默认是否展示:像穿戴设备,或明确广播心率
+  bool get showByDefault => likelyWearable || advertisesHeartRate;
+
+  /// 穿戴设备关键词(品牌 + 通用名称)
+  static const List<String> wearableKeywords = [
+    // 品牌
+    'xiaomi', 'redmi', 'miband', 'mi band', 'mi watch', 'mi sport',
+    'vivo', 'oppo', 'realme', 'oneplus', 'huawei', 'honor',
+    'amazfit', 'zepp', 'garmin', 'polar', 'wahoo', 'coros', 'suunto',
+    'fitbit', 'samsung', 'galaxy', 'haylou', 'imoo', 'meizu',
+    'magene', 'coospo', 'igpsport', 'bryton', 'tickr', 'hrm', 'h10',
+    // 通用名称
+    'watch', 'band', 'bracelet', 'smartband', 'heart rate', 'heartrate',
+    'pulse', '手环', '手表', '心率',
+  ];
+
+  /// 判断设备名是否像穿戴设备
+  static bool isWearableName(String name) {
+    final n = name.toLowerCase().trim();
+    if (n.isEmpty) return false;
+    for (final k in wearableKeywords) {
+      if (n.contains(k)) return true;
+    }
+    if (n.endsWith('watch') || n.endsWith('band') || n.endsWith('bracelet')) {
+      return true;
+    }
+    return false;
+  }
 }
 
 /// 通用 BLE 心率读取模块。
@@ -119,13 +152,17 @@ class BleHeartRate {
           : r.advertisementData.advName;
       final advHr = r.advertisementData.serviceUuids.any((u) => u == hrService);
       final prev = _found[id];
+      final effName = name.isNotEmpty ? name : (prev?.name ?? '');
       _devices[id] = r.device;
       _found[id] = BleDeviceInfo(
         remoteId: id,
-        name: name.isNotEmpty ? name : (prev?.name ?? ''),
+        name: effName,
         rssi: r.rssi,
         advertisesHeartRate:
             (prev?.advertisesHeartRate ?? false) || advHr || forceHeartRate,
+        likelyWearable:
+            BleDeviceInfo.isWearableName(effName) ||
+            (prev?.likelyWearable ?? false),
       );
     }
     _emit();
