@@ -48,7 +48,8 @@ class _CameraPageState extends State<CameraPage> {
 
   // 手环连接面板状态
   bool _connecting = false;
-  String _bleStatus = '未连接手环';
+  bool _scanning = false;
+  String _bleStatus = '未连接';
 
   /// 画质档位(供设置面板展示)
   static const List<(ResolutionPreset, String, String)> _qualityOptions = [
@@ -183,7 +184,7 @@ class _CameraPageState extends State<CameraPage> {
               height: sheetHeight,
               child: SafeArea(
                 child: Padding(
-                  padding: const EdgeInsets.fromLTRB(24, 20, 24, 20),
+                  padding: const EdgeInsets.fromLTRB(20, 16, 20, 16),
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
@@ -197,9 +198,9 @@ class _CameraPageState extends State<CameraPage> {
                           ),
                         ),
                       ),
-                      const SizedBox(height: 16),
+                      const SizedBox(height: 14),
                       const Text(
-                        '连接手环',
+                        '连接心率设备',
                         style: TextStyle(
                           color: Colors.white,
                           fontSize: 20,
@@ -207,51 +208,45 @@ class _CameraPageState extends State<CameraPage> {
                         ),
                       ),
                       const SizedBox(height: 6),
-                      Text(
-                        '先在小米运动健康 App 中开启手环"心率广播",再连接',
+                      const Text(
+                        '支持所有开启心率广播的设备:手环 / 手表 / 心率带(标准 0x180D)',
                         style: TextStyle(color: Colors.white54, fontSize: 12),
                       ),
-                      const SizedBox(height: 20),
+                      const SizedBox(height: 16),
 
-                      // ── 连接状态与按钮 ──
-                      Container(
-                        width: double.infinity,
-                        padding: const EdgeInsets.all(16),
-                        decoration: BoxDecoration(
-                          color: Colors.white10,
-                          borderRadius: BorderRadius.circular(12),
-                        ),
-                        child: Column(
-                          children: [
-                            Row(
-                              children: [
-                                Icon(
-                                  connected
-                                      ? Icons.favorite
-                                      : Icons.bluetooth_disabled,
-                                  color: connected
-                                      ? Colors.redAccent
-                                      : Colors.white38,
-                                  size: 28,
-                                ),
-                                const SizedBox(width: 12),
-                                Expanded(
-                                  child: Text(
-                                    connected
-                                        ? '已连接 · 心率 ${widget.ble.currentBpm} bpm'
-                                        : _connecting
-                                        ? '正在扫描手环…(约 12 秒)'
-                                        : _bleStatus,
-                                    style: const TextStyle(
-                                      color: Colors.white,
-                                      fontSize: 15,
+                      if (connected) ...[
+                        // ── 已连接:状态与大号心率 ──
+                        Container(
+                          width: double.infinity,
+                          padding: const EdgeInsets.all(16),
+                          decoration: BoxDecoration(
+                            color: Colors.white10,
+                            borderRadius: BorderRadius.circular(12),
+                          ),
+                          child: Column(
+                            children: [
+                              Row(
+                                children: [
+                                  const Icon(
+                                    Icons.favorite,
+                                    color: Colors.redAccent,
+                                    size: 26,
+                                  ),
+                                  const SizedBox(width: 10),
+                                  Expanded(
+                                    child: Text(
+                                      widget.ble.connectedName.isEmpty
+                                          ? '已连接'
+                                          : '已连接 · ${widget.ble.connectedName}',
+                                      style: const TextStyle(
+                                        color: Colors.white,
+                                        fontSize: 14,
+                                      ),
                                     ),
                                   ),
-                                ),
-                              ],
-                            ),
-                            if (connected) ...[
-                              const SizedBox(height: 12),
+                                ],
+                              ),
+                              const SizedBox(height: 10),
                               Text(
                                 '${widget.ble.currentBpm}',
                                 style: const TextStyle(
@@ -260,58 +255,140 @@ class _CameraPageState extends State<CameraPage> {
                                   fontWeight: FontWeight.bold,
                                 ),
                               ),
-                            ],
-                          ],
-                        ),
-                      ),
-
-                      const Spacer(),
-
-                      // 主操作按钮
-                      SizedBox(
-                        width: double.infinity,
-                        child: connected
-                            ? OutlinedButton.icon(
-                                style: OutlinedButton.styleFrom(
-                                  foregroundColor: Colors.white70,
-                                  side: const BorderSide(color: Colors.white24),
+                              const Text(
+                                'bpm',
+                                style: TextStyle(
+                                  color: Colors.white54,
+                                  fontSize: 12,
                                 ),
-                                onPressed: () async {
-                                  await widget.ble.disconnect();
-                                  setSheetState(() {});
-                                  if (mounted) {
-                                    setState(() {
-                                      _bleStatus = '未连接手环';
-                                      _history.clear();
-                                      _samples.clear();
-                                    });
-                                  }
-                                },
-                                icon: const Icon(Icons.link_off),
-                                label: const Text('断开连接'),
-                              )
-                            : FilledButton.icon(
-                                style: FilledButton.styleFrom(
-                                  backgroundColor: Colors.redAccent,
-                                ),
-                                onPressed: _connecting
-                                    ? null
-                                    : () => _connectBle(setSheetState),
-                                icon: const Icon(Icons.bluetooth_searching),
-                                label: Text(_connecting ? '连接中…' : '连接手环'),
                               ),
-                      ),
-                      const SizedBox(height: 8),
-                      if (widget.ble.currentBpm > 0 && !connected)
-                        Center(
-                          child: Text(
-                            '上次心率:${widget.ble.currentBpm}',
+                            ],
+                          ),
+                        ),
+                        const Spacer(),
+                        SizedBox(
+                          width: double.infinity,
+                          child: OutlinedButton.icon(
+                            style: OutlinedButton.styleFrom(
+                              foregroundColor: Colors.white70,
+                              side: const BorderSide(color: Colors.white24),
+                            ),
+                            onPressed: () async {
+                              await widget.ble.disconnect();
+                              if (mounted) {
+                                setState(() {
+                                  _bleStatus = '未连接';
+                                  _history.clear();
+                                  _samples.clear();
+                                });
+                              }
+                              setSheetState(() {});
+                            },
+                            icon: const Icon(Icons.link_off),
+                            label: const Text('断开连接'),
+                          ),
+                        ),
+                      ] else ...[
+                        // ── 未连接:扫描 + 设备列表 ──
+                        SizedBox(
+                          width: double.infinity,
+                          child: FilledButton.icon(
+                            style: FilledButton.styleFrom(
+                              backgroundColor: Colors.redAccent,
+                            ),
+                            onPressed: _scanning
+                                ? null
+                                : () => _startScan(setSheetState),
+                            icon: const Icon(Icons.bluetooth_searching),
+                            label: Text(_scanning ? '扫描中…' : '扫描设备'),
+                          ),
+                        ),
+                        const SizedBox(height: 10),
+                        if (_bleStatus.isNotEmpty)
+                          Text(
+                            _bleStatus,
                             style: const TextStyle(
-                              color: Colors.white38,
+                              color: Colors.yellowAccent,
                               fontSize: 12,
                             ),
                           ),
+                        const SizedBox(height: 6),
+                        Expanded(
+                          child: StreamBuilder<List<BleDeviceInfo>>(
+                            stream: widget.ble.deviceList,
+                            initialData: widget.ble.devicesNow,
+                            builder: (context3, snap) {
+                              final list = snap.data ?? const <BleDeviceInfo>[];
+                              if (list.isEmpty) {
+                                return Center(
+                                  child: Text(
+                                    _scanning ? '正在搜索附近设备…' : '点上方"扫描设备"开始搜索',
+                                    style: const TextStyle(
+                                      color: Colors.white38,
+                                      fontSize: 13,
+                                    ),
+                                  ),
+                                );
+                              }
+                              return ListView.separated(
+                                itemCount: list.length,
+                                separatorBuilder: (_, _) => const Divider(
+                                  height: 1,
+                                  color: Colors.white12,
+                                ),
+                                itemBuilder: (context4, i) {
+                                  final d = list[i];
+                                  return ListTile(
+                                    contentPadding: EdgeInsets.zero,
+                                    leading: Icon(
+                                      d.advertisesHeartRate
+                                          ? Icons.favorite
+                                          : Icons.bluetooth,
+                                      color: d.advertisesHeartRate
+                                          ? Colors.redAccent
+                                          : Colors.white38,
+                                    ),
+                                    title: Text(
+                                      d.displayName,
+                                      style: const TextStyle(
+                                        color: Colors.white,
+                                        fontSize: 15,
+                                      ),
+                                    ),
+                                    subtitle: Text(
+                                      d.advertisesHeartRate
+                                          ? '支持心率广播 · 信号 ${d.rssi} dBm'
+                                          : '信号 ${d.rssi} dBm',
+                                      style: TextStyle(
+                                        color: d.advertisesHeartRate
+                                            ? Colors.redAccent
+                                            : Colors.white38,
+                                        fontSize: 11,
+                                      ),
+                                    ),
+                                    trailing: _connecting
+                                        ? const SizedBox(
+                                            width: 16,
+                                            height: 16,
+                                            child: CircularProgressIndicator(
+                                              strokeWidth: 2,
+                                            ),
+                                          )
+                                        : const Icon(
+                                            Icons.chevron_right,
+                                            color: Colors.white38,
+                                          ),
+                                    onTap: () => _connectDevice(
+                                      d.remoteId,
+                                      setSheetState,
+                                    ),
+                                  );
+                                },
+                              );
+                            },
+                          ),
                         ),
+                      ],
                     ],
                   ),
                 ),
@@ -323,41 +400,69 @@ class _CameraPageState extends State<CameraPage> {
     );
   }
 
-  /// 执行连接;结果刷新面板与主界面状态
-  Future<void> _connectBle(StateSetter setSheetState) async {
-    // Android:扫描 BLE 需要位置/蓝牙权限
+  /// 扫描附近可连接设备
+  Future<void> _startScan(StateSetter setSheetState) async {
+    // Android:扫描 BLE 需要定位权限
     if (!kIsWeb && Platform.isAndroid) {
       try {
         final loc = await Permission.locationWhenInUse.request();
         if (!loc.isGranted) {
-          if (mounted) {
-            setState(() => _bleStatus = '需要定位权限才能扫描手环');
-          }
+          if (mounted) setState(() => _bleStatus = '需要定位权限才能扫描设备');
+          if (mounted) setSheetState(() {});
           return;
         }
       } catch (_) {}
     }
     setState(() {
-      _connecting = true;
-      _bleStatus = '正在扫描手环…(约 12 秒)';
+      _scanning = true;
+      _bleStatus = '正在搜索附近设备…';
     });
     if (mounted) setSheetState(() {});
     try {
-      await widget.ble.connect();
+      await widget.ble.scan();
+      if (!mounted) return;
+      setState(() {
+        _scanning = false;
+        _bleStatus = widget.ble.devicesNow.isEmpty
+            ? '未发现设备,请确认设备已开启心率广播并靠近手机'
+            : '发现 ${widget.ble.devicesNow.length} 个设备,点击即可连接';
+      });
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _scanning = false;
+          _bleStatus = '扫描失败: $e';
+        });
+      }
+    }
+    if (mounted) setSheetState(() {});
+  }
+
+  /// 连接所选设备并订阅心率
+  Future<void> _connectDevice(
+    String remoteId,
+    StateSetter setSheetState,
+  ) async {
+    setState(() {
+      _connecting = true;
+      _bleStatus = '正在连接…';
+    });
+    if (mounted) setSheetState(() {});
+    try {
+      await widget.ble.connectTo(remoteId);
       if (!mounted) return;
       setState(() {
         _connecting = false;
         _bleStatus = '已连接';
       });
-      setSheetState(() {});
     } catch (e) {
       if (!mounted) return;
       setState(() {
         _connecting = false;
-        _bleStatus = '连接失败,请确认已开启心率广播';
+        _bleStatus = '连接失败:${e.toString().replaceAll('Exception: ', '')}';
       });
-      setSheetState(() {});
     }
+    if (mounted) setSheetState(() {});
   }
 
   /// 打开镜头选择面板:平铺所有摄像头方向与可用变焦档位(含等效 mm)
