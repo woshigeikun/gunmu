@@ -928,11 +928,14 @@ class _CameraPageState extends State<CameraPage> {
         final samplesSnapshot = List<_HrSample>.from(_samples);
         final hadBleSnapshot = _recordHadBle;
         final fallbackDuration = _timer.elapsedMilliseconds / 1000.0;
-        await _startExport(
-          raw: file,
-          samples: samplesSnapshot,
-          hadBle: hadBleSnapshot,
-          fallbackDuration: fallbackDuration,
+        // 不等待导出结束:否则 _busy 会一直占用,导致无法继续拍摄
+        unawaited(
+          _startExport(
+            raw: file,
+            samples: samplesSnapshot,
+            hadBle: hadBleSnapshot,
+            fallbackDuration: fallbackDuration,
+          ),
         );
       }
     } catch (e) {
@@ -1108,9 +1111,13 @@ class _CameraPageState extends State<CameraPage> {
 
   Future<void> _restoreCamera() async {
     if (_cam != null || _cameras.isEmpty) return;
+    if (mounted) setState(() => _hint = '正在恢复相机预览…');
     try {
       await _openCamera(_camIndex);
-    } catch (_) {}
+      if (mounted) setState(() => _hint = '');
+    } catch (e) {
+      if (mounted) setState(() => _hint = '相机恢复失败,请重启应用: $e');
+    }
   }
 
   String _fmtDuration(int sec) {
