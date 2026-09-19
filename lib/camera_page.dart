@@ -11,6 +11,7 @@ import 'package:flutter/material.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:share_plus/share_plus.dart';
+import 'package:video_player/video_player.dart';
 
 import 'ble_heart_rate.dart';
 
@@ -19,6 +20,69 @@ class _HrSample {
   final int ms;
   final int bpm;
   _HrSample(this.ms, this.bpm);
+}
+
+/// 导出(渲染)任务进度
+class RenderJob extends ChangeNotifier {
+  double _progress = 0;
+  String _stage = '准备中…';
+  double? _etaSec;
+  bool _done = false;
+  String? _error;
+
+  double get progress => _progress;
+  String get stage => _stage;
+  double? get etaSec => _etaSec;
+  bool get done => _done;
+  String? get error => _error;
+
+  set progress(double v) {
+    _progress = v.clamp(0.0, 1.0);
+    notifyListeners();
+  }
+
+  set stage(String v) {
+    _stage = v;
+    notifyListeners();
+  }
+
+  set etaSec(double? v) {
+    _etaSec = v;
+    notifyListeners();
+  }
+
+  set done(bool v) {
+    _done = v;
+    notifyListeners();
+  }
+
+  set error(String? v) {
+    _error = v;
+    notifyListeners();
+  }
+}
+
+/// 已导出的作品(保存在应用"录像"目录)
+class ExportItem {
+  final String path;
+  final DateTime time;
+  final int sizeBytes;
+
+  ExportItem({required this.path, required this.time, required this.sizeBytes});
+
+  String get displayName {
+    final t = time;
+    String two(int v) => v.toString().padLeft(2, '0');
+    return '${t.year}-${two(t.month)}-${two(t.day)} '
+        '${two(t.hour)}:${two(t.minute)}:${two(t.second)}';
+  }
+
+  String get sizeText {
+    final mb = sizeBytes / 1024 / 1024;
+    return mb >= 1
+        ? '${mb.toStringAsFixed(1)} MB'
+        : '${(sizeBytes / 1024).toStringAsFixed(0)} KB';
+  }
 }
 
 /// 相机页:预览 + 实时心率 + 心率曲线 + 前后摄切换 + 录像烧录
@@ -81,10 +145,17 @@ class _CameraPageState extends State<CameraPage> {
   // 本段录像是否为竖屏(竖屏则成片需旋转为竖向)
   bool _recordPortrait = true;
 
+  // ── 导出/渲染状态 ──
+  RenderJob? _job; // 当前渲染任务(用于进度弹窗与后台进度条)
+  bool _renderBackground = false; // 用户是否选择"后台渲染"
+  bool _renderDialogOpen = false; // 进度弹窗是否打开
+  final List<ExportItem> _exports = []; // 已导出作品
+
   @override
   void initState() {
     super.initState();
     _initCamera();
+    _loadExports(); // 启动时载入已有作品
     // 订阅心率:录像中记录时间线;屏幕历史始终累积
     widget.ble.bpmStream.listen((bpm) {
       _history.add(bpm);
@@ -853,7 +924,16 @@ class _CameraPageState extends State<CameraPage> {
 
         final XFile file = await cam.stopVideoRecording();
         if (mounted) setState(() => _recording = false);
-        await _burnAndSave(file); // 烧录 + 保存,内部自带 try/catch
+        // 快照本段数据:后台渲染期间可以继续拍摄,不能被下一段覆盖
+        final samplesSnapshot = List<_HrSample>.from(_samples);
+        final hadBleSnapshot = _recordHadBle;
+        final fallbackDuration = _timer.elapsedMilliseconds / 1000.0;
+        await _startExport(
+          raw: file,
+          samples: samplesSnapshot,
+          hadBle: hadBleSnapshot,
+          fallbackDuration: fallbackDuration,
+        );
       }
     } catch (e) {
       if (mounted) {
@@ -868,182 +948,604 @@ class _CameraPageState extends State<CameraPage> {
     }
   }
 
-  /// ① 用 FFmpeg 把心率烧进视频右上角 ② 保存到文件目录 ③ 弹分享面板
-  Future<void> _burnAndSave(XFile raw) async {
-    // 分享面板锚点:在首个 await 前从 context 取好,避免跨 async 使用
-    final renderBox = context.findRenderObject() as RenderBox?;
-    final shareOrigin = renderBox != null
-        ? renderBox.localToGlobal(Offset.zero) & renderBox.size
-        : null;
+  // ─────────────── 导出流程:进度弹窗 + 后台渲染 ───────────────
 
-    // 本段录像开始时未连接手环 → 无心率数据,直接保存原视频(不烧任何 UI)
-    if (!_recordHadBle) {
-      try {
-        final docs = await getApplicationDocumentsDirectory();
-        final folder = Directory('${docs.path}/录像');
-        if (!folder.existsSync()) folder.createSync(recursive: true);
-        final stamp = DateTime.now().millisecondsSinceEpoch;
-        final saved = '${folder.path}/$stamp.mp4';
-        await raw.saveTo(saved);
-        if (mounted) {
-          setState(() => _hint = '已保存录像(未连接手环,无心率)');
-        }
-        await SharePlus.instance.share(
-          ShareParams(
-            files: [XFile(saved)],
-            text: '录像',
-            sharePositionOrigin: shareOrigin,
-          ),
-        );
-      } catch (e) {
-        if (mounted) setState(() => _hint = '保存失败: $e');
-      }
-      return;
-    }
+  /// 开始导出:关闭摄像头 → 弹进度窗 → 渲染(可转后台继续拍摄)
+  Future<void> _startExport({
+    required XFile raw,
+    required List<_HrSample> samples,
+    required bool hadBle,
+    required double fallbackDuration,
+  }) async {
+    final job = RenderJob();
+    setState(() {
+      _job = job;
+      _renderBackground = false;
+    });
+
+    // 关闭摄像头(渲染期间不用相机,省电降温)
+    await _releaseCamera();
+
+    // 弹出进度窗(不等待,渲染并行进行)
+    _renderDialogOpen = true;
+    unawaited(_showRenderDialog(job));
 
     try {
-      // 1) 解析原视频尺寸与时长(字幕坐标需要像素尺寸)
-      final info = await FFprobeKit.getMediaInformation(raw.path);
-      final mi = info.getMediaInformation();
-      if (mi == null) throw Exception('无法读取视频信息');
-      int width = 1920, height = 1080;
-      double? durationSec;
-      for (final s in mi.getStreams()) {
-        if (s.getType() == 'video') {
-          width = s.getWidth() ?? width;
-          height = s.getHeight() ?? height;
-        }
-      }
-      final durStr = mi.getDuration(); // 形如 "12.345"
-      durationSec = durStr != null ? double.tryParse(durStr) : null;
-      if (durationSec == null || durationSec <= 0) {
-        durationSec = _timer.elapsedMilliseconds / 1000.0;
-      }
-
-      // 1.5) 方向处理:竖屏录制但视频仍是横向(宽>高)时,成片旋转为竖向。
-      //      旋转后宽高互换,后续字幕/曲线坐标一律按旋转后的尺寸计算。
-      //      transpose=1 顺时针90°;若方向相反改为 2(逆时针90°)。
-      final bool needRotate = _recordPortrait && width > height;
-      const int transposeMode = 1;
-      if (needRotate) {
-        final t = width;
-        width = height;
-        height = t;
-      }
-      final String vfPrefix = needRotate ? 'transpose=$transposeMode,' : '';
-
-      // 2) 生成 ASS 字幕(右上角 ♥ bpm)+ 心率曲线 PNG(文字正下方)
-      final docs = await getApplicationDocumentsDirectory();
-      final workDir = Directory('${docs.path}/work');
-      if (!workDir.existsSync()) workDir.createSync(recursive: true);
-      final stamp = DateTime.now().millisecondsSinceEpoch;
-      final assPath = '${workDir.path}/$stamp.ass';
-      final hasCurve = _samples.where((s) => s.bpm > 0).length >= 2;
-
-      // 曲线区域尺寸:与心率文字一致(MarginR=30、MarginV=40、字号=高4.5%)
-      final fontSize = (height * 0.045).round().clamp(24, 200);
-      const marginRight = 30.0;
-      const marginTop = 40.0;
-      // 心率文字高度≈fontSize,曲线放其下方;加右侧数字列与上下限标注,略加高
-      final curW = (fontSize * 3.0).round().clamp(80, 720);
-      final curH = (fontSize * 1.35).round().clamp(32, 320);
-      final curX = (width - marginRight - curW).round();
-      final curY = (marginTop + fontSize * 1.12).round();
-
-      _writeAss(assPath, width, height, durationSec);
-      String? seqDir;
-      if (hasCurve && durationSec > 1) {
-        if (mounted) setState(() => _hint = '正在生成心率曲线动画…');
-        // 有效采样(升序时间)
-        final pts = _samples.where((s) => s.bpm > 0).toList();
-        seqDir = '${workDir.path}/${stamp}_seq';
-        final seq = Directory(seqDir);
-        if (seq.existsSync()) seq.deleteSync(recursive: true);
-        seq.createSync(recursive: true);
-
-        final frameCount = durationSec.ceil() + 1; // 每秒一帧,含起始与结束
-        var idx = 0; // pts 中最后一个 <= nowMs 的下标
-        for (var f = 0; f < frameCount; f++) {
-          final nowMs = (f * 1000).clamp(0, (durationSec * 1000).round());
-          // 该帧"当前心率":时间 <= nowMs 的最近一次采样
-          while (idx + 1 < pts.length && pts[idx + 1].ms <= nowMs) {
-            idx++;
-          }
-          final cur = pts[idx].bpm.toDouble();
-          final img = await _renderCurveFrame(curW, curH, nowMs, curBpm: cur);
-          final data = await img.toByteData(format: ui.ImageByteFormat.png);
-          final name = '${seq.path}/curve_${f.toString().padLeft(4, '0')}.png';
-          File(name).writeAsBytesSync(data!.buffer.asUint8List());
-        }
-      }
-
-      // 3) FFmpeg 烧录:字幕滤镜 + (曲线动画序列 overlay)+ 重新编码
-      if (mounted) setState(() => _hint = '正在合成心率到视频…');
-      final outPath = '${workDir.path}/$stamp.mp4';
-      String cmd;
-      if (seqDir != null) {
-        // 输入0=原始视频(先旋转方向再烧字幕),输入1=曲线动画序列(1帧/秒)
-        cmd =
-            '-y -i "${raw.path}" -framerate 1 -i "$seqDir/curve_%04d.png" '
-            '-filter_complex '
-            '"[0:v]${vfPrefix}ass=$assPath[base];'
-            '[1:v]scale=$curW:$curH,format=rgba,fps=30[ov];'
-            '[base][ov]overlay=x=$curX:y=$curY:eof_action=repeat[outv]" '
-            '-map "[outv]" -map 0:a? '
-            '-c:v libx264 -preset veryfast -crf 22 '
-            '-c:a aac -b:a 128k "$outPath"';
-      } else {
-        cmd =
-            '-y -i "${raw.path}" -vf "${vfPrefix}ass=$assPath" '
-            '-c:v libx264 -preset veryfast -crf 22 '
-            '-c:a aac -b:a 128k "$outPath"';
-      }
-      final session = await FFmpegKit.execute(cmd);
-      final rc = await session.getReturnCode();
-      if (!ReturnCode.isSuccess(rc)) {
-        throw Exception('FFmpeg 合成失败 (rc=$rc)');
-      }
-
-      // 4) 保存到"文件"目录(带 .mp4)
-      final folder = Directory('${docs.path}/录像');
-      if (!folder.existsSync()) folder.createSync(recursive: true);
-      final saved = '${folder.path}/$stamp.mp4';
-      await File(outPath).copy(saved);
-      // 清理工作文件
-      try {
-        File(assPath).deleteSync();
-        if (seqDir != null) {
-          Directory(seqDir).deleteSync(recursive: true);
-        }
-        File(outPath).deleteSync();
-        File(raw.path).deleteSync();
-      } catch (_) {}
-
-      // 5) 弹出系统分享面板(可"存储视频"到相册/发给微信等)
-      if (mounted) setState(() => _hint = '合成完成,弹出分享…');
-      await SharePlus.instance.share(
-        ShareParams(
-          files: [XFile(saved)],
-          text: '心率录像',
-          sharePositionOrigin: shareOrigin,
-        ),
+      await _renderVideo(
+        raw: raw,
+        samples: samples,
+        hadBle: hadBle,
+        fallbackDuration: fallbackDuration,
+        job: job,
       );
+      job
+        ..progress = 1.0
+        ..stage = '完成'
+        ..etaSec = null
+        ..done = true;
+      await _loadExports();
       if (mounted) {
-        setState(
-          () => _hint = kIsWeb || !Platform.isAndroid
-              ? '已保存(带心率),可在"文件"App→本App→录像 查看'
-              : '视频已生成,请在分享面板中选择保存位置',
-        );
+        setState(() => _hint = '导出完成,可点顶部文件夹按钮查看并保存');
       }
     } catch (e) {
-      if (mounted) setState(() => _hint = '合成保存失败: $e');
+      job
+        ..stage = '失败'
+        ..error = '$e'
+        ..done = true;
+      if (mounted) setState(() => _hint = '导出失败: $e');
+    } finally {
+      _popRenderDialog();
+      await _restoreCamera();
+      if (mounted) setState(() {});
+      Future.delayed(const Duration(seconds: 2), () {
+        if (mounted && identical(_job, job)) setState(() => _job = null);
+      });
     }
   }
 
+  /// 渲染进度弹窗(含进度条与预计剩余时间,可切后台渲染)
+  Future<void> _showRenderDialog(RenderJob job) async {
+    if (!mounted) return;
+    await showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF1C1C1E),
+        title: const Text(
+          '正在导出视频',
+          style: TextStyle(color: Colors.white, fontSize: 18),
+        ),
+        content: ListenableBuilder(
+          listenable: job,
+          builder: (context2, _) {
+            final pct = (job.progress * 100).round();
+            final etaText = job.error != null
+                ? '失败:${job.error}'
+                : job.done
+                ? '已完成'
+                : (job.etaSec != null && job.etaSec! > 0
+                      ? '预计剩余约 ${_fmtDuration(job.etaSec!.round())}'
+                      : '正在估算剩余时间…');
+            return Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(6),
+                  child: LinearProgressIndicator(
+                    value: job.progress,
+                    minHeight: 8,
+                    backgroundColor: Colors.white12,
+                    valueColor: const AlwaysStoppedAnimation(Colors.redAccent),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                Text(
+                  '$pct%  ${job.stage}',
+                  style: const TextStyle(color: Colors.white70, fontSize: 13),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  etaText,
+                  style: TextStyle(
+                    color: job.error != null
+                        ? Colors.yellowAccent
+                        : Colors.white38,
+                    fontSize: 12,
+                  ),
+                ),
+              ],
+            );
+          },
+        ),
+        actions: [
+          TextButton(
+            onPressed: () {
+              // 后台渲染:关弹窗 + 恢复摄像头,渲染继续在后台进行
+              setState(() => _renderBackground = true);
+              _popRenderDialog();
+              _restoreCamera();
+            },
+            child: const Text(
+              '后台渲染(返回拍摄)',
+              style: TextStyle(color: Colors.redAccent),
+            ),
+          ),
+        ],
+      ),
+    );
+    _renderDialogOpen = false;
+  }
+
+  void _popRenderDialog() {
+    if (!_renderDialogOpen) return;
+    _renderDialogOpen = false;
+    try {
+      final nav = Navigator.of(context, rootNavigator: true);
+      if (nav.canPop()) nav.pop();
+    } catch (_) {}
+  }
+
+  /// 点击后台进度条时重新打开进度窗
+  void _reopenRenderDialog() {
+    final job = _job;
+    if (job == null || _renderDialogOpen) return;
+    _renderBackground = false;
+    _renderDialogOpen = true;
+    // 正在录像时不释放摄像头,避免打断当前拍摄
+    if (!_recording) _releaseCamera();
+    unawaited(_showRenderDialog(job));
+  }
+
+  Future<void> _releaseCamera() async {
+    final c = _cam;
+    _cam = null;
+    if (mounted) setState(() {});
+    try {
+      await c?.dispose();
+    } catch (_) {}
+  }
+
+  Future<void> _restoreCamera() async {
+    if (_cam != null || _cameras.isEmpty) return;
+    try {
+      await _openCamera(_camIndex);
+    } catch (_) {}
+  }
+
+  String _fmtDuration(int sec) {
+    if (sec < 60) return '$sec 秒';
+    return '${sec ~/ 60} 分 ${sec % 60} 秒';
+  }
+
+  /// 实际渲染:无心率直接保存原视频;有心率则烧字幕 + 曲线
+  Future<void> _renderVideo({
+    required XFile raw,
+    required List<_HrSample> samples,
+    required bool hadBle,
+    required double fallbackDuration,
+    required RenderJob job,
+  }) async {
+    final docs = await getApplicationDocumentsDirectory();
+    final folder = Directory('${docs.path}/录像');
+    if (!folder.existsSync()) folder.createSync(recursive: true);
+    final stamp = DateTime.now().millisecondsSinceEpoch;
+    final saved = '${folder.path}/$stamp.mp4';
+
+    // 本段开始时未连接手环 → 直接保存原视频(不烧任何心率 UI)
+    if (!hadBle) {
+      job
+        ..stage = '保存视频…'
+        ..progress = 0.5;
+      await raw.saveTo(saved);
+      job.progress = 1.0;
+      return;
+    }
+
+    // 1) 解析原视频尺寸与时长(字幕坐标需要像素尺寸)
+    job
+      ..stage = '读取视频信息…'
+      ..progress = 0.02;
+    final info = await FFprobeKit.getMediaInformation(raw.path);
+    final mi = info.getMediaInformation();
+    if (mi == null) throw Exception('无法读取视频信息');
+    int width = 1920, height = 1080;
+    for (final s in mi.getStreams()) {
+      if (s.getType() == 'video') {
+        width = s.getWidth() ?? width;
+        height = s.getHeight() ?? height;
+      }
+    }
+    final durStr = mi.getDuration(); // 形如 "12.345"
+    var durationSec = durStr != null ? double.tryParse(durStr) : null;
+    if (durationSec == null || durationSec <= 0) {
+      durationSec = fallbackDuration <= 0 ? 1.0 : fallbackDuration;
+    }
+
+    // 方向处理:竖屏录制但文件仍为横向(宽>高)时,成片旋转为竖向。
+    // 旋转后宽高互换,后续字幕/曲线坐标一律按旋转后的尺寸计算。
+    // transpose=1 顺时针90°;若方向相反改为 2(逆时针90°)。
+    final bool needRotate = _recordPortrait && width > height;
+    const int transposeMode = 1;
+    if (needRotate) {
+      final t = width;
+      width = height;
+      height = t;
+    }
+    final String vfPrefix = needRotate ? 'transpose=$transposeMode,' : '';
+
+    // 2) 字幕 + 曲线参数
+    final workDir = Directory('${docs.path}/work');
+    if (!workDir.existsSync()) workDir.createSync(recursive: true);
+    final assPath = '${workDir.path}/$stamp.ass';
+    final hasCurve = samples.where((s) => s.bpm > 0).length >= 2;
+
+    // 曲线区域尺寸:与心率文字一致(MarginR=30、MarginV=40、字号=高4.5%)
+    final fontSize = (height * 0.045).round().clamp(24, 200);
+    const marginRight = 30.0;
+    const marginTop = 40.0;
+    // 心率文字高度≈fontSize,曲线放其下方;加右侧数字列与上下限标注,略加高
+    final curW = (fontSize * 3.0).round().clamp(80, 720);
+    final curH = (fontSize * 1.35).round().clamp(32, 320);
+    final curX = (width - marginRight - curW).round();
+    final curY = (marginTop + fontSize * 1.12).round();
+
+    _writeAss(assPath, width, height, durationSec, samples);
+    String? seqDir;
+    if (hasCurve && durationSec > 1) {
+      job.stage = '生成心率曲线…';
+      // 有效采样(升序时间)
+      final pts = samples.where((s) => s.bpm > 0).toList();
+      seqDir = '${workDir.path}/${stamp}_seq';
+      final seq = Directory(seqDir);
+      if (seq.existsSync()) seq.deleteSync(recursive: true);
+      seq.createSync(recursive: true);
+
+      final frameCount = durationSec.ceil() + 1; // 每秒一帧,含起始与结束
+      var idx = 0; // pts 中最后一个 <= nowMs 的下标
+      for (var f = 0; f < frameCount; f++) {
+        final nowMs = (f * 1000).clamp(0, (durationSec * 1000).round());
+        // 该帧"当前心率":时间 <= nowMs 的最近一次采样
+        while (idx + 1 < pts.length && pts[idx + 1].ms <= nowMs) {
+          idx++;
+        }
+        final cur = pts[idx].bpm.toDouble();
+        final img = await _renderCurveFrame(
+          curW,
+          curH,
+          nowMs,
+          curBpm: cur,
+          samples: samples,
+        );
+        final data = await img.toByteData(format: ui.ImageByteFormat.png);
+        final name = '${seq.path}/curve_${f.toString().padLeft(4, '0')}.png';
+        File(name).writeAsBytesSync(data!.buffer.asUint8List());
+        // 曲线阶段占总进度 0.05 ~ 0.40
+        job.progress = 0.05 + 0.35 * (f + 1) / frameCount;
+        job.etaSec = (frameCount - f - 1) * 0.08;
+      }
+    }
+
+    // 3) FFmpeg 合成(进度由 statistics 回调上报)
+    job
+      ..stage = '合成中…'
+      ..progress = 0.40;
+    final outPath = '${workDir.path}/$stamp.mp4';
+    String cmd;
+    if (seqDir != null) {
+      // 输入0=原始视频(先旋转方向再烧字幕),输入1=曲线动画序列(1帧/秒)
+      cmd =
+          '-y -i "${raw.path}" -framerate 1 -i "$seqDir/curve_%04d.png" '
+          '-filter_complex '
+          '"[0:v]${vfPrefix}ass=$assPath[base];'
+          '[1:v]scale=$curW:$curH,format=rgba,fps=30[ov];'
+          '[base][ov]overlay=x=$curX:y=$curY:eof_action=repeat[outv]" '
+          '-map "[outv]" -map 0:a? '
+          '-c:v libx264 -preset veryfast -crf 22 '
+          '-c:a aac -b:a 128k "$outPath"';
+    } else {
+      cmd =
+          '-y -i "${raw.path}" -vf "${vfPrefix}ass=$assPath" '
+          '-c:v libx264 -preset veryfast -crf 22 '
+          '-c:a aac -b:a 128k "$outPath"';
+    }
+    final ok = await _runFfmpeg(cmd, durationSec, job);
+    if (!ok) throw Exception('FFmpeg 合成失败');
+
+    // 4) 保存到录像目录 + 清理临时文件
+    job
+      ..stage = '保存中…'
+      ..progress = 0.99;
+    await File(outPath).copy(saved);
+    try {
+      File(assPath).deleteSync();
+      if (seqDir != null) {
+        Directory(seqDir).deleteSync(recursive: true);
+      }
+      File(outPath).deleteSync();
+      File(raw.path).deleteSync();
+    } catch (_) {}
+    job.progress = 1.0;
+  }
+
+  /// 执行 FFmpeg,并用 statistics 回调上报进度与速度(预计剩余时间)
+  Future<bool> _runFfmpeg(String cmd, double durationSec, RenderJob job) async {
+    final done = Completer<bool>();
+    await FFmpegKit.executeAsync(
+      cmd,
+      (session) async {
+        final rc = await session.getReturnCode();
+        if (!done.isCompleted) done.complete(ReturnCode.isSuccess(rc));
+      },
+      null,
+      (stats) {
+        final tMs = stats.getTime();
+        if (durationSec <= 0 || tMs <= 0) return;
+        final p = (tMs / (durationSec * 1000)).clamp(0.0, 1.0);
+        job.progress = 0.40 + 0.58 * p;
+        job.stage = '合成中 ${(p * 100).round()}%';
+        final speed = stats.getSpeed();
+        if (speed > 0) {
+          job.etaSec = ((durationSec * 1000 - tMs) / 1000) / speed;
+        }
+      },
+    );
+    return done.future;
+  }
+
+  // ─────────────── 作品(已导出视频)───────────────
+
+  /// 载入录像目录中的作品列表
+  Future<void> _loadExports() async {
+    try {
+      final docs = await getApplicationDocumentsDirectory();
+      final folder = Directory('${docs.path}/录像');
+      if (!folder.existsSync()) return;
+      final files = folder
+          .listSync()
+          .whereType<File>()
+          .where((f) => f.path.toLowerCase().endsWith('.mp4'))
+          .toList();
+      files.sort(
+        (a, b) => b.statSync().modified.compareTo(a.statSync().modified),
+      );
+      final items = files.take(100).map((f) {
+        final stat = f.statSync();
+        final name = f.uri.pathSegments.last;
+        final ts = int.tryParse(name.split('.').first);
+        return ExportItem(
+          path: f.path,
+          time: ts != null
+              ? DateTime.fromMillisecondsSinceEpoch(ts)
+              : stat.modified,
+          sizeBytes: stat.size,
+        );
+      }).toList();
+      if (!mounted) return;
+      setState(() {
+        _exports
+          ..clear()
+          ..addAll(items);
+      });
+    } catch (_) {}
+  }
+
+  /// 作品面板:列表 + 查看(应用内播放) + 保存
+  Future<void> _showExportsSheet() async {
+    await _loadExports();
+    if (!mounted) return;
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: const Color(0xFF1C1C1E),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (ctx) => SizedBox(
+        height: MediaQuery.of(ctx).size.height * 2 / 3,
+        child: SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(16, 16, 16, 12),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Center(
+                  child: Container(
+                    width: 40,
+                    height: 4,
+                    decoration: BoxDecoration(
+                      color: Colors.white24,
+                      borderRadius: BorderRadius.circular(2),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 14),
+                Row(
+                  children: [
+                    const Icon(
+                      Icons.video_library,
+                      color: Colors.white,
+                      size: 20,
+                    ),
+                    const SizedBox(width: 8),
+                    const Text(
+                      '作品',
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontSize: 18,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                    const Spacer(),
+                    Text(
+                      '${_exports.length} 个',
+                      style: const TextStyle(
+                        color: Colors.white38,
+                        fontSize: 12,
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 10),
+                Expanded(
+                  child: _exports.isEmpty
+                      ? const Center(
+                          child: Text(
+                            '还没有导出的视频\n录像结束后会自动生成',
+                            textAlign: TextAlign.center,
+                            style: TextStyle(
+                              color: Colors.white38,
+                              fontSize: 13,
+                            ),
+                          ),
+                        )
+                      : ListView.separated(
+                          itemCount: _exports.length,
+                          separatorBuilder: (_, _) =>
+                              const Divider(height: 1, color: Colors.white12),
+                          itemBuilder: (context2, i) {
+                            final item = _exports[i];
+                            return ListTile(
+                              contentPadding: EdgeInsets.zero,
+                              leading: const Icon(
+                                Icons.movie,
+                                color: Colors.white70,
+                              ),
+                              title: Text(
+                                item.displayName,
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 14,
+                                ),
+                              ),
+                              subtitle: Text(
+                                item.sizeText,
+                                style: const TextStyle(
+                                  color: Colors.white38,
+                                  fontSize: 11,
+                                ),
+                              ),
+                              trailing: Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  IconButton(
+                                    tooltip: '查看',
+                                    onPressed: () => _playExport(item),
+                                    icon: const Icon(
+                                      Icons.play_circle_outline,
+                                      color: Colors.white,
+                                    ),
+                                  ),
+                                  IconButton(
+                                    tooltip: '保存',
+                                    onPressed: () => _saveExport(item),
+                                    icon: const Icon(
+                                      Icons.ios_share,
+                                      color: Colors.redAccent,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            );
+                          },
+                        ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// 应用内播放导出的视频
+  Future<void> _playExport(ExportItem item) async {
+    final controller = VideoPlayerController.file(File(item.path));
+    try {
+      await controller.initialize();
+      await controller.setLooping(true);
+      await controller.play();
+    } catch (e) {
+      await controller.dispose();
+      if (mounted) setState(() => _hint = '无法播放该视频: $e');
+      return;
+    }
+    if (!mounted) {
+      await controller.dispose();
+      return;
+    }
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => Dialog(
+        backgroundColor: Colors.black,
+        insetPadding: const EdgeInsets.all(12),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            AspectRatio(
+              aspectRatio: controller.value.aspectRatio == 0
+                  ? 9 / 16
+                  : controller.value.aspectRatio,
+              child: VideoPlayer(controller),
+            ),
+            Padding(
+              padding: const EdgeInsets.all(8),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  TextButton.icon(
+                    onPressed: () => _saveExport(item),
+                    icon: const Icon(
+                      Icons.ios_share,
+                      size: 16,
+                      color: Colors.redAccent,
+                    ),
+                    label: const Text(
+                      '保存',
+                      style: TextStyle(color: Colors.redAccent),
+                    ),
+                  ),
+                  TextButton(
+                    onPressed: () => Navigator.pop(ctx),
+                    child: const Text(
+                      '关闭',
+                      style: TextStyle(color: Colors.white70),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+    await controller.dispose();
+  }
+
+  /// 保存作品(走系统分享面板:可存相册/发送)
+  Future<void> _saveExport(ExportItem item) async {
+    final box = context.findRenderObject() as RenderBox?;
+    await SharePlus.instance.share(
+      ShareParams(
+        files: [XFile(item.path)],
+        text: '心率录像',
+        sharePositionOrigin: box != null
+            ? box.localToGlobal(Offset.zero) & box.size
+            : null,
+      ),
+    );
+  }
+
   /// 生成 ASS 字幕文件:右上角显示 ♥ bpm,文本红色、黑描边
-  void _writeAss(String path, int width, int height, double durationSec) {
-    // 心率采样点若为空,用局部占位(不污染 _samples)
-    final eff = _samples.isEmpty ? [_HrSample(0, 0)] : _samples;
+  void _writeAss(
+    String path,
+    int width,
+    int height,
+    double durationSec,
+    List<_HrSample> samples,
+  ) {
+    // 心率采样点若为空,用局部占位
+    final eff = samples.isEmpty ? [_HrSample(0, 0)] : samples;
     // 字体大小按画面高度约 4%
     final fontSize = (height * 0.045).round().clamp(24, 200);
 
@@ -1110,13 +1612,14 @@ class _CameraPageState extends State<CameraPage> {
     int h,
     int nowMs, {
     required double curBpm,
+    required List<_HrSample> samples,
   }) async {
     final rec = ui.PictureRecorder();
     final canvas = Canvas(rec);
     const winMs = 10000; // 10 秒窗口
 
     // 有效采样
-    final pts = _samples.where((s) => s.bpm > 0).toList();
+    final pts = samples.where((s) => s.bpm > 0).toList();
     // 该帧取 [nowMs-10s, nowMs] 内的点
     final inWin = pts
         .where((s) => s.ms <= nowMs && s.ms >= nowMs - winMs)
@@ -1398,6 +1901,47 @@ class _CameraPageState extends State<CameraPage> {
                         disabledBackgroundColor: Colors.black26,
                       ),
                     ),
+                    // 作品(已导出视频)入口
+                    Stack(
+                      clipBehavior: Clip.none,
+                      children: [
+                        IconButton(
+                          tooltip: '作品',
+                          onPressed: _showExportsSheet,
+                          icon: const Icon(
+                            Icons.folder,
+                            color: Colors.white,
+                            size: 24,
+                          ),
+                          style: IconButton.styleFrom(
+                            backgroundColor: Colors.black,
+                          ),
+                        ),
+                        if (_exports.isNotEmpty)
+                          Positioned(
+                            right: 2,
+                            top: 2,
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 5,
+                                vertical: 1,
+                              ),
+                              decoration: BoxDecoration(
+                                color: Colors.redAccent,
+                                borderRadius: BorderRadius.circular(8),
+                              ),
+                              child: Text(
+                                '${_exports.length}',
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 9,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                            ),
+                          ),
+                      ],
+                    ),
                     // 当前等效焦距 + 画质/帧率
                     Padding(
                       padding: const EdgeInsets.only(left: 4),
@@ -1500,6 +2044,67 @@ class _CameraPageState extends State<CameraPage> {
                   color: Colors.yellowAccent,
                   fontSize: 12,
                   backgroundColor: Colors.black45,
+                ),
+              ),
+            ),
+
+          // ── 后台渲染进度条(点一下可重新打开进度窗)──
+          if (_job != null && _renderBackground)
+            Positioned(
+              top: topPad + (isLandscape ? 66 : 120),
+              left: 20,
+              right: 20,
+              child: GestureDetector(
+                onTap: _reopenRenderDialog,
+                child: ListenableBuilder(
+                  listenable: _job!,
+                  builder: (context2, _) {
+                    final job = _job!;
+                    final pct = (job.progress * 100).round();
+                    return Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 12,
+                        vertical: 8,
+                      ),
+                      decoration: BoxDecoration(
+                        color: Colors.black.withValues(alpha: 0.72),
+                        borderRadius: BorderRadius.circular(10),
+                      ),
+                      child: Row(
+                        children: [
+                          SizedBox(
+                            width: 18,
+                            height: 18,
+                            child: CircularProgressIndicator(
+                              value: job.progress,
+                              strokeWidth: 2.5,
+                              backgroundColor: Colors.white12,
+                              valueColor: const AlwaysStoppedAnimation(
+                                Colors.redAccent,
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 10),
+                          Expanded(
+                            child: Text(
+                              job.done
+                                  ? '导出完成,可在"作品"中查看'
+                                  : '后台渲染中 $pct%  ${job.stage}',
+                              style: const TextStyle(
+                                color: Colors.white70,
+                                fontSize: 12,
+                              ),
+                            ),
+                          ),
+                          const Icon(
+                            Icons.open_in_full,
+                            size: 14,
+                            color: Colors.white38,
+                          ),
+                        ],
+                      ),
+                    );
+                  },
                 ),
               ),
             ),

@@ -41,6 +41,7 @@ dependencies:
   path_provider:
   ffmpeg_kit_flutter_new:
   share_plus:
+  video_player:
 
 dev_dependencies:
   flutter_test:
