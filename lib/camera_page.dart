@@ -159,11 +159,18 @@ class _CameraPageState extends State<CameraPage> {
   bool _stabRunning = false; // 是否已点"开始稳定"
   double _stabAngleX = 0; // 积分得到的 X 角速度 → 角度(度)
   double _stabOffsetY = 0; // 画面纵向位移(像素)
-  final double _stabGain = 1.6; // 每度对应的位移像素(可调)
-  static const double _stabMargin = 0.14; // 预留余量:画面放大量(可上下移动的范围)
-  final List<List<double>> _stabLog = []; // 记录的陀螺仪数据 [t, gx, gy, gz]
+  final double _stabGain = 5.0; // 每度对应的位移像素(越大越明显)
+  static const double _stabMargin = 0.25; // 预留余量:画面放大量(可上下移动的范围)
+  final List<List<double>> _stabLog = []; // 陀螺仪数据 [t(epoch秒), gx, gy, gz]
   DateTime _stabLast = DateTime.now();
   StreamSubscription<GyroscopeEvent>? _gyroSub;
+  // 诊断:确认陀螺仪是否真的有数据
+  double _gxNow = 0;
+  int _gyroCount = 0;
+  double _gyroHz = 0;
+  DateTime _gyroHzWin = DateTime.now();
+  int _gyroHzSamples = 0;
+  double _recordStartEpochSec = 0; // 本段录像开始时刻(用于切分陀螺仪数据)
   double _minZoom = 1.0;
   double _maxZoom = 1.0;
   double _zoomAtGestureStart = 1.0;
@@ -912,6 +919,8 @@ class _CameraPageState extends State<CameraPage> {
         _recordHadBle = widget.ble.isConnected;
         // 记录本段录制方向:竖屏则成片需要旋转为竖向
         _recordPortrait = isPortraitNow;
+        // 记录本段开始时刻(用于切分陀螺仪数据)
+        _recordStartEpochSec = DateTime.now().millisecondsSinceEpoch / 1000.0;
         // 每秒刷新一次界面,让计时数字走动
         _ticker?.cancel();
         _ticker = Timer.periodic(const Duration(seconds: 1), (_) {
@@ -946,6 +955,10 @@ class _CameraPageState extends State<CameraPage> {
         final samplesSnapshot = List<_HrSample>.from(_samples);
         final hadBleSnapshot = _recordHadBle;
         final fallbackDuration = _timer.elapsedMilliseconds / 1000.0;
+        // 运动稳定曲线(仅在本段开启并运行时有效)
+        final stabCurve = (_stabilizeEnabled && _stabRunning)
+            ? _buildStabCurve()
+            : <List<double>>[];
         // 不等待导出结束:否则 _busy 会一直占用,导致无法继续拍摄
         unawaited(
           _startExport(
@@ -953,6 +966,7 @@ class _CameraPageState extends State<CameraPage> {
             samples: samplesSnapshot,
             hadBle: hadBleSnapshot,
             fallbackDuration: fallbackDuration,
+            stabCurve: stabCurve,
           ),
         );
       }
@@ -977,6 +991,7 @@ class _CameraPageState extends State<CameraPage> {
     required List<_HrSample> samples,
     required bool hadBle,
     required double fallbackDuration,
+    List<List<double>> stabCurve = const [],
   }) async {
     final job = RenderJob();
     setState(() {
@@ -998,6 +1013,7 @@ class _CameraPageState extends State<CameraPage> {
         hadBle: hadBle,
         fallbackDuration: fallbackDuration,
         job: job,
+        stabCurve: stabCurve,
       );
       job
         ..progress = 1.0
@@ -1150,6 +1166,7 @@ class _CameraPageState extends State<CameraPage> {
     required bool hadBle,
     required double fallbackDuration,
     required RenderJob job,
+    List<List<double>> stabCurve = const [],
   }) async {
     final docs = await getApplicationDocumentsDirectory();
     final folder = Directory('${docs.path}/录像');
@@ -1251,30 +1268,58 @@ class _CameraPageState extends State<CameraPage> {
       }
     }
 
+    // 2.5) 运动稳定:成片同样应用陀螺仪曲线(放大留余量 + 按曲线移动裁切框)
+    //      输出尺寸保持与原视频一致,因此字幕/曲线坐标无需改变。
+    String stabPrefix = '';
+    if (stabCurve.length >= 2) {
+      final m = _stabMargin;
+      final scaledW = ((width * (1 + m)) / 2).floor() * 2;
+      final scaledH = ((height * (1 + m)) / 2).floor() * 2;
+      final cropX = ((scaledW - width) / 2).round();
+      final baseY = (scaledH - height) / 2;
+      final expr = _buildCropExpr(stabCurve, height * m / 2);
+      if (expr != null) {
+        stabPrefix =
+            'scale=$scaledW:$scaledH,'
+            'crop=$width:$height:$cropX:'
+            "'(${baseY.toStringAsFixed(1)}+($expr))',";
+      }
+    }
+
     // 3) FFmpeg 合成(进度由 statistics 回调上报)
     job
       ..stage = '合成中…'
       ..progress = 0.40;
     final outPath = '${workDir.path}/$stamp.mp4';
-    String cmd;
-    if (seqDir != null) {
-      // 输入0=原始视频(先旋转方向再烧字幕),输入1=曲线动画序列(1帧/秒)
-      cmd =
-          '-y -i "${raw.path}" -framerate 1 -i "$seqDir/curve_%04d.png" '
-          '-filter_complex '
-          '"[0:v]${vfPrefix}ass=$assPath[base];'
-          '[1:v]scale=$curW:$curH,format=rgba,fps=30[ov];'
-          '[base][ov]overlay=x=$curX:y=$curY:eof_action=repeat[outv]" '
-          '-map "[outv]" -map 0:a? '
-          '-c:v libx264 -preset veryfast -crf 22 '
-          '-c:a aac -b:a 128k "$outPath"';
-    } else {
-      cmd =
-          '-y -i "${raw.path}" -vf "${vfPrefix}ass=$assPath" '
+
+    String buildCmd(String stab) {
+      if (seqDir != null) {
+        // 输入0=原始视频(先旋转/稳定再烧字幕),输入1=曲线动画序列(1帧/秒)
+        return '-y -i "${raw.path}" -framerate 1 -i "$seqDir/curve_%04d.png" '
+            '-filter_complex '
+            '"[0:v]$vfPrefix${stab}ass=$assPath[base];'
+            '[1:v]scale=$curW:$curH,format=rgba,fps=30[ov];'
+            '[base][ov]overlay=x=$curX:y=$curY:eof_action=repeat[outv]" '
+            '-map "[outv]" -map 0:a? '
+            '-c:v libx264 -preset veryfast -crf 22 '
+            '-c:a aac -b:a 128k "$outPath"';
+      }
+      return '-y -i "${raw.path}" -vf "$vfPrefix${stab}ass=$assPath" '
           '-c:v libx264 -preset veryfast -crf 22 '
           '-c:a aac -b:a 128k "$outPath"';
     }
-    final ok = await _runFfmpeg(cmd, durationSec, job);
+
+    var ok = await _runFfmpeg(buildCmd(stabPrefix), durationSec, job);
+    if (!ok && stabPrefix.isNotEmpty) {
+      // 稳定滤镜失败时自动回退(至少保证出片)
+      job
+        ..stage = '稳定处理失败,改为普通合成…'
+        ..progress = 0.40;
+      ok = await _runFfmpeg(buildCmd(''), durationSec, job);
+      if (ok && mounted) {
+        setState(() => _hint = '运动稳定未能应用,已导出普通视频');
+      }
+    }
     if (!ok) throw Exception('FFmpeg 合成失败');
 
     // 4) 保存到录像目录 + 清理临时文件
@@ -1518,25 +1563,40 @@ class _CameraPageState extends State<CameraPage> {
     return h * _stabMargin / 2;
   }
 
-  /// 订阅陀螺仪:运行中持续积分并换算为画面位移
+  /// 订阅陀螺仪:持续统计(诊断),运行中积分并换算为画面位移
   void _startGyroSession() {
     _gyroSub?.cancel();
     _stabLast = DateTime.now();
+    _gyroHzWin = DateTime.now();
+    _gyroHzSamples = 0;
     _gyroSub = gyroscopeEventStream(samplingPeriod: SensorInterval.gameInterval)
         .listen((e) {
           final now = DateTime.now();
           final dt = now.difference(_stabLast).inMicroseconds / 1e6;
           _stabLast = now;
+
+          // 诊断:无条件统计,即使未开始稳定也能确认是否有数据
+          _gyroCount++;
+          _gyroHzSamples++;
+          _gxNow = e.x;
+          final winMs = now.difference(_gyroHzWin).inMilliseconds;
+          if (winMs >= 500) {
+            _gyroHz = _gyroHzSamples * 1000 / winMs;
+            _gyroHzSamples = 0;
+            _gyroHzWin = now;
+          }
+
           if (dt <= 0 || dt > 0.2) return;
+
+          // 记录陀螺仪数据[t(epoch秒), gx, gy, gz]
+          _stabLog.add([now.millisecondsSinceEpoch / 1000.0, e.x, e.y, e.z]);
+          if (_stabLog.length > 60000) _stabLog.removeAt(0);
+
           if (!_stabRunning) return;
 
           // 积分 X 角速度 → 角度(度);轻微泄漏以抑制长期漂移
           _stabAngleX += e.x * dt * 180 / math.pi;
           _stabAngleX *= 0.9985;
-
-          // 记录陀螺仪数据[t, gx, gy, gz]
-          _stabLog.add([now.millisecondsSinceEpoch / 1000.0, e.x, e.y, e.z]);
-          if (_stabLog.length > 60000) _stabLog.removeAt(0);
 
           // X 值增大 → 画面下移(超出余量则截断)
           final maxPx = _maxStabOffset();
@@ -1544,6 +1604,63 @@ class _CameraPageState extends State<CameraPage> {
 
           if (mounted) setState(() {});
         }, onError: (_) {});
+  }
+
+  /// 用本次录像期间的陀螺仪数据生成"归一化位移曲线"[[t秒, -1~1]]
+  List<List<double>> _buildStabCurve() {
+    final out = <List<double>>[];
+    if (_stabLog.isEmpty) return out;
+    final start = _recordStartEpochSec;
+    var maxPx = _maxStabOffset();
+    if (maxPx <= 0) maxPx = 40;
+
+    var angle = 0.0;
+    double? lastTs;
+    var nextSample = 0.0;
+    for (final e in _stabLog) {
+      final ts = e[0];
+      if (ts < start) continue;
+      if (lastTs != null) {
+        final dt = ts - lastTs;
+        if (dt > 0 && dt < 0.2) {
+          angle += e[1] * dt * 180 / math.pi;
+          angle *= 0.9985;
+        }
+      }
+      lastTs = ts;
+      final t = ts - start;
+      if (t >= nextSample) {
+        out.add([t, (angle * _stabGain / maxPx).clamp(-1.0, 1.0)]);
+        nextSample = t + 0.25;
+      }
+    }
+    return out;
+  }
+
+  /// 把归一化曲线转成 FFmpeg crop 的 y 位移表达式(节点数受限,避免表达式过深)
+  String? _buildCropExpr(List<List<double>> curve, double maxShiftPx) {
+    if (curve.length < 2) return null;
+    const maxKnots = 36;
+    final step = (curve.length / maxKnots).ceil();
+    final knots = <List<double>>[];
+    for (var i = 0; i < curve.length; i += step) {
+      knots.add(curve[i]);
+    }
+    if (knots.last[0] != curve.last[0]) knots.add(curve.last);
+    if (knots.length < 2) return null;
+
+    final ts = knots.map((k) => k[0]).toList();
+    final vs = knots.map((k) => k[1] * maxShiftPx).toList();
+    var expr = vs.last.toStringAsFixed(2);
+    for (var i = ts.length - 2; i >= 0; i--) {
+      final t0 = ts[i], t1 = ts[i + 1], v0 = vs[i], v1 = vs[i + 1];
+      final slope = (v1 - v0) / (t1 - t0);
+      expr =
+          'if(lt(t,${t1.toStringAsFixed(2)}),'
+          '${v0.toStringAsFixed(2)}+${slope.toStringAsFixed(3)}'
+          '*(t-${t0.toStringAsFixed(2)}),$expr)';
+    }
+    return expr;
   }
 
   void _stopGyroSession() {
@@ -1723,9 +1840,9 @@ class _CameraPageState extends State<CameraPage> {
                     ),
                     const SizedBox(height: 8),
                     Text(
-                      '已记录 ${_stabLog.length} 条陀螺仪数据 · X 角度 '
-                      '${_stabAngleX.toStringAsFixed(1)}° · 画面位移 '
-                      '${_stabOffsetY.toStringAsFixed(0)}px',
+                      '陀螺仪:${_gyroCount == 0 ? "无数据(请检查权限)" : "${_gyroHz.toStringAsFixed(0)} Hz · gx=${_gxNow.toStringAsFixed(2)}"}'
+                      '\nX 角度 ${_stabAngleX.toStringAsFixed(1)}° · 画面位移 '
+                      '${_stabOffsetY.toStringAsFixed(0)}px · 记录 ${_stabLog.length} 条',
                       style: const TextStyle(
                         color: Colors.white38,
                         fontSize: 11,
@@ -2553,11 +2670,22 @@ class _CameraPageState extends State<CameraPage> {
                       const SizedBox(width: 6),
                       Text(
                         '稳定中 X ${_stabAngleX.toStringAsFixed(1)}° · '
-                        '位移 ${_stabOffsetY.toStringAsFixed(0)}px · '
-                        '${_stabLog.length} 条',
+                        '位移 ${_stabOffsetY.toStringAsFixed(0)}px',
                         style: const TextStyle(
                           color: Colors.white70,
                           fontSize: 11,
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Text(
+                        _gyroCount == 0
+                            ? '陀螺仪无数据'
+                            : '${_gyroHz.toStringAsFixed(0)}Hz',
+                        style: TextStyle(
+                          color: _gyroCount == 0
+                              ? Colors.redAccent
+                              : Colors.greenAccent,
+                          fontSize: 10,
                         ),
                       ),
                     ],
