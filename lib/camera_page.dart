@@ -17,6 +17,7 @@ import 'package:video_player/video_player.dart';
 
 import 'ble_heart_rate.dart';
 import 'gyro_test_page.dart';
+import 'stabilizer.dart';
 
 /// 一次心率采样:相对录像开始的时间(毫秒)+ 心率值
 class _HrSample {
@@ -154,13 +155,16 @@ class _CameraPageState extends State<CameraPage> {
   bool _renderDialogOpen = false; // 进度弹窗是否打开
   final List<ExportItem> _exports = []; // 已导出作品
 
-  // ── 运动稳定(陀螺仪防抖)──
+  // ── 运动稳定(陀螺仪防抖,Gyroflow 式算法)──
   bool _stabilizeEnabled = false; // 开关(在弹窗里控制)
   bool _stabRunning = false; // 是否已点"开始稳定"
-  double _stabAngleX = 0; // 积分得到的 X 角速度 → 角度(度)
-  double _stabOffsetY = 0; // 画面纵向位移(像素)
-  final double _stabGain = 5.0; // 每度对应的位移像素(越大越明显)
-  static const double _stabMargin = 0.25; // 预留余量:画面放大量(可上下移动的范围)
+  final OnlineStabilizer _onlineStab = OnlineStabilizer();
+  double _stabOffsetX = 0; // 画面横向补偿(像素,预览坐标)
+  double _stabOffsetY = 0; // 画面纵向补偿(像素,预览坐标)
+  double _stabAutoZoom = 1.0; // 自适应缩放(保证裁切不出画面)
+  double _stabStrength = 1.0; // 稳定强度(0.5 柔和 / 1.0 标准 / 1.6 强)
+  final double _stabFov = 66; // 估算视场角(度),用于焦距换算
+  double _stabCorrDeg = 0; // 当前角修正(度,仅显示用)
   final List<List<double>> _stabLog = []; // 陀螺仪数据 [t(epoch秒), gx, gy, gz]
   DateTime _stabLast = DateTime.now();
   StreamSubscription<GyroscopeEvent>? _gyroSub;
@@ -955,9 +959,10 @@ class _CameraPageState extends State<CameraPage> {
         final samplesSnapshot = List<_HrSample>.from(_samples);
         final hadBleSnapshot = _recordHadBle;
         final fallbackDuration = _timer.elapsedMilliseconds / 1000.0;
-        // 运动稳定曲线(仅在本段开启并运行时有效)
-        final stabCurve = (_stabilizeEnabled && _stabRunning)
-            ? _buildStabCurve()
+        // 运动稳定:快照本段陀螺仪原始数据(导出时用 Gyroflow 式算法分析)
+        final stabOn = _stabilizeEnabled && _stabRunning;
+        final stabGyro = stabOn
+            ? List<List<double>>.from(_stabLog)
             : <List<double>>[];
         // 不等待导出结束:否则 _busy 会一直占用,导致无法继续拍摄
         unawaited(
@@ -966,7 +971,11 @@ class _CameraPageState extends State<CameraPage> {
             samples: samplesSnapshot,
             hadBle: hadBleSnapshot,
             fallbackDuration: fallbackDuration,
-            stabCurve: stabCurve,
+            stabGyro: stabGyro,
+            stabStartEpoch: _recordStartEpochSec,
+            stabEndEpoch: DateTime.now().millisecondsSinceEpoch / 1000.0,
+            stabStrength: _stabStrength,
+            stabFov: _stabFov,
           ),
         );
       }
@@ -991,7 +1000,11 @@ class _CameraPageState extends State<CameraPage> {
     required List<_HrSample> samples,
     required bool hadBle,
     required double fallbackDuration,
-    List<List<double>> stabCurve = const [],
+    List<List<double>> stabGyro = const [],
+    double stabStartEpoch = 0,
+    double stabEndEpoch = 0,
+    double stabStrength = 1.0,
+    double stabFov = 66,
   }) async {
     final job = RenderJob();
     setState(() {
@@ -1013,7 +1026,11 @@ class _CameraPageState extends State<CameraPage> {
         hadBle: hadBle,
         fallbackDuration: fallbackDuration,
         job: job,
-        stabCurve: stabCurve,
+        stabGyro: stabGyro,
+        stabStartEpoch: stabStartEpoch,
+        stabEndEpoch: stabEndEpoch,
+        stabStrength: stabStrength,
+        stabFov: stabFov,
       );
       job
         ..progress = 1.0
@@ -1166,7 +1183,11 @@ class _CameraPageState extends State<CameraPage> {
     required bool hadBle,
     required double fallbackDuration,
     required RenderJob job,
-    List<List<double>> stabCurve = const [],
+    List<List<double>> stabGyro = const [],
+    double stabStartEpoch = 0,
+    double stabEndEpoch = 0,
+    double stabStrength = 1.0,
+    double stabFov = 66,
   }) async {
     final docs = await getApplicationDocumentsDirectory();
     final folder = Directory('${docs.path}/录像');
@@ -1268,21 +1289,36 @@ class _CameraPageState extends State<CameraPage> {
       }
     }
 
-    // 2.5) 运动稳定:成片同样应用陀螺仪曲线(放大留余量 + 按曲线移动裁切框)
-    //      输出尺寸保持与原视频一致,因此字幕/曲线坐标无需改变。
+    // 2.5) 运动稳定(Gyroflow 式):四元数姿态积分 → 平滑虚拟相机路径
+    //      → 双轴补偿曲线 + 自适应缩放 → 放大后按曲线移动裁切框。
+    //      输出尺寸与原视频一致,因此字幕/曲线坐标无需改变。
     String stabPrefix = '';
-    if (stabCurve.length >= 2) {
-      final m = _stabMargin;
-      final scaledW = ((width * (1 + m)) / 2).floor() * 2;
-      final scaledH = ((height * (1 + m)) / 2).floor() * 2;
-      final cropX = ((scaledW - width) / 2).round();
-      final baseY = (scaledH - height) / 2;
-      final expr = _buildCropExpr(stabCurve, height * m / 2);
-      if (expr != null) {
-        stabPrefix =
-            'scale=$scaledW:$scaledH,'
-            'crop=$width:$height:$cropX:'
-            "'(${baseY.toStringAsFixed(1)}+($expr))',";
+    if (stabGyro.length >= 4 && stabEndEpoch > stabStartEpoch) {
+      job.stage = '分析陀螺仪数据…';
+      final plan = GyroStabilizer.analyze(
+        samples: stabGyro,
+        startEpoch: stabStartEpoch,
+        endEpoch: stabEndEpoch,
+        frameW: width.toDouble(),
+        frameH: height.toDouble(),
+        fovDeg: stabFov,
+        strength: stabStrength,
+      );
+      if (plan.usable) {
+        final zoom = plan.zoom;
+        final scaledW = ((width * zoom) / 2).floor() * 2;
+        final scaledH = ((height * zoom) / 2).floor() * 2;
+        final baseX = (scaledW - width) / 2;
+        final baseY = (scaledH - height) / 2;
+        final exprX = GyroStabilizer.toCropExpr(plan.dx);
+        final exprY = GyroStabilizer.toCropExpr(plan.dy);
+        if (exprX != null && exprY != null) {
+          stabPrefix =
+              'scale=$scaledW:$scaledH,'
+              'crop=$width:$height:'
+              "'(${baseX.toStringAsFixed(1)}+$zoom*($exprX))':"
+              "'(${baseY.toStringAsFixed(1)}+$zoom*($exprY))',";
+        }
       }
     }
 
@@ -1556,13 +1592,6 @@ class _CameraPageState extends State<CameraPage> {
     } catch (_) {}
   }
 
-  /// 画面放大量对应的可移动范围(像素,单侧)
-  double _maxStabOffset() {
-    final h = _previewSize.height;
-    if (h <= 0) return 40;
-    return h * _stabMargin / 2;
-  }
-
   /// 订阅陀螺仪:持续统计(诊断),运行中积分并换算为画面位移
   void _startGyroSession() {
     _gyroSub?.cancel();
@@ -1594,73 +1623,26 @@ class _CameraPageState extends State<CameraPage> {
 
           if (!_stabRunning) return;
 
-          // 积分 X 角速度 → 角度(度);轻微泄漏以抑制长期漂移
-          _stabAngleX += e.x * dt * 180 / math.pi;
-          _stabAngleX *= 0.9985;
+          // 四元数姿态积分 + EMA 平滑虚拟相机路径 → 角修正(Gyroflow 式)
+          _onlineStab.update(dt, e.x, e.y, e.z);
 
-          // X 值增大 → 画面下移(超出余量则截断)
-          final maxPx = _maxStabOffset();
-          _stabOffsetY = (_stabAngleX * _stabGain).clamp(-maxPx, maxPx);
+          // 角修正 → 像素位移(按焦距换算),并给出自适应缩放
+          final fov = _stabFov;
+          final wPx = _previewSize.width <= 0 ? 1080.0 : _previewSize.width;
+          final hPx = _previewSize.height <= 0 ? 1920.0 : _previewSize.height;
+          final shifts = _onlineStab.shifts(wPx, fov, _stabStrength);
+          _stabOffsetX = shifts[0];
+          _stabOffsetY = shifts[1];
+          _stabCorrDeg = _onlineStab.corrX * 180 / math.pi;
+          _stabAutoZoom = _onlineStab.adaptiveZoom(
+            wPx,
+            hPx,
+            fov,
+            _stabStrength,
+          );
 
           if (mounted) setState(() {});
         }, onError: (_) {});
-  }
-
-  /// 用本次录像期间的陀螺仪数据生成"归一化位移曲线"[[t秒, -1~1]]
-  List<List<double>> _buildStabCurve() {
-    final out = <List<double>>[];
-    if (_stabLog.isEmpty) return out;
-    final start = _recordStartEpochSec;
-    var maxPx = _maxStabOffset();
-    if (maxPx <= 0) maxPx = 40;
-
-    var angle = 0.0;
-    double? lastTs;
-    var nextSample = 0.0;
-    for (final e in _stabLog) {
-      final ts = e[0];
-      if (ts < start) continue;
-      if (lastTs != null) {
-        final dt = ts - lastTs;
-        if (dt > 0 && dt < 0.2) {
-          angle += e[1] * dt * 180 / math.pi;
-          angle *= 0.9985;
-        }
-      }
-      lastTs = ts;
-      final t = ts - start;
-      if (t >= nextSample) {
-        out.add([t, (angle * _stabGain / maxPx).clamp(-1.0, 1.0)]);
-        nextSample = t + 0.25;
-      }
-    }
-    return out;
-  }
-
-  /// 把归一化曲线转成 FFmpeg crop 的 y 位移表达式(节点数受限,避免表达式过深)
-  String? _buildCropExpr(List<List<double>> curve, double maxShiftPx) {
-    if (curve.length < 2) return null;
-    const maxKnots = 36;
-    final step = (curve.length / maxKnots).ceil();
-    final knots = <List<double>>[];
-    for (var i = 0; i < curve.length; i += step) {
-      knots.add(curve[i]);
-    }
-    if (knots.last[0] != curve.last[0]) knots.add(curve.last);
-    if (knots.length < 2) return null;
-
-    final ts = knots.map((k) => k[0]).toList();
-    final vs = knots.map((k) => k[1] * maxShiftPx).toList();
-    var expr = vs.last.toStringAsFixed(2);
-    for (var i = ts.length - 2; i >= 0; i--) {
-      final t0 = ts[i], t1 = ts[i + 1], v0 = vs[i], v1 = vs[i + 1];
-      final slope = (v1 - v0) / (t1 - t0);
-      expr =
-          'if(lt(t,${t1.toStringAsFixed(2)}),'
-          '${v0.toStringAsFixed(2)}+${slope.toStringAsFixed(3)}'
-          '*(t-${t0.toStringAsFixed(2)}),$expr)';
-    }
-    return expr;
   }
 
   void _stopGyroSession() {
@@ -1782,7 +1764,7 @@ class _CameraPageState extends State<CameraPage> {
                           ),
                           const SizedBox(height: 4),
                           const Text(
-                            '① 切到最广 → ② 双指放大画面留出余量 → ③ 点开始稳定',
+                            '① 切到最广 → ② 点开始稳定(缩放会自适应,可双指微调) → ③ 正常拍摄',
                             style: TextStyle(
                               color: Colors.white38,
                               fontSize: 11,
@@ -1790,6 +1772,39 @@ class _CameraPageState extends State<CameraPage> {
                           ),
                         ],
                       ),
+                    ),
+                    const SizedBox(height: 10),
+                    Row(
+                      children: [
+                        const Text(
+                          '稳定强度',
+                          style: TextStyle(color: Colors.white70, fontSize: 12),
+                        ),
+                        const SizedBox(width: 10),
+                        ...[(0.6, '柔和'), (1.0, '标准'), (1.6, '强')].map((o) {
+                          final sel = (_stabStrength - o.$1).abs() < 0.01;
+                          return Padding(
+                            padding: const EdgeInsets.only(right: 6),
+                            child: ChoiceChip(
+                              label: Text(
+                                o.$2,
+                                style: TextStyle(
+                                  fontSize: 11,
+                                  color: sel ? Colors.black : Colors.white,
+                                ),
+                              ),
+                              selected: sel,
+                              selectedColor: Colors.redAccent,
+                              backgroundColor: Colors.black,
+                              side: BorderSide(
+                                color: sel ? Colors.redAccent : Colors.white24,
+                              ),
+                              onSelected: (_) =>
+                                  setSheetState(() => _stabStrength = o.$1),
+                            ),
+                          );
+                        }),
+                      ],
                     ),
                     const SizedBox(height: 10),
                     SizedBox(
@@ -1820,10 +1835,14 @@ class _CameraPageState extends State<CameraPage> {
                           setState(() {
                             if (_stabRunning) {
                               _stabRunning = false;
+                              _stabOffsetX = 0;
                               _stabOffsetY = 0;
                             } else {
-                              _stabAngleX = 0;
+                              _onlineStab.reset();
+                              _stabOffsetX = 0;
                               _stabOffsetY = 0;
+                              _stabAutoZoom = 1.0;
+                              _stabCorrDeg = 0;
                               _stabLog.clear();
                               _stabLast = DateTime.now();
                               _stabRunning = true;
@@ -1841,8 +1860,10 @@ class _CameraPageState extends State<CameraPage> {
                     const SizedBox(height: 8),
                     Text(
                       '陀螺仪:${_gyroCount == 0 ? "无数据(请检查权限)" : "${_gyroHz.toStringAsFixed(0)} Hz · gx=${_gxNow.toStringAsFixed(2)}"}'
-                      '\nX 角度 ${_stabAngleX.toStringAsFixed(1)}° · 画面位移 '
-                      '${_stabOffsetY.toStringAsFixed(0)}px · 记录 ${_stabLog.length} 条',
+                      '\n角修正 ${_stabCorrDeg.toStringAsFixed(1)}° · 位移 '
+                      '${_stabOffsetX.toStringAsFixed(0)},${_stabOffsetY.toStringAsFixed(0)}px'
+                      ' · 自适应缩放 ${_stabAutoZoom.toStringAsFixed(2)}x'
+                      ' · 记录 ${_stabLog.length} 条',
                       style: const TextStyle(
                         color: Colors.white38,
                         fontSize: 11,
@@ -2182,7 +2203,7 @@ class _CameraPageState extends State<CameraPage> {
           // ── 相机预览 ──
           // iOS 相机插件会把输出画面随设备方向旋转,但 value.aspectRatio 始终返回
           // 捕获格式的原始比例(横向)。故竖屏时纹理实际是竖向,必须用 1/aspectRatio。
-          // 运动稳定开启时:画面额外放大 _stabMargin 形成余量,再按陀螺仪位移取景框。
+          // 运动稳定开启时:画面按自适应缩放放大形成余量,再按陀螺仪位移取景框。
           if (cam != null && cam.value.isInitialized)
             Positioned.fill(
               child: GestureDetector(
@@ -2214,8 +2235,9 @@ class _CameraPageState extends State<CameraPage> {
                     final rawA = cam.value.aspectRatio <= 0
                         ? 4.0 / 3.0
                         : cam.value.aspectRatio;
-                    // 稳定运行中:画面放大留出余量,并按陀螺仪位移
-                    final over = _stabRunning ? 1.0 + _stabMargin : 1.0;
+                    // 稳定运行中:按自适应缩放放大(留出余量),并做双轴补偿
+                    final over = _stabRunning ? _stabAutoZoom : 1.0;
+                    final dx = _stabRunning ? _stabOffsetX : 0.0;
                     final dy = _stabRunning ? _stabOffsetY : 0.0;
 
                     // 竖屏:纹理已竖置 → 用竖比例 cover 铺满全屏
@@ -2243,7 +2265,7 @@ class _CameraPageState extends State<CameraPage> {
                               minHeight: ih,
                               maxHeight: ih,
                               child: Transform.translate(
-                                offset: Offset(0, dy),
+                                offset: Offset(dx, dy),
                                 child: SizedBox(
                                   width: iw,
                                   height: ih,
@@ -2285,7 +2307,7 @@ class _CameraPageState extends State<CameraPage> {
                             minHeight: ih,
                             maxHeight: ih,
                             child: Transform.translate(
-                              offset: Offset(0, dy),
+                              offset: Offset(dx, dy),
                               child: SizedBox(
                                 width: iw,
                                 height: ih,
@@ -2669,8 +2691,10 @@ class _CameraPageState extends State<CameraPage> {
                       ),
                       const SizedBox(width: 6),
                       Text(
-                        '稳定中 X ${_stabAngleX.toStringAsFixed(1)}° · '
-                        '位移 ${_stabOffsetY.toStringAsFixed(0)}px',
+                        '稳定中 角修正 ${_stabCorrDeg.toStringAsFixed(1)}° · '
+                        '位移 ${_stabOffsetX.toStringAsFixed(0)},'
+                        '${_stabOffsetY.toStringAsFixed(0)}px · '
+                        '${_stabAutoZoom.toStringAsFixed(2)}x',
                         style: const TextStyle(
                           color: Colors.white70,
                           fontSize: 11,
