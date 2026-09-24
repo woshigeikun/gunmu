@@ -1213,16 +1213,6 @@ class _CameraPageState extends State<CameraPage> {
     final stamp = DateTime.now().millisecondsSinceEpoch;
     final saved = '${folder.path}/$stamp.mp4';
 
-    // 本段开始时未连接手环 → 直接保存原视频(不烧任何心率 UI)
-    if (!hadBle) {
-      job
-        ..stage = '保存视频…'
-        ..progress = 0.5;
-      await raw.saveTo(saved);
-      job.progress = 1.0;
-      return;
-    }
-
     // 1) 解析原视频尺寸与时长(字幕坐标需要像素尺寸)
     job
       ..stage = '读取视频信息…'
@@ -1308,9 +1298,11 @@ class _CameraPageState extends State<CameraPage> {
     }
 
     // 2.5) 运动稳定(Gyroflow 式):四元数姿态积分 → 平滑虚拟相机路径
-    //      → 双轴补偿曲线 + 自适应缩放 → 放大后按曲线移动裁切框。
+    //      → 双轴补偿曲线 + **固定**裁切余量 → 按曲线移动裁切框。
+    //      余量恒定 ⇒ 画面不会随抖动幅度越放越大(修"大幅晃动卡在 3x")。
     //      输出尺寸与原视频一致,因此字幕/曲线坐标无需改变。
-    String stabPrefix = '';
+    String stabPrefix = ''; // 末尾带逗号,后面还要接 ass=
+    String stabInfo = '';
     if (stabGyro.length >= 4 && stabEndEpoch > stabStartEpoch) {
       job.stage = '分析陀螺仪数据…';
       final plan = GyroStabilizer.analyze(
@@ -1336,8 +1328,46 @@ class _CameraPageState extends State<CameraPage> {
               'crop=$width:$height:'
               "'(${baseX.toStringAsFixed(1)}+$zoom*($exprX))':"
               "'(${baseY.toStringAsFixed(1)}+$zoom*($exprY))',";
+          stabInfo =
+              '运动稳定 ×${zoom.toStringAsFixed(2)} · 位移≤'
+              '${plan.maxShiftX.toStringAsFixed(0)},'
+              '${plan.maxShiftY.toStringAsFixed(0)}px';
+          if (mounted) setState(() => _hint = stabInfo);
         }
       }
+      if (stabPrefix.isEmpty && mounted) {
+        setState(() => _hint = '本段陀螺仪数据不足,未应用运动稳定');
+      }
+    }
+
+    // 2.6) 本段开始时未连手环 → 不烧心率 UI,但**仍然**应用运动稳定
+    if (!hadBle) {
+      job
+        ..stage = '保存视频…'
+        ..progress = 0.6;
+      if (stabPrefix.isEmpty) {
+        await raw.saveTo(saved);
+      } else {
+        final stabOnly = stabPrefix.substring(0, stabPrefix.length - 1);
+        final tmpOut = '${workDir.path}/${stamp}_stab.mp4';
+        final stabOk = await _runFfmpeg(
+          '-y -i "${raw.path}" -vf "$vfPrefix$stabOnly" '
+          '-c:v libx264 -preset veryfast -crf 22 '
+          '-c:a aac -b:a 128k "$tmpOut"',
+          durationSec,
+          job,
+        );
+        if (!stabOk) throw Exception('FFmpeg 稳定处理失败');
+        await File(tmpOut).copy(saved);
+        try {
+          File(tmpOut).deleteSync();
+        } catch (_) {}
+      }
+      try {
+        File(assPath).deleteSync();
+      } catch (_) {}
+      job.progress = 1.0;
+      return;
     }
 
     // 3) FFmpeg 合成(进度由 statistics 回调上报)
@@ -1644,20 +1674,24 @@ class _CameraPageState extends State<CameraPage> {
           // 四元数姿态积分 + EMA 平滑虚拟相机路径 → 角修正(Gyroflow 式)
           _onlineStab.update(dt, e.x, e.y, e.z);
 
-          // 角修正 → 像素位移(按焦距换算),并给出自适应缩放
+          // 角修正 → 像素位移(按焦距换算),并硬限制在固定裁切余量内
           final fov = _stabFov;
           final wPx = _previewSize.width <= 0 ? 1080.0 : _previewSize.width;
           final hPx = _previewSize.height <= 0 ? 1920.0 : _previewSize.height;
-          final shifts = _onlineStab.shifts(wPx, fov, _stabStrength);
-          _stabOffsetX = shifts[0];
-          _stabOffsetY = shifts[1];
-          _stabCorrDeg = _onlineStab.corrX * 180 / math.pi;
-          _stabAutoZoom = _onlineStab.adaptiveZoom(
+          final margin = GyroStabilizer.marginFor(_stabStrength);
+          final shifts = _onlineStab.shifts(
             wPx,
             hPx,
             fov,
             _stabStrength,
+            margin,
           );
+          _stabOffsetX = shifts[0];
+          _stabOffsetY = shifts[1];
+          _stabCorrDeg = _onlineStab.corrX * 180 / math.pi;
+          // 固定裁切放大:只由"稳定强度"决定,不随抖动幅度变化
+          // (否则大幅晃一下就会永久顶到镜头最大倍数)
+          _stabAutoZoom = GyroStabilizer.zoomForMargin(margin);
 
           if (mounted) {
             setState(() {});
@@ -1813,7 +1847,8 @@ class _CameraPageState extends State<CameraPage> {
                           ),
                           const SizedBox(height: 4),
                           const Text(
-                            '① 切到最广 → ② 点开始稳定(缩放会自适应,可双指微调) → ③ 正常拍摄',
+                            '① 切到最广 → ② 点开始稳定 → ③ 正常拍摄'
+                            '(裁切放大固定,抖得再大也不会变)',
                             style: TextStyle(
                               color: Colors.white38,
                               fontSize: 11,
@@ -1942,7 +1977,7 @@ class _CameraPageState extends State<CameraPage> {
                             '陀螺仪:${_gyroCount == 0 ? "无数据(请检查权限)" : "${_gyroHz.toStringAsFixed(0)} Hz · gx=${_gxNow.toStringAsFixed(2)}"}'
                             '\n角修正 ${_stabCorrDeg.toStringAsFixed(1)}° · 位移 '
                             '${_stabOffsetX.toStringAsFixed(0)},${_stabOffsetY.toStringAsFixed(0)}px'
-                            ' · 自适应缩放 ${_stabAutoZoom.toStringAsFixed(2)}x'
+                            ' · 裁切放大 ${_stabAutoZoom.toStringAsFixed(2)}x'
                             ' · 记录 ${_stabLog.length} 条',
                             style: const TextStyle(
                               color: Colors.white38,
