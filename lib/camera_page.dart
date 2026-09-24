@@ -33,12 +33,19 @@ class RenderJob extends ChangeNotifier {
   double? _etaSec;
   bool _done = false;
   String? _error;
+  String? _stabInfo; // 运动稳定实际参数(尽早填,弹窗立刻可见)
 
   double get progress => _progress;
   String get stage => _stage;
   double? get etaSec => _etaSec;
   bool get done => _done;
   String? get error => _error;
+  String? get stabInfo => _stabInfo;
+
+  set stabInfo(String? v) {
+    _stabInfo = v;
+    notifyListeners();
+  }
 
   set progress(double v) {
     _progress = v.clamp(0.0, 1.0);
@@ -1118,6 +1125,16 @@ class _CameraPageState extends State<CameraPage> {
                     fontSize: 12,
                   ),
                 ),
+                if (job.stabInfo != null) ...[
+                  const SizedBox(height: 4),
+                  Text(
+                    job.stabInfo!,
+                    style: const TextStyle(
+                      color: Colors.redAccent,
+                      fontSize: 12,
+                    ),
+                  ),
+                ],
               ],
             );
           },
@@ -1245,6 +1262,48 @@ class _CameraPageState extends State<CameraPage> {
     }
     final String vfPrefix = needRotate ? 'transpose=$transposeMode,' : '';
 
+    // 1.5) 运动稳定分析:**尽早**算出来,这样进度窗一出现就能看到稳定参数,
+    //      不用等心率曲线生成完(曲线阶段可能要好几秒)。
+    //      四元数姿态积分 → 平滑虚拟相机路径 → 双轴补偿曲线 + 固定裁切余量。
+    String stabPrefix = ''; // 末尾带逗号,后面还要接 ass=
+    if (stabGyro.length >= 4 && stabEndEpoch > stabStartEpoch) {
+      job.stage = '分析陀螺仪数据…';
+      final plan = GyroStabilizer.analyze(
+        samples: stabGyro,
+        startEpoch: stabStartEpoch,
+        endEpoch: stabEndEpoch,
+        frameW: width.toDouble(),
+        frameH: height.toDouble(),
+        fovDeg: stabFov,
+        strength: stabStrength,
+      );
+      if (plan.usable) {
+        final zoom = plan.zoom;
+        final scaledW = ((width * zoom) / 2).floor() * 2;
+        final scaledH = ((height * zoom) / 2).floor() * 2;
+        final baseX = (scaledW - width) / 2;
+        final baseY = (scaledH - height) / 2;
+        final exprX = GyroStabilizer.toCropExpr(plan.dx);
+        final exprY = GyroStabilizer.toCropExpr(plan.dy);
+        if (exprX != null && exprY != null) {
+          stabPrefix =
+              'scale=$scaledW:$scaledH,'
+              'crop=$width:$height:'
+              "'(${baseX.toStringAsFixed(1)}+$zoom*($exprX))':"
+              "'(${baseY.toStringAsFixed(1)}+$zoom*($exprY))',";
+          job.stabInfo =
+              '运动稳定 ×${zoom.toStringAsFixed(2)} · 位移≤'
+              '${plan.maxShiftX.toStringAsFixed(0)},'
+              '${plan.maxShiftY.toStringAsFixed(0)}px · '
+              '陀螺仪 ${stabGyro.length} 条';
+        }
+      }
+      if (stabPrefix.isEmpty) {
+        job.stabInfo = '陀螺仪数据不足(${stabGyro.length} 条),未应用运动稳定';
+      }
+      if (mounted) setState(() => _hint = job.stabInfo ?? '');
+    }
+
     // 2) 字幕 + 曲线参数
     final workDir = Directory('${docs.path}/work');
     if (!workDir.existsSync()) workDir.createSync(recursive: true);
@@ -1297,50 +1356,8 @@ class _CameraPageState extends State<CameraPage> {
       }
     }
 
-    // 2.5) 运动稳定(Gyroflow 式):四元数姿态积分 → 平滑虚拟相机路径
-    //      → 双轴补偿曲线 + **固定**裁切余量 → 按曲线移动裁切框。
-    //      余量恒定 ⇒ 画面不会随抖动幅度越放越大(修"大幅晃动卡在 3x")。
-    //      输出尺寸与原视频一致,因此字幕/曲线坐标无需改变。
-    String stabPrefix = ''; // 末尾带逗号,后面还要接 ass=
-    String stabInfo = '';
-    if (stabGyro.length >= 4 && stabEndEpoch > stabStartEpoch) {
-      job.stage = '分析陀螺仪数据…';
-      final plan = GyroStabilizer.analyze(
-        samples: stabGyro,
-        startEpoch: stabStartEpoch,
-        endEpoch: stabEndEpoch,
-        frameW: width.toDouble(),
-        frameH: height.toDouble(),
-        fovDeg: stabFov,
-        strength: stabStrength,
-      );
-      if (plan.usable) {
-        final zoom = plan.zoom;
-        final scaledW = ((width * zoom) / 2).floor() * 2;
-        final scaledH = ((height * zoom) / 2).floor() * 2;
-        final baseX = (scaledW - width) / 2;
-        final baseY = (scaledH - height) / 2;
-        final exprX = GyroStabilizer.toCropExpr(plan.dx);
-        final exprY = GyroStabilizer.toCropExpr(plan.dy);
-        if (exprX != null && exprY != null) {
-          stabPrefix =
-              'scale=$scaledW:$scaledH,'
-              'crop=$width:$height:'
-              "'(${baseX.toStringAsFixed(1)}+$zoom*($exprX))':"
-              "'(${baseY.toStringAsFixed(1)}+$zoom*($exprY))',";
-          stabInfo =
-              '运动稳定 ×${zoom.toStringAsFixed(2)} · 位移≤'
-              '${plan.maxShiftX.toStringAsFixed(0)},'
-              '${plan.maxShiftY.toStringAsFixed(0)}px';
-          if (mounted) setState(() => _hint = stabInfo);
-        }
-      }
-      if (stabPrefix.isEmpty && mounted) {
-        setState(() => _hint = '本段陀螺仪数据不足,未应用运动稳定');
-      }
-    }
-
     // 2.6) 本段开始时未连手环 → 不烧心率 UI,但**仍然**应用运动稳定
+    //      (stabPrefix 已在 1.5 步算好)
     if (!hadBle) {
       job
         ..stage = '保存视频…'
@@ -1646,6 +1663,14 @@ class _CameraPageState extends State<CameraPage> {
     _stabLast = DateTime.now();
     _gyroHzWin = DateTime.now();
     _gyroHzSamples = 0;
+    // 已经在稳定中:立刻把固定裁切放大就位,别等第一个样本
+    if (_stabRunning && mounted) {
+      setState(() {
+        _stabAutoZoom = GyroStabilizer.zoomForMargin(
+          GyroStabilizer.marginFor(_stabStrength),
+        );
+      });
+    }
     _gyroSub = gyroscopeEventStream(samplingPeriod: SensorInterval.gameInterval)
         .listen((e) {
           final now = DateTime.now();
@@ -1952,13 +1977,19 @@ class _CameraPageState extends State<CameraPage> {
                                   _onlineStab.reset();
                                   _stabOffsetX = 0;
                                   _stabOffsetY = 0;
-                                  _stabAutoZoom = 1.0;
+                                  // 立刻生效:裁切放大这一帧就位,不等第一个陀螺仪样本
+                                  // (否则会先空等几秒才看到画面被裁切)
+                                  _stabAutoZoom = GyroStabilizer.zoomForMargin(
+                                    GyroStabilizer.marginFor(_stabStrength),
+                                  );
                                   _stabCorrDeg = 0;
                                   _stabLog.clear();
                                   _stabLast = DateTime.now();
                                   _stabRunning = true;
                                 }
                               });
+                              // 确保陀螺仪订阅此刻就是活的,避免几秒空档
+                              if (_stabRunning) _startGyroSession();
                               setSheetState(() {});
                               if (_stabRunning) Navigator.pop(ctx);
                             },
