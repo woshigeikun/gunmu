@@ -905,7 +905,14 @@ class _CameraPageState extends State<CameraPage> {
 
   Future<void> _toggleRecord() async {
     final cam = _cam;
-    if (cam == null || !cam.value.isInitialized || _busy) return;
+    // 相机未就绪(如刚渲染完、恢复失败):先尝试恢复,不要静默无反应
+    if (cam == null || !cam.value.isInitialized) {
+      if (_busy) return;
+      if (mounted) setState(() => _hint = '相机未就绪,正在恢复…');
+      await _restoreCamera();
+      return;
+    }
+    if (_busy) return;
     // 在 await 之前取当前方向(避免跨 async 使用 context)
     final isPortraitNow =
         MediaQuery.of(context).orientation == Orientation.portrait;
@@ -1062,7 +1069,8 @@ class _CameraPageState extends State<CameraPage> {
     if (!mounted) return;
     await showDialog<void>(
       context: context,
-      barrierDismissible: false,
+      // 允许点弹窗外关闭,避免遮罩卡住导致整个界面点不动
+      barrierDismissible: true,
       builder: (ctx) => AlertDialog(
         backgroundColor: const Color(0xFF1C1C1E),
         title: const Text(
@@ -1129,6 +1137,14 @@ class _CameraPageState extends State<CameraPage> {
       ),
     );
     _renderDialogOpen = false;
+    // 若是用户点了弹窗外部关闭(渲染还没结束),自动转为后台渲染并恢复相机,
+    // 避免出现"界面像卡住、按钮点不动"的观感
+    if (!job.done && !_renderBackground) {
+      if (mounted) {
+        setState(() => _renderBackground = true);
+      }
+      _restoreCamera();
+    }
   }
 
   void _popRenderDialog() {
@@ -2208,10 +2224,11 @@ class _CameraPageState extends State<CameraPage> {
             Positioned.fill(
               child: GestureDetector(
                 // 运动稳定开启后:双指缩放画面(留出可移动余量)
-                onScaleStart: _stabilizeEnabled
+                // 注意:录像/处理中不接管手势,否则会抢走录像按钮的点击
+                onScaleStart: (_stabilizeEnabled && !_recording && !_busy)
                     ? (_) => _zoomAtGestureStart = _zoom
                     : null,
-                onScaleUpdate: _stabilizeEnabled
+                onScaleUpdate: (_stabilizeEnabled && !_recording && !_busy)
                     ? (d) async {
                         final camNow = _cam;
                         if (camNow == null) return;
@@ -2323,7 +2340,26 @@ class _CameraPageState extends State<CameraPage> {
               ),
             )
           else
-            const Center(child: CircularProgressIndicator()),
+            GestureDetector(
+              onTap: _restoreCamera,
+              child: const Center(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    SizedBox(
+                      width: 32,
+                      height: 32,
+                      child: CircularProgressIndicator(strokeWidth: 2.5),
+                    ),
+                    SizedBox(height: 12),
+                    Text(
+                      '相机未就绪,点击重试',
+                      style: TextStyle(color: Colors.white54, fontSize: 13),
+                    ),
+                  ],
+                ),
+              ),
+            ),
 
           // ── 顶部控制排 ──
           Positioned(
