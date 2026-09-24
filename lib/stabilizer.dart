@@ -44,11 +44,15 @@ class StabPlan {
   /// 纵向补偿曲线 [t秒, 原图像素]
   final List<List<double>> dy;
 
-  /// 自适应缩放(保证裁切框不出画面)
+  /// 固定裁切放大倍率(由余量决定,与抖动幅度无关)
   final double zoom;
 
+  /// 实际用到的最大位移(像素,诊断用)
   final double maxShiftX;
   final double maxShiftY;
+
+  /// 使用的裁切余量(比例)
+  final double margin;
 
   const StabPlan({
     required this.dx,
@@ -56,6 +60,7 @@ class StabPlan {
     required this.zoom,
     required this.maxShiftX,
     required this.maxShiftY,
+    required this.margin,
   });
 
   bool get usable => dx.length >= 2 && dy.length >= 2;
@@ -66,16 +71,34 @@ class StabPlan {
     zoom: 1,
     maxShiftX: 0,
     maxShiftY: 0,
+    margin: 0,
   );
 }
 
 /// 陀螺仪稳定核心。
-/// 算法思路参考 Gyroflow(四元数姿态积分 → 平滑虚拟相机路径 → 自适应缩放),
+/// 算法思路参考 Gyroflow(四元数姿态积分 → 平滑虚拟相机路径 → 裁切取景框),
 /// 但为手机端实时/导出场景用 Dart 重新实现,并省略镜头畸变与卷帘快门校正。
+///
+/// 与第一版的区别(修 "大幅晃动后卡在 3x / 渲染没效果"):
+///   * 裁切余量是**固定常量**,只由"稳定强度"决定;
+///   * 补偿位移被**硬限制**在余量以内,抖得再大也不会把画面越放越大;
+///   * 平滑窗更长(默认 1.2s),让持续晃动也进入补偿范围,补偿更"激烈"。
 class GyroStabilizer {
-  /// 由视场角估算焦距(像素)
-  static double focalPx(double frameW, double fovDeg) =>
-      (frameW / 2) / math.tan(fovDeg * math.pi / 180 / 2);
+  /// 由视场角估算焦距(像素)。
+  /// 关键:竖屏成片的宽高是**转置**过的,而焦距(像素)是转置不变量。
+  /// 视场角 fovDeg 描述的是原始横向捕获的长边,所以必须用长边反推,
+  /// 两个轴才能得到同一个正确的 f(否则补偿量会小 1.7 倍以上)。
+  static double focalPx(double frameW, double frameH, double fovDeg) =>
+      (math.max(frameW, frameH) / 2) /
+      math.tan(fovDeg * math.pi / 180 / 2);
+
+  /// 稳定强度 → 裁切余量(画面每边可移动的比例)
+  /// 柔和 0.6→4.2% / 标准 1.0→7% / 强 1.6→11.2%
+  static double marginFor(double strength) => (0.07 * strength).clamp(0.04, 0.12);
+
+  /// 余量 → 固定裁切放大倍率。余量恒定 ⇒ 画面永远不会越挪越放大。
+  static double zoomForMargin(double margin) =>
+      (1 / (1 - 2 * margin)).clamp(1.0, 1.4);
 
   /// 离线分析:用整段陀螺仪数据算出"平滑虚拟相机路径"的补偿曲线
   static StabPlan analyze({
@@ -85,11 +108,16 @@ class GyroStabilizer {
     required double frameW,
     required double frameH,
     double fovDeg = 66,
-    double smoothSec = 0.6,
+    double smoothSec = 1.2,
     double strength = 1.0,
-    double safety = 0.06,
     double curveStep = 0.2,
+    double? margin,
   }) {
+    final m = (margin ?? marginFor(strength)).clamp(0.02, 0.16);
+    final zoom = zoomForMargin(m);
+    final maxShiftXPx = m * frameW;
+    final maxShiftYPx = m * frameH;
+
     // 1) 积分姿态(取旋转向量的 x=pitch、y=yaw 作为相机指向)
     final ts = <double>[];
     final rawX = <double>[];
@@ -134,29 +162,24 @@ class GyroStabilizer {
       smY[i] = n > 0 ? sumY / n : rawY[i];
     }
 
-    // 3) 修正角 → 像素位移
-    final f = focalPx(frameW, fovDeg);
+    // 3) 修正角 → 像素位移,并硬限制在裁切余量内
+    final f = focalPx(frameW, frameH, fovDeg);
     final dxs = List<double>.filled(ts.length, 0);
     final dys = List<double>.filled(ts.length, 0);
     var maxX = 0.0, maxY = 0.0;
     for (var i = 0; i < ts.length; i++) {
-      final cx = ((rawX[i] - smX[i]) * strength).clamp(-0.6, 0.6);
-      final cy = ((rawY[i] - smY[i]) * strength).clamp(-0.6, 0.6);
+      final cx = ((rawX[i] - smX[i]) * strength).clamp(-1.0, 1.0);
+      final cy = ((rawY[i] - smY[i]) * strength).clamp(-1.0, 1.0);
       // X 增大 → 画面下移(纵向);横向取反以匹配镜面关系
-      final dyPx = f * math.tan(cx);
-      final dxPx = -f * math.tan(cy);
+      final dyPx = (f * math.tan(cx)).clamp(-maxShiftYPx, maxShiftYPx);
+      final dxPx = (-f * math.tan(cy)).clamp(-maxShiftXPx, maxShiftXPx);
       dys[i] = dyPx;
       dxs[i] = dxPx;
       maxX = math.max(maxX, dxPx.abs());
       maxY = math.max(maxY, dyPx.abs());
     }
 
-    // 4) 自适应缩放:裁切窗口始终留在画面内
-    final need = math.max(2 * maxX / frameW, 2 * maxY / frameH);
-    var zoom = need >= 0.98 ? 3.0 : 1 / (1 - need);
-    zoom = (zoom * (1 + safety)).clamp(1.0, 3.0);
-
-    // 5) 按固定间隔采样成曲线(供 FFmpeg 表达式使用)
+    // 4) 按固定间隔采样成曲线(供 FFmpeg 表达式使用)
     final dxCurve = <List<double>>[];
     final dyCurve = <List<double>>[];
     var nextT = 0.0;
@@ -179,11 +202,12 @@ class GyroStabilizer {
       zoom: zoom,
       maxShiftX: maxX,
       maxShiftY: maxY,
+      margin: m,
     );
   }
 
   /// 把曲线转成 FFmpeg crop 的位移表达式(节点数受限,避免表达式过深)
-  static String? toCropExpr(List<List<double>> curve, {int maxKnots = 34}) {
+  static String? toCropExpr(List<List<double>> curve, {int maxKnots = 60}) {
     if (curve.length < 2) return null;
     final step = (curve.length / maxKnots).ceil();
     final knots = <List<double>>[];
@@ -212,7 +236,6 @@ class GyroStabilizer {
 class OnlineStabilizer {
   Quat _q = Quat.identity;
   double _sx = 0, _sy = 0;
-  double _maxX = 0, _maxY = 0;
   double corrX = 0; // pitch 修正(弧度)
   double corrY = 0; // yaw 修正(弧度)
 
@@ -220,14 +243,12 @@ class OnlineStabilizer {
     _q = Quat.identity;
     _sx = 0;
     _sy = 0;
-    _maxX = 0;
-    _maxY = 0;
     corrX = 0;
     corrY = 0;
   }
 
   /// [dt] 秒;[gx]/[gy]/[gz] 为 rad/s;[tau] 为平滑时间常数(越大越稳、跟随越慢)
-  void update(double dt, double gx, double gy, double gz, {double tau = 0.6}) {
+  void update(double dt, double gx, double gy, double gz, {double tau = 0.9}) {
     if (dt <= 0 || dt > 0.2) return;
     _q = (_q * Quat.fromRotVec(gx * dt, gy * dt, gz * dt)).normalized;
     final rv = _q.toRotVec();
@@ -236,39 +257,27 @@ class OnlineStabilizer {
     _sy += (rv[1] - _sy) * a;
     corrX = rv[0] - _sx;
     corrY = rv[1] - _sy;
-    _maxX = math.max(_maxX * 0.9995, corrX.abs());
-    _maxY = math.max(_maxY * 0.9995, corrY.abs());
   }
 
-  /// 当前需要的自适应缩放(按已出现过的最大修正量估算)
-  double adaptiveZoom(
+  /// 角修正 → 像素位移,并按裁切余量硬限制(抖得再大也不会越界)
+  List<double> shifts(
     double frameW,
     double frameH,
     double fovDeg,
-    double strength, {
-    double safety = 0.06,
-  }) {
-    final f = GyroStabilizer.focalPx(frameW, fovDeg);
-    final needX =
-        2 *
-        f *
-        math.tan((_maxX * strength).clamp(-0.6, 0.6)) /
-        math.max(1.0, frameW);
-    final needY =
-        2 *
-        f *
-        math.tan((_maxY * strength).clamp(-0.6, 0.6)) /
-        math.max(1.0, frameH);
-    final need = math.max(needX, needY);
-    if (need >= 0.98) return 3.0;
-    return ((1 / (1 - need)) * (1 + safety)).clamp(1.0, 3.0);
-  }
-
-  /// 角修正 → 像素位移(与原图像素同尺度)
-  List<double> shifts(double frameW, double fovDeg, double strength) {
-    final f = GyroStabilizer.focalPx(frameW, fovDeg);
-    final dxPx = -f * math.tan((corrY * strength).clamp(-0.6, 0.6));
-    final dyPx = f * math.tan((corrX * strength).clamp(-0.6, 0.6));
+    double strength,
+    double margin,
+  ) {
+    final f = GyroStabilizer.focalPx(frameW, frameH, fovDeg);
+    final limX = margin * frameW;
+    final limY = margin * frameH;
+    final dyPx = (f * math.tan((corrX * strength).clamp(-1.0, 1.0))).clamp(
+      -limY,
+      limY,
+    );
+    final dxPx = (-f * math.tan((corrY * strength).clamp(-1.0, 1.0))).clamp(
+      -limX,
+      limX,
+    );
     return <double>[dxPx, dyPx];
   }
 }
