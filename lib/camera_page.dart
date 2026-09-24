@@ -174,6 +174,8 @@ class _CameraPageState extends State<CameraPage> {
   double _gyroHz = 0;
   DateTime _gyroHzWin = DateTime.now();
   int _gyroHzSamples = 0;
+  // 弹窗内实时数据显示用的轻量通知器(不依赖页面 setState)
+  final ValueNotifier<int> _stabTick = ValueNotifier<int>(0);
   double _recordStartEpochSec = 0; // 本段录像开始时刻(用于切分陀螺仪数据)
   double _minZoom = 1.0;
   double _maxZoom = 1.0;
@@ -1657,7 +1659,10 @@ class _CameraPageState extends State<CameraPage> {
             _stabStrength,
           );
 
-          if (mounted) setState(() {});
+          if (mounted) {
+            setState(() {});
+            _stabTick.value++;
+          }
         }, onError: (_) {});
   }
 
@@ -1673,6 +1678,8 @@ class _CameraPageState extends State<CameraPage> {
     await showModalBottomSheet<void>(
       context: context,
       backgroundColor: const Color(0xFF1C1C1E),
+      isScrollControlled: true,
+      useSafeArea: true,
       shape: const RoundedRectangleBorder(
         borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
       ),
@@ -1682,13 +1689,33 @@ class _CameraPageState extends State<CameraPage> {
               ? '1.0x'
               : '${_zoom.toStringAsFixed(1)}x';
           final hasWide = _minZoom < 0.999;
-          return SafeArea(
-            child: Padding(
-              padding: const EdgeInsets.fromLTRB(20, 16, 20, 24),
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
+          final bottomInset = MediaQuery.of(context2).padding.bottom;
+
+          // 录制中不允许改稳定:给明确提示,而不是点了没反应
+          void lockedHint() {
+            if (mounted) setState(() => _hint = '录制中无法调整运动稳定,请先停止录像');
+            ScaffoldMessenger.of(context2).showSnackBar(
+              const SnackBar(
+                content: Text('录制中无法调整运动稳定,请先停止录像'),
+                duration: Duration(seconds: 2),
+              ),
+            );
+          }
+
+          return ConstrainedBox(
+            constraints: BoxConstraints(
+              maxHeight: MediaQuery.of(context2).size.height * 0.88,
+            ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Flexible(
+                  child: SingleChildScrollView(
+                    padding: const EdgeInsets.fromLTRB(20, 16, 20, 4),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
                   const Text(
                     '运动稳定',
                     style: TextStyle(
@@ -1717,17 +1744,23 @@ class _CameraPageState extends State<CameraPage> {
                         fontSize: 12,
                       ),
                     ),
-                    onChanged: (v) async {
+                    onChanged: (v) {
+                      // 先同步更新 UI,再去做异步的变焦查询:避免开关看起来"点不动"
                       setState(() {
                         _stabilizeEnabled = v;
                         if (!v) {
                           _stabRunning = false;
                           _stabOffsetY = 0;
+                          _stabOffsetX = 0;
                         }
                       });
                       if (v) {
-                        await _loadZoomRange();
                         _startGyroSession();
+                        unawaited(
+                          _loadZoomRange().then((_) {
+                            if (mounted) setSheetState(() {});
+                          }),
+                        );
                       } else {
                         _stopGyroSession();
                       }
@@ -1831,58 +1864,15 @@ class _CameraPageState extends State<CameraPage> {
                           side: const BorderSide(color: Colors.white24),
                         ),
                         onPressed: () async {
+                          if (_recording) {
+                            lockedHint();
+                            return;
+                          }
                           await _switchToWidest();
                           setSheetState(() {});
                         },
                         icon: const Icon(Icons.zoom_out_map, size: 18),
                         label: Text('切到最广 ${_minZoom.toStringAsFixed(1)}x'),
-                      ),
-                    ),
-                    const SizedBox(height: 10),
-                    SizedBox(
-                      width: double.infinity,
-                      child: FilledButton.icon(
-                        style: FilledButton.styleFrom(
-                          backgroundColor: _stabRunning
-                              ? Colors.white24
-                              : Colors.redAccent,
-                        ),
-                        onPressed: () {
-                          setState(() {
-                            if (_stabRunning) {
-                              _stabRunning = false;
-                              _stabOffsetX = 0;
-                              _stabOffsetY = 0;
-                            } else {
-                              _onlineStab.reset();
-                              _stabOffsetX = 0;
-                              _stabOffsetY = 0;
-                              _stabAutoZoom = 1.0;
-                              _stabCorrDeg = 0;
-                              _stabLog.clear();
-                              _stabLast = DateTime.now();
-                              _stabRunning = true;
-                            }
-                          });
-                          setSheetState(() {});
-                          if (_stabRunning) Navigator.pop(ctx);
-                        },
-                        icon: Icon(
-                          _stabRunning ? Icons.stop : Icons.play_arrow,
-                        ),
-                        label: Text(_stabRunning ? '停止稳定' : '开始稳定'),
-                      ),
-                    ),
-                    const SizedBox(height: 8),
-                    Text(
-                      '陀螺仪:${_gyroCount == 0 ? "无数据(请检查权限)" : "${_gyroHz.toStringAsFixed(0)} Hz · gx=${_gxNow.toStringAsFixed(2)}"}'
-                      '\n角修正 ${_stabCorrDeg.toStringAsFixed(1)}° · 位移 '
-                      '${_stabOffsetX.toStringAsFixed(0)},${_stabOffsetY.toStringAsFixed(0)}px'
-                      ' · 自适应缩放 ${_stabAutoZoom.toStringAsFixed(2)}x'
-                      ' · 记录 ${_stabLog.length} 条',
-                      style: const TextStyle(
-                        color: Colors.white38,
-                        fontSize: 11,
                       ),
                     ),
                   ] else ...[
@@ -1892,8 +1882,78 @@ class _CameraPageState extends State<CameraPage> {
                       style: TextStyle(color: Colors.white38, fontSize: 11),
                     ),
                   ],
-                ],
-              ),
+                      ],
+                    ),
+                  ),
+                ),
+                // ── 固定底栏:开始/停止稳定始终可见、可点 ──
+                if (_stabilizeEnabled)
+                  Padding(
+                    padding: EdgeInsets.fromLTRB(20, 2, 20, 16 + bottomInset),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        SizedBox(
+                          width: double.infinity,
+                          height: 50,
+                          child: FilledButton.icon(
+                            style: FilledButton.styleFrom(
+                              backgroundColor: _stabRunning
+                                  ? Colors.white24
+                                  : Colors.redAccent,
+                            ),
+                            onPressed: () {
+                              if (_recording) {
+                                lockedHint();
+                                return;
+                              }
+                              setState(() {
+                                if (_stabRunning) {
+                                  _stabRunning = false;
+                                  _stabOffsetX = 0;
+                                  _stabOffsetY = 0;
+                                } else {
+                                  _onlineStab.reset();
+                                  _stabOffsetX = 0;
+                                  _stabOffsetY = 0;
+                                  _stabAutoZoom = 1.0;
+                                  _stabCorrDeg = 0;
+                                  _stabLog.clear();
+                                  _stabLast = DateTime.now();
+                                  _stabRunning = true;
+                                }
+                              });
+                              setSheetState(() {});
+                              if (_stabRunning) Navigator.pop(ctx);
+                            },
+                            icon: Icon(
+                              _stabRunning ? Icons.stop : Icons.play_arrow,
+                            ),
+                            label: Text(
+                              _stabRunning ? '停止稳定(并关闭设置)' : '开始稳定',
+                            ),
+                          ),
+                        ),
+                        const SizedBox(height: 6),
+                        ValueListenableBuilder<int>(
+                          valueListenable: _stabTick,
+                          builder: (context3, _, _) => Text(
+                            '陀螺仪:${_gyroCount == 0 ? "无数据(请检查权限)" : "${_gyroHz.toStringAsFixed(0)} Hz · gx=${_gxNow.toStringAsFixed(2)}"}'
+                            '\n角修正 ${_stabCorrDeg.toStringAsFixed(1)}° · 位移 '
+                            '${_stabOffsetX.toStringAsFixed(0)},${_stabOffsetY.toStringAsFixed(0)}px'
+                            ' · 自适应缩放 ${_stabAutoZoom.toStringAsFixed(2)}x'
+                            ' · 记录 ${_stabLog.length} 条',
+                            style: const TextStyle(
+                              color: Colors.white38,
+                              fontSize: 11,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+              ],
             ),
           );
         },
@@ -2674,9 +2734,8 @@ class _CameraPageState extends State<CameraPage> {
                   ),
                   child: IconButton(
                     tooltip: '运动稳定',
-                    onPressed: (_recording || _busy)
-                        ? null
-                        : _showStabilizeSheet,
+                    // 始终可点:录制/处理中的限制在弹窗内用提示表达,避免"点了没反应"
+                    onPressed: _showStabilizeSheet,
                     icon: Icon(
                       Icons.screen_rotation,
                       size: 22,
@@ -2817,6 +2876,7 @@ class _CameraPageState extends State<CameraPage> {
     _ticker?.cancel();
     _timer.stop();
     _stopGyroSession();
+    _stabTick.dispose();
     _cam?.dispose();
     super.dispose();
   }
