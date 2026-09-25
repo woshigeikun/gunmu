@@ -1286,11 +1286,14 @@ class _CameraPageState extends State<CameraPage> {
         final exprX = GyroStabilizer.toCropExpr(plan.dx);
         final exprY = GyroStabilizer.toCropExpr(plan.dy);
         if (exprX != null && exprY != null) {
+          // 注意符号:预览用 Transform.translate(+d) 平移画面,内容位移 = +d;
+          // 而这里是移动**裁切窗口**,窗口右移 ⇒ 内容在成片里左移,
+          // 所以成片的位移是 -d。两处必须相反,否则成片方向和预览是镜像的。
           stabPrefix =
               'scale=$scaledW:$scaledH,'
               'crop=$width:$height:'
-              "'(${baseX.toStringAsFixed(1)}+$zoom*($exprX))':"
-              "'(${baseY.toStringAsFixed(1)}+$zoom*($exprY))',";
+              "'(${baseX.toStringAsFixed(1)}-$zoom*($exprX))':"
+              "'(${baseY.toStringAsFixed(1)}-$zoom*($exprY))',";
           job.stabInfo =
               '运动稳定 ×${zoom.toStringAsFixed(2)} · 位移≤'
               '${plan.maxShiftX.toStringAsFixed(0)},'
