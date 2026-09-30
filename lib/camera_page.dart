@@ -1416,15 +1416,47 @@ class _CameraPageState extends State<CameraPage> {
     String stabPrefixExpr = ''; // 表达式方案(退路)
     String? cmdsPath; // 逐帧命令文件(临时,出片后删除)
 
-    // 1.4) 画面锁定:先跟踪出目标轨迹(必须在方向判定之后,因为抽帧要跟着转置)
+    // 1.45) 先算陀螺仪方案 —— 画面识别要拿它当"运动先验":
+    //       陀螺仪测的是相机真实转动,高频非常准,有了它,画面识别只需要在
+    //       很小的窗口里找目标,几乎不可能跳到附近相似的纹理上。
+    final bool hasGyro = stabGyro.length >= 4 && stabEndEpoch > stabStartEpoch;
+    StabPlan? plan;
+    if (hasGyro) {
+      job.stage = '分析陀螺仪数据…';
+      plan = GyroStabilizer.analyze(
+        samples: stabGyro,
+        startEpoch: stabStartEpoch,
+        endEpoch: stabEndEpoch,
+        frameW: width.toDouble(),
+        frameH: height.toDouble(),
+        fovDeg: stabFov,
+        strength: stabStrength,
+        curveStep: 1 / 60, // 60Hz 逐帧
+      );
+    }
+
+    // 1.4) 画面锁定:跟踪出目标轨迹(必须在方向判定之后,因为抽帧要跟着转置;
+    //      也必须在陀螺仪分析之后,因为要用它当先验)
     List<List<double>>? lockXY;
-    if (lockBox != null &&
-        stabGyro.length >= 4 &&
-        stabEndEpoch > stabStartEpoch) {
+    if (lockBox != null && plan != null && plan.usable) {
       job
         ..stage = '画面识别(目标锁定)…'
         ..progress = 0.02;
       try {
+        // 把陀螺仪曲线换算成"跟踪帧里的目标预测位置":
+        // 陀螺仪给的是"需要施加的画面位移 D",而画面本身在录制时移动了 -D,
+        // 所以目标在原始帧里的位置 = 初始位置 - D。
+        final priorX = <double>[];
+        final priorY = <double>[];
+        final k = kTrackWidth / width;
+        final gyroX = plan.dx.map((e) => <double>[e[0], e[1]]).toList();
+        final gyroY = plan.dy.map((e) => <double>[e[0], e[1]]).toList();
+        final nFrames = (durationSec * kTrackFps).round().clamp(2, 200000);
+        for (var f = 0; f < nFrames; f++) {
+          final t = f / kTrackFps;
+          priorX.add(-TargetTracker.interp(gyroX, t) * k);
+          priorY.add(-TargetTracker.interp(gyroY, t) * k);
+        }
         lockXY = await _trackTargetPath(
           rawPath: raw.path,
           vfPrefix: vfPrefix,
@@ -1434,6 +1466,8 @@ class _CameraPageState extends State<CameraPage> {
           workDir: workDir,
           stamp: stamp,
           job: job,
+          priorDx: priorX,
+          priorDy: priorY,
         );
       } catch (e) {
         lockXY = null;
@@ -1444,19 +1478,8 @@ class _CameraPageState extends State<CameraPage> {
       }
     }
 
-    if (stabGyro.length >= 4 && stabEndEpoch > stabStartEpoch) {
-      job.stage = '分析陀螺仪数据…';
-      final plan = GyroStabilizer.analyze(
-        samples: stabGyro,
-        startEpoch: stabStartEpoch,
-        endEpoch: stabEndEpoch,
-        frameW: width.toDouble(),
-        frameH: height.toDouble(),
-        fovDeg: stabFov,
-        strength: stabStrength,
-        curveStep: 1 / 60, // 60Hz 逐帧
-      );
-      if (plan.usable) {
+    if (plan != null && plan.usable) {
+      {
         final zoom = plan.zoom;
         final scaledW = ((width * zoom) / 2).floor() * 2;
         final scaledH = ((height * zoom) / 2).floor() * 2;
@@ -1776,6 +1799,8 @@ class _CameraPageState extends State<CameraPage> {
     required Directory workDir,
     required int stamp,
     required RenderJob job,
+    List<double>? priorDx,
+    List<double>? priorDy,
   }) async {
     final tw = kTrackWidth;
     var th = ((tw * outH) / outW / 2).round() * 2;
@@ -1821,6 +1846,8 @@ class _CameraPageState extends State<CameraPage> {
         boxW: bw,
         boxH: bh,
         fps: kTrackFps,
+        priorDx: priorDx,
+        priorDy: priorDy,
       );
       return pts
           .map((p) => <double>[p.t, p.cx, p.cy, p.mad, p.ok ? 1 : 0])
