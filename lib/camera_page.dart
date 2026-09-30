@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:isolate';
 import 'dart:math' as math;
+import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import 'package:camera/camera.dart';
@@ -205,6 +206,10 @@ class _CameraPageState extends State<CameraPage> {
   /// 预览里那幅图的映射参数 [显示宽, 显示高, 平移x, 平移y](由 LayoutBuilder 写入),
   /// 用于在"屏幕坐标 ⇄ 图像归一化坐标"之间换算锁定框。
   List<double> _imgMap = const [1, 1, 0, 0];
+
+  /// 自动识别出的候选目标(点一下即可锁定)
+  List<TargetCandidate> _candidates = const [];
+  bool _detecting = false;
 
   // ── 导出/渲染状态 ──
   RenderJob? _job; // 当前渲染任务(用于进度弹窗与后台进度条)
@@ -944,6 +949,163 @@ class _CameraPageState extends State<CameraPage> {
     );
   }
 
+  // ─────────────── 画面锁定:候选目标自动识别 ───────────────
+
+  /// 抓一帧预览画面并转成灰度 + 缩放,供候选目标识别使用。
+  /// 返回 (灰度数据, 宽, 高, 顺时针90°圈数)。
+  Future<(Uint8List, int, int, int)?> _grabGrayFrame() async {
+    final cam = _cam;
+    if (cam == null || !cam.value.isInitialized) return null;
+    // 朝向要在任何 await 之前读,避免跨异步使用 context
+    final portrait = MediaQuery.of(context).orientation == Orientation.portrait;
+    final c = Completer<CameraImage?>();
+    try {
+      await cam.startImageStream((f) {
+        if (!c.isCompleted) c.complete(f);
+      });
+      final img = await c.future.timeout(
+        const Duration(seconds: 4),
+        onTimeout: () => null,
+      );
+      try {
+        await cam.stopImageStream();
+      } catch (_) {}
+      if (img == null) return null;
+      // 朝向:竖屏且传感器画面是横向 → 需要顺时针转 90°,
+      // 与成片用的 transpose=1 保持一致。
+      final turns = (portrait && img.width > img.height) ? 1 : 0;
+      final g = _frameToGray(img, turns, 1024);
+      if (g == null) return null;
+      return (g.$1, g.$2, g.$3, turns);
+    } catch (_) {
+      try {
+        await cam.stopImageStream();
+      } catch (_) {}
+      return null;
+    }
+  }
+
+  /// 相机帧 → 灰度(带旋转与缩放)。BGRA 取 G 通道当灰度,YUV 取 Y 平面。
+  (Uint8List, int, int)? _frameToGray(CameraImage img, int q, int maxDim) {
+    final planes = img.planes;
+    if (planes.isEmpty) return null;
+    final sw = img.width, sh = img.height;
+    if (sw <= 0 || sh <= 0) return null;
+    final src = planes[0].bytes;
+    final rowStride = planes[0].bytesPerRow;
+    // 单平面 = BGRA(每像素 4 字节);多平面 = YUV420,平面 0 就是亮度
+    final bgra = planes.length == 1;
+    final pxStride = bgra ? 4 : 1;
+    final base = bgra ? 1 : 0;
+
+    final swap = q % 2 == 1;
+    final rw = swap ? sh : sw;
+    final rh = swap ? sw : sh;
+    final rot = Uint8List(rw * rh);
+    for (var y = 0; y < sh; y++) {
+      final rowOff = y * rowStride;
+      for (var x = 0; x < sw; x++) {
+        final v = src[rowOff + x * pxStride + base];
+        int rx, ry;
+        switch (q) {
+          case 1:
+            rx = sh - 1 - y;
+            ry = x;
+          case 2:
+            rx = sw - 1 - x;
+            ry = sh - 1 - y;
+          case 3:
+            rx = y;
+            ry = sw - 1 - x;
+          default:
+            rx = x;
+            ry = y;
+        }
+        rot[ry * rw + rx] = v;
+      }
+    }
+
+    final long = rw > rh ? rw : rh;
+    if (long <= maxDim) return (rot, rw, rh);
+    final scale = maxDim / long;
+    final fw = (rw * scale).round().clamp(8, rw);
+    final fh = (rh * scale).round().clamp(8, rh);
+    final out = Uint8List(fw * fh);
+    for (var y = 0; y < fh; y++) {
+      final srow = (y * rh ~/ fh) * rw;
+      final orow = y * fw;
+      for (var x = 0; x < fw; x++) {
+        out[orow + x] = rot[srow + (x * rw ~/ fw)];
+      }
+    }
+    return (out, fw, fh);
+  }
+
+  /// 识别候选目标:给用户几个可以直接点的框,找不到再手动画
+  Future<void> _detectCandidates() async {
+    if (_detecting || _recording || _busy) return;
+    if (!VisionTracker.isSupported) {
+      setState(() => _hint = '当前平台不支持自动识别,请在预览上拖拽手动画框');
+      return;
+    }
+    setState(() {
+      _detecting = true;
+      _candidates = const [];
+      _hint = '正在识别画面中的候选目标…';
+    });
+    try {
+      final f = await _grabGrayFrame();
+      if (f == null) {
+        if (mounted) {
+          setState(() {
+            _detecting = false;
+            _hint = '未能获取预览画面,请稍后重试或手动画框';
+          });
+        }
+        return;
+      }
+      final (bytes, w, h, turns) = f;
+      final list = await VisionTracker.detectTargets(
+        bytes: bytes,
+        w: w,
+        h: h,
+        rotationQuarterTurns: turns,
+      );
+      if (!mounted) return;
+      setState(() {
+        _detecting = false;
+        _candidates = list;
+        _hint = list.isEmpty
+            ? '没有找到明显的候选目标,请在预览上拖拽手动画框'
+            : '找到 ${list.length} 个候选目标:点一下即可锁定,也可以直接拖拽手动画框';
+      });
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _detecting = false;
+          _hint = '识别失败: $e';
+        });
+      }
+    }
+  }
+
+  /// 点击预览:命中候选框就锁定它,否则忽略(拖动仍然是手动画框)
+  bool _tryPickCandidate(Offset local) {
+    if (_candidates.isEmpty) return false;
+    final p = _screenToImage(local);
+    // 从后往前找,重叠时优先选分数低的那个(排在后面的通常框更大更粗)
+    for (final c in _candidates) {
+      if (c.box.contains(p)) {
+        setState(() {
+          _lockBox = c.box;
+          _hint = '已锁定「${c.label}」;开始稳定后导出时把它钉在画面正中';
+        });
+        return true;
+      }
+    }
+    return false;
+  }
+
   // ─────────────── 画面锁定:画框与坐标换算 ───────────────
 
   /// 屏幕坐标 → 预览图像归一化坐标(0~1)。图像在预览区里永远居中,
@@ -981,6 +1143,8 @@ class _CameraPageState extends State<CameraPage> {
       setState(() {});
       return;
     }
+    // 位移极小 = 这是一次点击:优先命中候选目标,命中就锁定它(不必手画)
+    if ((from - to).distance < 14 && _tryPickCandidate(to)) return;
     final a = _screenToImage(from);
     final b = _screenToImage(to);
     final l = math.min(a.dx, b.dx);
@@ -2396,13 +2560,17 @@ class _CameraPageState extends State<CameraPage> {
                               _lockEnabled = v;
                               if (!v) {
                                 _lockBox = null;
+                                _candidates = const [];
                                 _dragFrom = null;
                                 _dragTo = null;
-                              } else {
-                                _hint = '请在预览里单指拖拽,画框圈住要锁定的目标';
                               }
                             });
                             setSheetState(() {});
+                            if (v) {
+                              // 打开就先自动识别一次,让用户能直接点选候选
+                              Navigator.pop(ctx);
+                              _detectCandidates();
+                            }
                           },
                         ),
                         if (_lockEnabled)
@@ -2412,11 +2580,15 @@ class _CameraPageState extends State<CameraPage> {
                               children: [
                                 Expanded(
                                   child: Text(
-                                    _trackFrames > 0
-                                        ? '上次识别:$logTrack'
-                                        : (_lockBox == null
-                                              ? '尚未画框:单指在预览上拖出矩形'
-                                              : '目标框已就绪(双指仍可缩放)'),
+                                    _detecting
+                                        ? '正在识别候选目标…'
+                                        : (_trackFrames > 0
+                                              ? '上次识别:$logTrack'
+                                              : (_candidates.isNotEmpty
+                                                    ? '已识别 ${_candidates.length} 个候选:点预览里的青色框'
+                                                    : (_lockBox == null
+                                                          ? '点右侧「识别候选」自动找,或直接拖拽画框'
+                                                          : '目标框已就绪(双指仍可缩放)'))),
                                     style: const TextStyle(
                                       color: Colors.white38,
                                       fontSize: 11,
@@ -2434,6 +2606,18 @@ class _CameraPageState extends State<CameraPage> {
                                       style: TextStyle(fontSize: 12),
                                     ),
                                   ),
+                                TextButton(
+                                  onPressed: _detecting
+                                      ? null
+                                      : () {
+                                          Navigator.pop(ctx);
+                                          _detectCandidates();
+                                        },
+                                  child: const Text(
+                                    '识别候选',
+                                    style: TextStyle(fontSize: 12),
+                                  ),
+                                ),
                               ],
                             ),
                           ),
@@ -2949,8 +3133,11 @@ class _CameraPageState extends State<CameraPage> {
           if (cam != null && cam.value.isInitialized)
             Positioned.fill(
               child: GestureDetector(
-                // 单指拖拽 = 画锁定框(开启画面锁定时);
-                // 双指缩放 = 画面放大留出余量(开启运动稳定时)。
+                // 单击 = 选中候选目标(自动识别出来的青色框);
+                // 单指拖拽 = 手动画框;双指 = 缩放画面留出余量。
+                onTapUp: (!_recording && !_busy && _lockEnabled)
+                    ? (d) => _tryPickCandidate(d.localPosition)
+                    : null,
                 // 注意:录像/处理中不接管手势,否则会抢走录像按钮的点击
                 onScaleStart:
                     (!_recording &&
@@ -3119,15 +3306,19 @@ class _CameraPageState extends State<CameraPage> {
               ),
             ),
 
-          // ── 锁定框(画面识别目标)+ 画面正中十字 ──
+          // ── 锁定框(画面识别目标)+ 候选目标 + 画面正中十字 ──
           if (cam != null && cam.value.isInitialized && _lockEnabled)
             Positioned.fill(
               child: IgnorePointer(
                 child: Builder(
                   builder: (_) {
                     final r = _lockBoxScreen;
+                    final cands = <(Rect, String)>[];
+                    for (final c in _candidates) {
+                      cands.add((_imageRectToScreen(c.box), c.label));
+                    }
                     return CustomPaint(
-                      painter: _LockBoxPainter(r, _stabRunning),
+                      painter: _LockBoxPainter(r, _stabRunning, cands),
                       size: Size.infinite,
                     );
                   },
@@ -3601,7 +3792,10 @@ class _CameraPageState extends State<CameraPage> {
 class _LockBoxPainter extends CustomPainter {
   final Rect? rect;
   final bool running;
-  _LockBoxPainter(this.rect, this.running);
+
+  /// 候选目标(屏幕矩形 + 标签),点一下即可锁定
+  final List<(Rect, String)> candidates;
+  _LockBoxPainter(this.rect, this.running, [this.candidates = const []]);
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -3623,6 +3817,41 @@ class _LockBoxPainter extends CustomPainter {
       center + const Offset(0, arm),
       cross,
     );
+
+    // 候选目标:青色细框 + 序号角标
+    for (var i = 0; i < candidates.length; i++) {
+      final (r, label) = candidates[i];
+      canvas.drawRRect(
+        RRect.fromRectAndRadius(r, const Radius.circular(3)),
+        Paint()
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 2
+          ..color = const Color(0xFF4DD0E1),
+      );
+      final tag = '${i + 1} $label';
+      final tp = TextPainter(
+        text: TextSpan(
+          text: tag,
+          style: const TextStyle(
+            color: Colors.black,
+            fontSize: 11,
+            fontWeight: FontWeight.bold,
+          ),
+        ),
+        textDirection: TextDirection.ltr,
+      )..layout();
+      final bg = Rect.fromLTWH(
+        r.left,
+        (r.top - tp.height - 4).clamp(0.0, size.height),
+        tp.width + 8,
+        tp.height + 4,
+      );
+      canvas.drawRRect(
+        RRect.fromRectAndRadius(bg, const Radius.circular(3)),
+        Paint()..color = const Color(0xFF4DD0E1),
+      );
+      tp.paint(canvas, Offset(bg.left + 4, bg.top + 2));
+    }
 
     final r = rect;
     if (r == null) return;
@@ -3652,7 +3881,9 @@ class _LockBoxPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(covariant _LockBoxPainter old) =>
-      old.rect != rect || old.running != running;
+      old.rect != rect ||
+      old.running != running ||
+      old.candidates.length != candidates.length;
 }
 
 /// 心率曲线画笔:横轴为最近的心率历史,纵轴按数据范围自适应
