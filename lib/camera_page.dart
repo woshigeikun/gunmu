@@ -34,6 +34,8 @@ class RenderJob extends ChangeNotifier {
   bool _done = false;
   String? _error;
   String? _stabInfo; // 运动稳定实际参数(尽早填,弹窗立刻可见)
+  String? _encoderText; // 使用的视频编码器
+  double? _speedNow; // 实时渲染速度(倍速)
 
   double get progress => _progress;
   String get stage => _stage;
@@ -41,9 +43,21 @@ class RenderJob extends ChangeNotifier {
   bool get done => _done;
   String? get error => _error;
   String? get stabInfo => _stabInfo;
+  String? get encoderText => _encoderText;
+  double? get speedNow => _speedNow;
 
   set stabInfo(String? v) {
     _stabInfo = v;
+    notifyListeners();
+  }
+
+  set encoderText(String? v) {
+    _encoderText = v;
+    notifyListeners();
+  }
+
+  set speedNow(double? v) {
+    _speedNow = v;
     notifyListeners();
   }
 
@@ -1096,6 +1110,7 @@ class _CameraPageState extends State<CameraPage> {
                 ? '已完成'
                 : (job.etaSec != null && job.etaSec! > 0
                       ? '预计剩余约 ${_fmtDuration(job.etaSec!.round())}'
+                            '${job.speedNow == null ? '' : ' · ${job.speedNow!.toStringAsFixed(1)}x 速度'}'
                       : '正在估算剩余时间…');
             return Column(
               mainAxisSize: MainAxisSize.min,
@@ -1131,6 +1146,16 @@ class _CameraPageState extends State<CameraPage> {
                     job.stabInfo!,
                     style: const TextStyle(
                       color: Colors.redAccent,
+                      fontSize: 12,
+                    ),
+                  ),
+                ],
+                if (job.encoderText != null) ...[
+                  const SizedBox(height: 4),
+                  Text(
+                    job.encoderText!,
+                    style: const TextStyle(
+                      color: Colors.greenAccent,
                       fontSize: 12,
                     ),
                   ),
@@ -1290,7 +1315,7 @@ class _CameraPageState extends State<CameraPage> {
           // 而这里是移动**裁切窗口**,窗口右移 ⇒ 内容在成片里左移,
           // 所以成片的位移是 -d。两处必须相反,否则成片方向和预览是镜像的。
           stabPrefix =
-              'scale=$scaledW:$scaledH,'
+              'scale=$scaledW:$scaledH:flags=bilinear,'
               'crop=$width:$height:'
               "'(${baseX.toStringAsFixed(1)}-$zoom*($exprX))':"
               "'(${baseY.toStringAsFixed(1)}-$zoom*($exprY))',";
@@ -1306,6 +1331,14 @@ class _CameraPageState extends State<CameraPage> {
       }
       if (mounted) setState(() => _hint = job.stabInfo ?? '');
     }
+
+    // 1.6) 编码器选择(只探测一次):硬件编码比 libx264 快 5~10 倍,
+    //      这是渲染提速的关键。硬件不可用时退回 libx264 ultrafast。
+    final encHw = await _videoEncArgs(width, height);
+    final encSw = await _videoEncArgs(width, height, forceSw: true);
+    final useHw = encHw != encSw;
+    job.encoderText = useHw ? '硬件编码 $_hwName(快)' : '软件编码 libx264';
+    final threads = Platform.numberOfProcessors.clamp(2, 8);
 
     // 2) 字幕 + 曲线参数
     final workDir = Directory('${docs.path}/work');
@@ -1372,7 +1405,7 @@ class _CameraPageState extends State<CameraPage> {
         final tmpOut = '${workDir.path}/${stamp}_stab.mp4';
         final stabOk = await _runFfmpeg(
           '-y -i "${raw.path}" -vf "$vfPrefix$stabOnly" '
-          '-c:v libx264 -preset veryfast -crf 22 '
+          '${useHw ? encHw : encSw} '
           '-c:a aac -b:a 128k "$tmpOut"',
           durationSec,
           job,
@@ -1396,30 +1429,44 @@ class _CameraPageState extends State<CameraPage> {
       ..progress = 0.40;
     final outPath = '${workDir.path}/$stamp.mp4';
 
-    String buildCmd(String stab) {
+    // 提速要点:
+    //   * 全局多线程:scale/transpose/overlay 都支持切片并行,-filter_threads
+    //     让它们真正用满多核;
+    //   * 缩放用 bilinear(原来是 bicubic):1080p 逐帧上采样便宜一大截;
+    //   * 编码走硬件(见上面 1.6 步)。
+    String buildCmd(String stab, String enc) {
       if (seqDir != null) {
         // 输入0=原始视频(先旋转/稳定再烧字幕),输入1=曲线动画序列(1帧/秒)
-        return '-y -i "${raw.path}" -framerate 1 -i "$seqDir/curve_%04d.png" '
+        return '-y -filter_threads $threads -filter_complex_threads $threads '
+            '-i "${raw.path}" -framerate 1 -i "$seqDir/curve_%04d.png" '
             '-filter_complex '
             '"[0:v]$vfPrefix${stab}ass=$assPath[base];'
-            '[1:v]scale=$curW:$curH,format=rgba,fps=30[ov];'
+            '[1:v]format=rgba,fps=30[ov];'
             '[base][ov]overlay=x=$curX:y=$curY:eof_action=repeat[outv]" '
             '-map "[outv]" -map 0:a? '
-            '-c:v libx264 -preset veryfast -crf 22 '
-            '-c:a aac -b:a 128k "$outPath"';
+            '$enc -c:a aac -b:a 128k "$outPath"';
       }
-      return '-y -i "${raw.path}" -vf "$vfPrefix${stab}ass=$assPath" '
-          '-c:v libx264 -preset veryfast -crf 22 '
-          '-c:a aac -b:a 128k "$outPath"';
+      return '-y -filter_threads $threads '
+          '-i "${raw.path}" -vf "$vfPrefix${stab}ass=$assPath" '
+          '$enc -c:a aac -b:a 128k "$outPath"';
     }
 
-    var ok = await _runFfmpeg(buildCmd(stabPrefix), durationSec, job);
+    job.stage = '合成中…';
+    var ok = await _runFfmpeg(buildCmd(stabPrefix, encHw), durationSec, job);
+    if (!ok && useHw) {
+      // 硬件编码失败(个别机型/参数不支持)→ 退回软件编码重试
+      job
+        ..stage = '改用软件编码重试…'
+        ..progress = 0.40
+        ..encoderText = '软件编码 libx264(硬件编码不可用)';
+      ok = await _runFfmpeg(buildCmd(stabPrefix, encSw), durationSec, job);
+    }
     if (!ok && stabPrefix.isNotEmpty) {
       // 稳定滤镜失败时自动回退(至少保证出片)
       job
         ..stage = '稳定处理失败,改为普通合成…'
         ..progress = 0.40;
-      ok = await _runFfmpeg(buildCmd(''), durationSec, job);
+      ok = await _runFfmpeg(buildCmd('', encSw), durationSec, job);
       if (ok && mounted) {
         setState(() => _hint = '运动稳定未能应用,已导出普通视频');
       }
@@ -1442,6 +1489,56 @@ class _CameraPageState extends State<CameraPage> {
     job.progress = 1.0;
   }
 
+  // ─────────────── 编码器选择(渲染提速)───────────────
+
+  String? _hwEnc; // 缓存的硬件编码器名;'' 表示没有硬件编码器
+  String _hwName = '';
+
+  /// 探测本机 FFmpeg 是否带硬件 H.264 编码器(只做一次)。
+  /// iPhone 上是 VideoToolbox,安卓上是 MediaCodec —— 都由 SoC 的
+  /// 专用编码器完成,速度通常是 libx264 的 5~10 倍,而且更省电不发烫。
+  Future<String?> _pickHwEncoder() async {
+    final cached = _hwEnc;
+    if (cached != null) return cached.isEmpty ? null : cached;
+    var out = '';
+    try {
+      final s = await FFmpegKit.execute('-hide_banner -encoders');
+      out = await s.getOutput() ?? '';
+    } catch (_) {}
+    final cands = Platform.isIOS
+        ? <String>['h264_videotoolbox']
+        : <String>['h264_mediacodec', 'h264_videotoolbox'];
+    for (final c in cands) {
+      if (out.contains(c)) {
+        _hwEnc = c;
+        _hwName = c;
+        return c;
+      }
+    }
+    _hwEnc = '';
+    _hwName = '';
+    return null;
+  }
+
+  /// 视频编码参数。forceSw=true 时强制软件编码(作为硬件编码失败的回退)。
+  Future<String> _videoEncArgs(
+    int w,
+    int h, {
+    bool forceSw = false,
+  }) async {
+    // 码率按像素数给:1080p30 ≈ 7.5 Mbps,画质与原来 crf22 相当
+    final kbps = (w * h * 30 * 0.12 / 1000).round().clamp(4000, 20000);
+    if (!forceSw) {
+      final hw = await _pickHwEncoder();
+      if (hw != null) {
+        final extra = hw == 'h264_videotoolbox' ? ' -allow_sw 1' : '';
+        return '-c:v $hw -b:v ${kbps}k -maxrate ${kbps * 2}k '
+            '-bufsize ${kbps * 4}k$extra';
+      }
+    }
+    return '-c:v libx264 -preset ultrafast -crf 23 -threads 0';
+  }
+
   /// 执行 FFmpeg,并用 statistics 回调上报进度与速度(预计剩余时间)
   Future<bool> _runFfmpeg(String cmd, double durationSec, RenderJob job) async {
     final done = Completer<bool>();
@@ -1460,6 +1557,7 @@ class _CameraPageState extends State<CameraPage> {
         job.stage = '合成中 ${(p * 100).round()}%';
         final speed = stats.getSpeed();
         if (speed > 0) {
+          job.speedNow = speed;
           job.etaSec = ((durationSec * 1000 - tMs) / 1000) / speed;
         }
       },
