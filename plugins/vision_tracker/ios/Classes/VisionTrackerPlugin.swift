@@ -121,7 +121,9 @@ public class VisionTrackerPlugin: NSObject, FlutterPlugin {
       let y = 1.0 - bb.maxY
       let r = CGRect(x: x, y: y, width: bb.width, height: bb.height)
       let area = r.width * r.height
-      if area < 0.015 || area > 0.72 { continue }  // 太小没意义、太大等于全屏
+      // 太小没意义;太大(超过画面 45%)等于"整幅画面都是目标",
+      // 锁它没有任何意义,只会把真正想选的小目标挡住。
+      if area < 0.015 || area > 0.45 { continue }
       norm.append((r, sc, kind))
     }
     // 按分数降序,重叠的只留分高的
@@ -136,6 +138,10 @@ public class VisionTrackerPlugin: NSObject, FlutterPlugin {
       if !dup { kept.append(c) }
       if kept.count >= 6 { break }
     }
+
+    // 输出顺序:**面积从小到大**。
+    // 这样编号 1 永远是最精确的框,用户不必在几个套在一起的大框里猜哪个是哪个。
+    kept.sort { ($0.0.width * $0.0.height) < ($1.0.width * $1.0.height) }
 
     var out: [Double] = []
     for (r, sc, kind) in kept {
