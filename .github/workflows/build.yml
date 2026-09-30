@@ -2,6 +2,9 @@ name: build-ios
 on:
   workflow_dispatch:        # 仓库页面手动点 Run workflow 触发
 
+permissions:
+  contents: write           # 发布 Release 需要写权限
+
 jobs:
   build:
     runs-on: macos-15       # 最新 macOS 镜像,自带最新 Xcode(26)
@@ -30,10 +33,15 @@ jobs:
           mkdir -p Payload
           cp -r build/ios/iphoneos/*.app Payload/
           zip -r app.ipa Payload
-      # 产物只保留 2 天:私有仓库的 Actions 存储额度很小(免费仅 500MB),
-      # 不设保留期会被历史产物撑满。需要长期留存的产物请自行下载到本地。
-      - uses: actions/upload-artifact@v4
-        with:
-          name: app-ipa
-          path: app.ipa
-          retention-days: 2
+      # 不用 Actions 产物(upload-artifact):私有仓库只有 500MB 的 Actions 存储,
+      # 产物+日志很容易撑满,一撑满连编译成功的构建也会在"上传产物"这一步失败。
+      # 改为发布到 Release 附件:走仓库存储,不占 Actions 配额,也不会过期。
+      - name: 发布 ipa 到 Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view latest-ios >/dev/null 2>&1 \
+            || gh release create latest-ios \
+                 --title "iOS 最新构建" \
+                 --notes "由 GitHub Actions 自动构建;每次构建覆盖同名附件。"
+          gh release upload latest-ios app.ipa --clobber
