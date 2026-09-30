@@ -43,6 +43,10 @@ dependencies:
   share_plus:
   video_player:
   sensors_plus:
+  # 本地插件:用 iOS Vision 框架做目标跟踪(CocoaPods 会自动编译其 Swift 源码,
+  # 不需要手改 Xcode 工程文件)
+  vision_tracker:
+    path: plugins/vision_tracker
 
 dev_dependencies:
   flutter_test:
