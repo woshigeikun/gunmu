@@ -11,7 +11,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: subosito/flutter-action@v2
-        with: { channel: stable }
+        with:
+          channel: stable
+          cache: true          # 缓存 Flutter SDK 与 pub 缓存,缩短构建时间
 
       # Java 17(Flutter 3.47 需要)
       - uses: actions/setup-java@v4
@@ -21,8 +23,9 @@ jobs:
 
       - run: flutter pub get
 
-      # 按 CPU 架构分包,避免单个 APK 过大(内含 FFmpeg 原生库)
-      - run: flutter build apk --release --split-per-abi
+      # 只出 arm64:现代手机都是 arm64。v7a(老机型)与 x86_64(模拟器)
+      # 合计约 160MB,既拖慢 Gradle 构建又占满 Release 存储,需要时再单独构建。
+      - run: flutter build apk --release --split-per-abi --target-platform android-arm64
 
       # 同 iOS:不用 Actions 产物(会占满 500MB Actions 存储导致上传失败),
       # 改为发布到 Release 附件,同名覆盖,不占 Actions 配额。
@@ -34,4 +37,4 @@ jobs:
             || gh release create latest-android \
                  --title "Android 最新构建" \
                  --notes "由 GitHub Actions 自动构建;每次构建覆盖同名附件。"
-          gh release upload latest-android build/app/outputs/flutter-apk/*.apk --clobber
+          gh release upload latest-android build/app/outputs/flutter-apk/app-arm64-v8a-release.apk --clobber
