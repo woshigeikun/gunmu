@@ -27,6 +27,9 @@ class _HrSample {
 }
 
 /// 导出(渲染)任务进度
+/// 构建标记:用来在手机上确认装的到底是哪一版(显示在导出进度窗底部)
+const String kBuildTag = 'v38-speedup';
+
 class RenderJob extends ChangeNotifier {
   double _progress = 0;
   String _stage = '准备中…';
@@ -1069,7 +1072,15 @@ class _CameraPageState extends State<CameraPage> {
         ..done = true;
       await _loadExports();
       if (mounted) {
-        setState(() => _hint = '导出完成,可点顶部文件夹按钮查看并保存');
+        // 把编码器与实际速度留在常驻提示里:进度窗关掉后也还能看到
+        final sp = job.speedNow;
+        final hw = (job.encoderText ?? '').contains('软件') ? '软件编码' : '硬件编码';
+        setState(
+          () => _hint =
+              '导出完成 · $hw'
+              '${sp == null ? '' : ' · ${sp.toStringAsFixed(1)}x'}'
+              ' · 点顶部文件夹查看',
+        );
       }
     } catch (e) {
       job
@@ -1160,6 +1171,11 @@ class _CameraPageState extends State<CameraPage> {
                     ),
                   ),
                 ],
+                const SizedBox(height: 8),
+                Text(
+                  '构建 $kBuildTag',
+                  style: const TextStyle(color: Colors.white24, fontSize: 10),
+                ),
               ],
             );
           },
@@ -1332,12 +1348,12 @@ class _CameraPageState extends State<CameraPage> {
       if (mounted) setState(() => _hint = job.stabInfo ?? '');
     }
 
-    // 1.6) 编码器选择(只探测一次):硬件编码比 libx264 快 5~10 倍,
-    //      这是渲染提速的关键。硬件不可用时退回 libx264 ultrafast。
-    final encHw = await _videoEncArgs(width, height);
-    final encSw = await _videoEncArgs(width, height, forceSw: true);
-    final useHw = encHw != encSw;
-    job.encoderText = useHw ? '硬件编码 $_hwName(快)' : '软件编码 libx264';
+    // 1.6) 编码器:直接上硬件编码(iPhone=VideoToolbox / 安卓=MediaCodec),
+    //      通常比 libx264 快 5~10 倍;不支持时下面会自动回退软件编码。
+    //      这一行是同步赋值的,所以进度窗一出现就能看到,不用等任何探测。
+    final encHw = _videoEncArgs(width, height);
+    final encSw = _videoEncArgs(width, height, forceSw: true);
+    job.encoderText = '编码器 $_hwEncoderName(硬件加速)';
     final threads = Platform.numberOfProcessors.clamp(2, 8);
 
     // 2) 字幕 + 曲线参数
@@ -1403,13 +1419,16 @@ class _CameraPageState extends State<CameraPage> {
       } else {
         final stabOnly = stabPrefix.substring(0, stabPrefix.length - 1);
         final tmpOut = '${workDir.path}/${stamp}_stab.mp4';
-        final stabOk = await _runFfmpeg(
-          '-y -i "${raw.path}" -vf "$vfPrefix$stabOnly" '
-          '${useHw ? encHw : encSw} '
-          '-c:a aac -b:a 128k "$tmpOut"',
-          durationSec,
-          job,
-        );
+        String stabCmd(String enc) =>
+            '-y -i "${raw.path}" -vf "$vfPrefix$stabOnly" '
+            '$enc -c:a aac -b:a 128k "$tmpOut"';
+        var stabOk = await _runFfmpeg(stabCmd(encHw), durationSec, job);
+        if (!stabOk) {
+          job
+            ..stage = '改用软件编码重试…'
+            ..encoderText = '软件编码 libx264(硬件编码不可用)';
+          stabOk = await _runFfmpeg(stabCmd(encSw), durationSec, job);
+        }
         if (!stabOk) throw Exception('FFmpeg 稳定处理失败');
         await File(tmpOut).copy(saved);
         try {
@@ -1453,8 +1472,8 @@ class _CameraPageState extends State<CameraPage> {
 
     job.stage = '合成中…';
     var ok = await _runFfmpeg(buildCmd(stabPrefix, encHw), durationSec, job);
-    if (!ok && useHw) {
-      // 硬件编码失败(个别机型/参数不支持)→ 退回软件编码重试
+    if (!ok) {
+      // 硬件编码失败(该 ffmpeg 包未编入硬件编码器等)→ 退回软件编码重试
       job
         ..stage = '改用软件编码重试…'
         ..progress = 0.40
@@ -1491,50 +1510,24 @@ class _CameraPageState extends State<CameraPage> {
 
   // ─────────────── 编码器选择(渲染提速)───────────────
 
-  String? _hwEnc; // 缓存的硬件编码器名;'' 表示没有硬件编码器
-  String _hwName = '';
+  /// 本平台该用的硬件 H.264 编码器名
+  static String get _hwEncoderName =>
+      Platform.isIOS ? 'h264_videotoolbox' : 'h264_mediacodec';
 
-  /// 探测本机 FFmpeg 是否带硬件 H.264 编码器(只做一次)。
-  /// iPhone 上是 VideoToolbox,安卓上是 MediaCodec —— 都由 SoC 的
-  /// 专用编码器完成,速度通常是 libx264 的 5~10 倍,而且更省电不发烫。
-  Future<String?> _pickHwEncoder() async {
-    final cached = _hwEnc;
-    if (cached != null) return cached.isEmpty ? null : cached;
-    var out = '';
-    try {
-      final s = await FFmpegKit.execute('-hide_banner -encoders');
-      out = await s.getOutput() ?? '';
-    } catch (_) {}
-    final cands = Platform.isIOS
-        ? <String>['h264_videotoolbox']
-        : <String>['h264_mediacodec', 'h264_videotoolbox'];
-    for (final c in cands) {
-      if (out.contains(c)) {
-        _hwEnc = c;
-        _hwName = c;
-        return c;
-      }
-    }
-    _hwEnc = '';
-    _hwName = '';
-    return null;
-  }
-
-  /// 视频编码参数。forceSw=true 时强制软件编码(作为硬件编码失败的回退)。
-  Future<String> _videoEncArgs(
-    int w,
-    int h, {
-    bool forceSw = false,
-  }) async {
+  /// 视频编码参数。
+  /// 默认用硬件编码器(iPhone 的 VideoToolbox / 安卓的 MediaCodec,由 SoC 里
+  /// 的专用编码单元完成,通常比 libx264 快 5~10 倍);不支持时由调用处
+  /// 自动回退到 forceSw 的软件编码。
+  /// 注:不再预先用 `ffmpeg -encoders` 探测 —— 那要先跑一个 ffmpeg 进程,
+  /// 会让界面上的编码器提示晚好几秒才出现,而且探测本身也可能失败。
+  String _videoEncArgs(int w, int h, {bool forceSw = false}) {
     // 码率按像素数给:1080p30 ≈ 7.5 Mbps,画质与原来 crf22 相当
     final kbps = (w * h * 30 * 0.12 / 1000).round().clamp(4000, 20000);
     if (!forceSw) {
-      final hw = await _pickHwEncoder();
-      if (hw != null) {
-        final extra = hw == 'h264_videotoolbox' ? ' -allow_sw 1' : '';
-        return '-c:v $hw -b:v ${kbps}k -maxrate ${kbps * 2}k '
-            '-bufsize ${kbps * 4}k$extra';
-      }
+      final hw = _hwEncoderName;
+      final extra = hw == 'h264_videotoolbox' ? ' -allow_sw 1' : '';
+      return '-c:v $hw -b:v ${kbps}k -maxrate ${kbps * 2}k '
+          '-bufsize ${kbps * 4}k$extra';
     }
     return '-c:v libx264 -preset ultrafast -crf 23 -threads 0';
   }
