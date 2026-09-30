@@ -21,7 +21,9 @@ jobs:
       # 按 CPU 架构分包,避免单个 APK 过大(内含 FFmpeg 原生库)
       - run: flutter build apk --release --split-per-abi
 
+      # 产物只保留 2 天:Android 三个 APK 合计约 220MB,是容量占用的大头。
       - uses: actions/upload-artifact@v4
         with:
           name: app-apk
           path: build/app/outputs/flutter-apk/*.apk
+          retention-days: 2
