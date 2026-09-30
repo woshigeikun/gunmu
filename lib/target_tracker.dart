@@ -32,7 +32,9 @@ class TrackPoint {
 class TargetTracker {
   /// 距离惩罚系数:匹配残差(MAD,0~255 尺度)每偏离预测位置 1 像素加多少分。
   /// 调大 = 更保守(更相信运动连续性),调小 = 更相信灰度相似度。
-  static const double _distPenalty = 1.6;
+  /// 取 4.0 是偏保守的一侧:遇到重复纹理(条纹、格子、文字行)时,
+  /// 宁可少跟一点,也不要跳到隔壁那一片一模一样的纹理上。
+  static const double _distPenalty = 4.0;
 
   /// 在灰度帧序列里跟踪第一帧给定的目标框。
   ///
@@ -50,6 +52,8 @@ class TargetTracker {
     required int boxH,
     double fps = 10,
     int search = 14,
+    List<double>? priorDx,
+    List<double>? priorDy,
   }) {
     final out = <TrackPoint>[];
     if (w <= 0 || h <= 0 || frames <= 0) return out;
@@ -88,24 +92,53 @@ class TargetTracker {
     // 初始位置 = 用户框的位置
     var cx = bx + boxW / 2.0;
     var cy = by + boxH / 2.0;
+    final boxCx0 = cx, boxCy0 = cy;
     var lastX = cx, lastY = cy;
     var velX = 0.0, velY = 0.0;
+    // 视觉测得的偏差累积量(见下面的"绝对预测 + 累积修正")
+    var accX = 0.0, accY = 0.0;
 
     for (var f = 0; f < frames; f++) {
       final base = f * frameBytes;
       if (base + frameBytes > gray.length) break;
 
-      // 运动预测:用上一帧的速度外推。纯 SAD 只找"最像"的位置,遇到背景里
-      // 相似纹理就会跳过去;有了预测点,再叠一个"离预测越远扣分越多"的惩罚,
-      // 才能在杂乱背景里稳稳跟住目标。
-      final predX = lastX + velX;
-      final predY = lastY + velY;
+      // 运动预测:
+      //   * 有陀螺仪先验时(推荐):预测 = 初始位置 + 陀螺仪算出的累计位移 + 累积修正。
+      //     为什么用"绝对预测"而不是"上一帧 + 帧间增量":增量会把跟踪器自己的
+      //     误差一路带下去,一旦真值跑出小窗口就再也回不来(实测会累积到十几像素)。
+      //     绝对预测每帧都重新对齐陀螺仪基准,不会累积误差。
+      //   * 累积修正:把视觉测到的偏差以一半的权重慢慢并入预测,这样陀螺仪的
+      //     低频漂移能被视觉纠正,而视觉的测量噪声又不会被放大。
+      //   * 没有先验时:退回"上一帧速度外推"。
+      // 纯 SAD 只找"最像"的位置,遇到重复纹理(条纹、格子、马赛克)就会跳走,
+      // 预测点 + 距离惩罚正是为了压住这种情况。
+      final bool usePri =
+          priorDx != null &&
+          priorDy != null &&
+          f < priorDx.length &&
+          f < priorDy.length;
+      final double predX0;
+      final double predY0;
+      if (usePri) {
+        predX0 = boxCx0 + priorDx[f] + accX;
+        predY0 = boxCy0 + priorDy[f] + accY;
+      } else {
+        predX0 = lastX + velX;
+        predY0 = lastY + velY;
+      }
+      // 有先验时收紧搜索半径:陀螺仪已经把相机运动解释掉了,剩下要搜的
+      // 只是"目标自身的位移 + 先验误差"。窗口小,重复纹理就不可能抢走匹配。
+      final effSearch = usePri
+          ? math.min(search, math.max(3, search ~/ 4))
+          : search;
+      final predX = predX0;
+      final predY = predY0;
       final wantX = (predX - boxW / 2.0).round();
       final wantY = (predY - boxH / 2.0).round();
-      final sx0 = (wantX - search).clamp(0, maxX);
-      final sx1 = (wantX + search).clamp(0, maxX);
-      final sy0 = (wantY - search).clamp(0, maxY);
-      final sy1 = (wantY + search).clamp(0, maxY);
+      final sx0 = (wantX - effSearch).clamp(0, maxX);
+      final sx1 = (wantX + effSearch).clamp(0, maxX);
+      final sy0 = (wantY - effSearch).clamp(0, maxY);
+      final sy1 = (wantY + effSearch).clamp(0, maxY);
 
       var bestScore = double.infinity;
       var bestSad = 0;
@@ -148,6 +181,16 @@ class TargetTracker {
 
       cx = bestX + subX + boxW / 2.0;
       cy = bestY + subY + boxH / 2.0;
+      if (usePri) {
+        // 把"实测位置与预测位置的差"以一半权重并入累积修正:
+        // 陀螺仪的缓慢漂移能被纠正,而单帧的测量噪声不会直接进入预测
+        accX += (cx - predX0) * 0.5;
+        accY += (cy - predY0) * 0.5;
+        // 累积修正本身也要限幅,避免被一次误匹配带偏
+        final cap = search * 4.0;
+        accX = accX.clamp(-cap, cap);
+        accY = accY.clamp(-cap, cap);
+      }
       // 速度用带阻尼的更新,避免一次误匹配把预测甩飞
       velX = velX * 0.5 + (cx - lastX) * 0.5;
       velY = velY * 0.5 + (cy - lastY) * 0.5;
