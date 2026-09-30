@@ -20,10 +20,146 @@ public class VisionTrackerPlugin: NSObject, FlutterPlugin {
   }
 
   public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
-    guard call.method == "trackGray" else {
+    switch call.method {
+    case "trackGray":
+      handleTrack(call, result: result)
+    case "detectTargets":
+      handleDetect(call, result: result)
+    default:
       result(FlutterMethodNotImplemented)
+    }
+  }
+
+  // ─────────────── 候选目标检测 ───────────────
+
+  private func handleDetect(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+    guard let args = call.arguments as? [String: Any],
+      let w = args["w"] as? Int,
+      let h = args["h"] as? Int,
+      let rot = args["rotation"] as? Int,
+      let typed = args["bytes"] as? FlutterStandardTypedData
+    else {
+      result(FlutterError(code: "bad_args", message: "缺少参数", details: nil))
       return
     }
+    DispatchQueue.global(qos: .userInitiated).async {
+      let out = self.detect(bytes: typed.data, w: w, h: h, rotation: rot)
+      DispatchQueue.main.async { result(out) }
+    }
+  }
+
+  /// 旋转圈数 → Vision 图像方向(1 = 顺时针 90°,与转置录制一致)
+  private func cgOrientation(_ q: Int) -> CGImagePropertyOrientation {
+    switch ((q % 4) + 4) % 4 {
+    case 1: return .right
+    case 2: return .down
+    case 3: return .left
+    default: return .up
+    }
+  }
+
+  /// 在单帧灰度图上找"值得锁定的候选目标"。
+  /// 用了三种系统检测器,因为它们各自擅长不同目标:
+  ///   * VNRecognizeTextRequest —— 文字/数字(用户说的"画框的数字"就是这类)
+  ///   * VNGenerateAttentionBasedSaliencyImageRequest —— 人眼会注意到的醒目区域
+  ///   * VNDetectRectanglesRequest —— 屏幕/牌子/纸面等矩形物体
+  /// 返回扁平数组,每个候选 6 个值:[x, y, w, h, score, kind](归一化、左上原点)。
+  /// kind: 0=文字 1=醒目区域 2=矩形
+  private func detect(bytes: Data, w: Int, h: Int, rotation: Int) -> [Double] {
+    guard w > 8, h > 8, bytes.count >= w * h,
+      let provider = CGDataProvider(data: bytes as CFData),
+      let img = CGImage(
+        width: w, height: h, bitsPerComponent: 8, bitsPerPixel: 8, bytesPerRow: w,
+        space: CGColorSpaceCreateDeviceGray(),
+        bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue),
+        provider: provider, decode: nil, shouldInterpolate: false,
+        intent: .defaultIntent)
+    else { return [] }
+
+    // 关键:把旋转交给 Vision(orientation),返回的坐标就自动落在"旋转后"的画面里,
+    // 和 App 显示的竖屏预览一致,不需要 Dart 侧再换算。
+    let handler = VNImageRequestHandler(
+      cgImage: img, orientation: cgOrientation(rotation), options: [:])
+
+    let textReq = VNRecognizeTextRequest()
+    textReq.recognitionLevel = .fast
+    textReq.usesLanguageCorrection = false
+
+    let salReq = VNGenerateAttentionBasedSaliencyImageRequest()
+
+    let rectReq = VNDetectRectanglesRequest()
+    rectReq.maximumObservations = 8
+    rectReq.minimumConfidence = 0.55
+    rectReq.minimumAspectRatio = 0.2
+
+    do {
+      try handler.perform([textReq, salReq, rectReq])
+    } catch {
+      return []
+    }
+
+    var cands: [(CGRect, Double, Int)] = []
+
+    for o in textReq.results ?? [] {
+      cands.append((o.boundingBox, Double(o.confidence), 0))
+    }
+    if let sal = salReq.results?.first as? VNSaliencyImageObservation,
+      let objs = sal.salientObjects
+    {
+      for o in objs {
+        cands.append((o.boundingBox, Double(o.confidence) * 0.95, 1))
+      }
+    }
+    for o in rectReq.results ?? [] {
+      cands.append((o.boundingBox, Double(o.confidence) * 0.85, 2))
+    }
+
+    // Vision 归一化坐标是"原点左下" → 换成"原点左上"
+    var norm: [(CGRect, Double, Int)] = []
+    for (bb, sc, kind) in cands {
+      let x = bb.minX
+      let y = 1.0 - bb.maxY
+      let r = CGRect(x: x, y: y, width: bb.width, height: bb.height)
+      let area = r.width * r.height
+      if area < 0.015 || area > 0.72 { continue }  // 太小没意义、太大等于全屏
+      norm.append((r, sc, kind))
+    }
+    // 按分数降序,重叠的只留分高的
+    norm.sort { $0.1 > $1.1 }
+    var kept: [(CGRect, Double, Int)] = []
+    for c in norm {
+      var dup = false
+      for k in kept where iou(k.0, c.0) > 0.4 {
+        dup = true
+        break
+      }
+      if !dup { kept.append(c) }
+      if kept.count >= 6 { break }
+    }
+
+    var out: [Double] = []
+    for (r, sc, kind) in kept {
+      out.append(Double(r.minX))
+      out.append(Double(r.minY))
+      out.append(Double(r.width))
+      out.append(Double(r.height))
+      out.append(sc)
+      out.append(Double(kind))
+    }
+    return out
+  }
+
+  private func iou(_ a: CGRect, _ b: CGRect) -> Double {
+    let inter = a.intersection(b)
+    if inter.isNull { return 0 }
+    let ia = Double(inter.width * inter.height)
+    let ua = Double(a.width * a.height + b.width * b.height) - ia
+    return ua <= 0 ? 0 : ia / ua
+  }
+
+  // ─────────────── 逐帧跟踪 ───────────────
+
+  private func handleTrack(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
     guard let args = call.arguments as? [String: Any],
       let path = args["path"] as? String,
       let w = args["w"] as? Int,
