@@ -30,5 +30,10 @@ jobs:
           mkdir -p Payload
           cp -r build/ios/iphoneos/*.app Payload/
           zip -r app.ipa Payload
+      # 产物只保留 2 天:私有仓库的 Actions 存储额度很小(免费仅 500MB),
+      # 不设保留期会被历史产物撑满。需要长期留存的产物请自行下载到本地。
       - uses: actions/upload-artifact@v4
-        with: { name: app-ipa, path: app.ipa }
+        with:
+          name: app-ipa
+          path: app.ipa
+          retention-days: 2
