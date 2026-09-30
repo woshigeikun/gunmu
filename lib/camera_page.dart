@@ -1093,17 +1093,26 @@ class _CameraPageState extends State<CameraPage> {
   bool _tryPickCandidate(Offset local) {
     if (_candidates.isEmpty) return false;
     final p = _screenToImage(local);
-    // 从后往前找,重叠时优先选分数低的那个(排在后面的通常框更大更粗)
+    // 命中多个时**取面积最小的那个**:
+    // "醒目区域"常常输出一个几乎覆盖整幅画面的大框,它会包含屏幕上的每一个点。
+    // 如果按顺序取第一个命中的,用户就永远只能选中那个大框,永远点不到想选的小框。
+    TargetCandidate? best;
+    var bestArea = double.infinity;
     for (final c in _candidates) {
-      if (c.box.contains(p)) {
-        setState(() {
-          _lockBox = c.box;
-          _hint = '已锁定「${c.label}」;开始稳定后导出时把它钉在画面正中';
-        });
-        return true;
+      if (!c.box.contains(p)) continue;
+      final a = c.box.width * c.box.height;
+      if (a < bestArea) {
+        bestArea = a;
+        best = c;
       }
     }
-    return false;
+    if (best == null) return false;
+    final picked = best;
+    setState(() {
+      _lockBox = picked.box;
+      _hint = '已锁定「${picked.label}」;开始稳定后导出时把它钉在画面正中';
+    });
+    return true;
   }
 
   // ─────────────── 画面锁定:画框与坐标换算 ───────────────
