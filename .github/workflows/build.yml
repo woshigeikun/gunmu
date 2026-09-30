@@ -11,7 +11,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: subosito/flutter-action@v2
-        with: { channel: stable }
+        with:
+          channel: stable
+          cache: true        # 缓存 Flutter SDK 与 pub 缓存,缩短构建时间
 
       # camera_avfoundation 0.10.x 使用新版 AVCaptureSession 静态成员(如
       # .wasInterruptedNotification),必须用最新 Xcode 编译(见 flutter issue 185031)。
