@@ -16,13 +16,20 @@ import 'package:sensors_plus/sensors_plus.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:video_player/video_player.dart';
 
+import 'package:vision_tracker/vision_tracker.dart';
+
 import 'ble_heart_rate.dart';
 import 'gyro_test_page.dart';
 import 'stabilizer.dart';
 import 'target_tracker.dart';
 
-/// 画面锁定的跟踪帧宽度(越小越快,越小也越难跟准)
-const int kTrackWidth = 128;
+/// 画面锁定的跟踪帧宽度。
+/// iOS 走系统 Vision(算力不在 Dart 侧),可以用更大分辨率换精度;
+/// 其他平台退回 Dart 的 SAD 块匹配,小一点才跑得动。
+const int kTrackWidthVision = 256;
+const int kTrackWidthSad = 128;
+int get kTrackWidth =>
+    VisionTracker.isSupported ? kTrackWidthVision : kTrackWidthSad;
 
 /// 跟踪抽帧帧率
 const double kTrackFps = 10;
@@ -1761,7 +1768,11 @@ class _CameraPageState extends State<CameraPage> {
       Platform.isIOS ? 'h264_videotoolbox' : 'h264_mediacodec';
 
   /// 画面识别的诊断文字
-  String get logTrack => '画面锁定 $_trackOkFrames/$_trackFrames 帧可信';
+  String get logTrack =>
+      '画面锁定($_trackEngine) $_trackOkFrames/$_trackFrames 帧可信';
+
+  /// 上一次用的跟踪器(Vision / SAD)
+  String _trackEngine = '-';
 
   /// sendcmd 是否可用(首次失败后本次运行不再尝试,避免每次导出都白跑一遍)
   bool _sendcmdOk = true;
@@ -1821,12 +1832,14 @@ class _CameraPageState extends State<CameraPage> {
       return null;
     }
     final bytes = await f.readAsBytes();
-    try {
-      f.deleteSync();
-    } catch (_) {}
     final frameBytes = tw * th;
     final frames = bytes.length ~/ frameBytes;
-    if (frames < 4) return null;
+    if (frames < 4) {
+      try {
+        f.deleteSync();
+      } catch (_) {}
+      return null;
+    }
 
     // 用户的框(归一化) → 跟踪帧像素
     final bw = (box.width * tw).round().clamp(6, tw);
@@ -1834,30 +1847,61 @@ class _CameraPageState extends State<CameraPage> {
     final bx = (box.left * tw).round().clamp(0, tw - bw);
     final by = (box.top * th).round().clamp(0, th - bh);
 
-    // 放到独立 isolate:3 分钟素材约 8 秒,不能卡住界面
-    final raw = await Isolate.run(() {
-      final pts = TargetTracker.track(
-        gray: bytes,
+    // 跟踪器选择:
+    //   * iOS → 系统 Vision 框架(VNTrackObjectRequest):硬件/系统级实现,
+    //     自带尺度与外观自适应,比手写的块匹配稳得多,也不引入第三方依赖。
+    //   * 其他平台 → Dart 的 SAD 块匹配(独立 isolate,不卡界面)。
+    List<TrackPoint>? pts;
+    if (VisionTracker.isSupported) {
+      final v = await VisionTracker.trackGray(
+        path: grayPath,
         w: tw,
         h: th,
         frames: frames,
-        boxX: bx,
-        boxY: by,
-        boxW: bw,
-        boxH: bh,
         fps: kTrackFps,
-        priorDx: priorDx,
-        priorDy: priorDy,
+        boxX: bx.toDouble(),
+        boxY: by.toDouble(),
+        boxW: bw.toDouble(),
+        boxH: bh.toDouble(),
       );
-      return pts
-          .map((p) => <double>[p.t, p.cx, p.cy, p.mad, p.ok ? 1 : 0])
+      if (v != null) {
+        pts = v
+            .map(
+              (e) => TrackPoint(e[0], e[1], e[2], (1 - e[3]) * 100, e[4] > 0.5),
+            )
+            .toList();
+        _trackEngine = 'Vision';
+      }
+    }
+    if (pts == null) {
+      final raw = await Isolate.run(() {
+        final r = TargetTracker.track(
+          gray: bytes,
+          w: tw,
+          h: th,
+          frames: frames,
+          boxX: bx,
+          boxY: by,
+          boxW: bw,
+          boxH: bh,
+          fps: kTrackFps,
+          priorDx: priorDx,
+          priorDy: priorDy,
+        );
+        return r
+            .map((p) => <double>[p.t, p.cx, p.cy, p.mad, p.ok ? 1 : 0])
+            .toList();
+      });
+      pts = raw
+          .map((e) => TrackPoint(e[0], e[1], e[2], e[3], e[4] > 0.5))
           .toList();
-    });
-    final pts = raw
-        .map((e) => TrackPoint(e[0], e[1], e[2], e[3], e[4] > 0.5))
-        .toList();
+      _trackEngine = 'SAD';
+    }
     _trackFrames = pts.length;
     _trackOkFrames = pts.where((p) => p.ok).length;
+    try {
+      f.deleteSync();
+    } catch (_) {}
     // 可信帧太少就当作跟踪失败,退回纯陀螺仪
     if (pts.length < 4 || _trackOkFrames < pts.length * 0.5) return null;
     return TargetTracker.lockCurve(
