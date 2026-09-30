@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:isolate';
 import 'dart:math' as math;
 import 'dart:ui' as ui;
 
@@ -18,6 +19,13 @@ import 'package:video_player/video_player.dart';
 import 'ble_heart_rate.dart';
 import 'gyro_test_page.dart';
 import 'stabilizer.dart';
+import 'target_tracker.dart';
+
+/// 画面锁定的跟踪帧宽度(越小越快,越小也越难跟准)
+const int kTrackWidth = 128;
+
+/// 跟踪抽帧帧率
+const double kTrackFps = 10;
 
 /// 一次心率采样:相对录像开始的时间(毫秒)+ 心率值
 class _HrSample {
@@ -172,6 +180,24 @@ class _CameraPageState extends State<CameraPage> {
   bool _recordHadBle = false;
   // 本段录像是否为竖屏(竖屏则成片需旋转为竖向)
   bool _recordPortrait = true;
+
+  // ── 画面锁定(目标跟踪稳定)──
+  bool _lockEnabled = false; // 开关:是否启用画面识别锁定
+  // 用户画的框,归一化到"预览里显示的那幅图"的坐标(0~1)。
+  // 该图与成片是同一幅画面(同比例、同朝向),所以能直接映射到成片中。
+  Rect? _lockBox;
+  Rect? _lockBoxSnapshot; // 本段录像开始时的框(录制期间可继续改,不影响已录段)
+  // 拖拽画框过程(屏幕坐标)
+  Offset? _dragFrom;
+  Offset? _dragTo;
+  bool _dragging = false;
+  // 诊断:上一次跟踪结果
+  int _trackFrames = 0;
+  int _trackOkFrames = 0;
+
+  /// 预览里那幅图的映射参数 [显示宽, 显示高, 平移x, 平移y](由 LayoutBuilder 写入),
+  /// 用于在"屏幕坐标 ⇄ 图像归一化坐标"之间换算锁定框。
+  List<double> _imgMap = const [1, 1, 0, 0];
 
   // ── 导出/渲染状态 ──
   RenderJob? _job; // 当前渲染任务(用于进度弹窗与后台进度条)
@@ -911,6 +937,70 @@ class _CameraPageState extends State<CameraPage> {
     );
   }
 
+  // ─────────────── 画面锁定:画框与坐标换算 ───────────────
+
+  /// 屏幕坐标 → 预览图像归一化坐标(0~1)。图像在预览区里永远居中,
+  /// 显示尺寸与位移取自 [_imgMap]。
+  Offset _screenToImage(Offset p) {
+    final sw = _previewSize.width;
+    final sh = _previewSize.height;
+    final iw = _imgMap[0];
+    final ih = _imgMap[1];
+    if (sw <= 0 || sh <= 0 || iw <= 0 || ih <= 0) return Offset.zero;
+    final x = ((p.dx - _imgMap[2]) - sw / 2) / iw + 0.5;
+    final y = ((p.dy - _imgMap[3]) - sh / 2) / ih + 0.5;
+    return Offset(x.clamp(0.0, 1.0), y.clamp(0.0, 1.0));
+  }
+
+  /// 预览图像归一化坐标 → 屏幕坐标(把框画出来用)
+  Rect _imageRectToScreen(Rect r) {
+    final sw = _previewSize.width;
+    final sh = _previewSize.height;
+    final iw = _imgMap[0];
+    final ih = _imgMap[1];
+    if (iw <= 0 || ih <= 0) return Rect.zero;
+    double sx(double x) => (x - 0.5) * iw + _imgMap[2] + sw / 2;
+    double sy(double y) => (y - 0.5) * ih + _imgMap[3] + sh / 2;
+    return Rect.fromLTRB(sx(r.left), sy(r.top), sx(r.right), sy(r.bottom));
+  }
+
+  /// 拖拽结束:把屏幕矩形换算成归一化图像坐标并保存为锁定框
+  void _commitLockBox() {
+    final from = _dragFrom;
+    final to = _dragTo;
+    _dragFrom = null;
+    _dragTo = null;
+    if (from == null || to == null) {
+      setState(() {});
+      return;
+    }
+    final a = _screenToImage(from);
+    final b = _screenToImage(to);
+    final l = math.min(a.dx, b.dx);
+    final t = math.min(a.dy, b.dy);
+    final r = math.max(a.dx, b.dx);
+    final btm = math.max(a.dy, b.dy);
+    // 框太小当误触:忽略这次拖拽
+    if ((r - l) < 0.03 || (btm - t) < 0.03) {
+      setState(() {});
+      return;
+    }
+    setState(() {
+      _lockBox = Rect.fromLTRB(l, t, r, btm);
+      _hint = '已锁定目标框;开始稳定后导出时会把框内目标钉在画面正中';
+    });
+  }
+
+  /// 锁定框的屏幕矩形(拖拽中显示临时框)
+  Rect? get _lockBoxScreen {
+    if (_dragging && _dragFrom != null && _dragTo != null) {
+      return Rect.fromPoints(_dragFrom!, _dragTo!);
+    }
+    final box = _lockBox;
+    if (box == null) return null;
+    return _imageRectToScreen(box);
+  }
+
   /// 应用画质/帧率:重开当前镜头
   Future<void> _applySettings() async {
     if (_busy) return;
@@ -956,6 +1046,8 @@ class _CameraPageState extends State<CameraPage> {
         _recordHadBle = widget.ble.isConnected;
         // 记录本段录制方向:竖屏则成片需要旋转为竖向
         _recordPortrait = isPortraitNow;
+        // 快照本段的画面锁定目标框(录制中可以继续调,不影响这一段)
+        _lockBoxSnapshot = _lockEnabled ? _lockBox : null;
         // 记录本段开始时刻(用于切分陀螺仪数据)
         _recordStartEpochSec = DateTime.now().millisecondsSinceEpoch / 1000.0;
         // 每秒刷新一次界面,让计时数字走动
@@ -1009,6 +1101,7 @@ class _CameraPageState extends State<CameraPage> {
             stabEndEpoch: DateTime.now().millisecondsSinceEpoch / 1000.0,
             stabStrength: _stabStrength,
             stabFov: _stabFov,
+            lockBox: _lockBoxSnapshot,
           ),
         );
       }
@@ -1038,6 +1131,7 @@ class _CameraPageState extends State<CameraPage> {
     double stabEndEpoch = 0,
     double stabStrength = 1.0,
     double stabFov = 66,
+    Rect? lockBox,
   }) async {
     final job = RenderJob();
     setState(() {
@@ -1064,6 +1158,7 @@ class _CameraPageState extends State<CameraPage> {
         stabEndEpoch: stabEndEpoch,
         stabStrength: stabStrength,
         stabFov: stabFov,
+        lockBox: lockBox,
       );
       job
         ..progress = 1.0
@@ -1264,6 +1359,7 @@ class _CameraPageState extends State<CameraPage> {
     double stabEndEpoch = 0,
     double stabStrength = 1.0,
     double stabFov = 66,
+    Rect? lockBox,
   }) async {
     final docs = await getApplicationDocumentsDirectory();
     final folder = Directory('${docs.path}/录像');
@@ -1319,6 +1415,35 @@ class _CameraPageState extends State<CameraPage> {
     String stabPrefix = ''; // sendcmd 逐帧方案(首选),末尾带逗号以接 ass=
     String stabPrefixExpr = ''; // 表达式方案(退路)
     String? cmdsPath; // 逐帧命令文件(临时,出片后删除)
+
+    // 1.4) 画面锁定:先跟踪出目标轨迹(必须在方向判定之后,因为抽帧要跟着转置)
+    List<List<double>>? lockXY;
+    if (lockBox != null &&
+        stabGyro.length >= 4 &&
+        stabEndEpoch > stabStartEpoch) {
+      job
+        ..stage = '画面识别(目标锁定)…'
+        ..progress = 0.02;
+      try {
+        lockXY = await _trackTargetPath(
+          rawPath: raw.path,
+          vfPrefix: vfPrefix,
+          outW: width,
+          outH: height,
+          box: lockBox,
+          workDir: workDir,
+          stamp: stamp,
+          job: job,
+        );
+      } catch (e) {
+        lockXY = null;
+        if (mounted) setState(() => _hint = '画面识别失败,已退回纯陀螺仪稳定: $e');
+      }
+      if (lockXY == null && mounted) {
+        setState(() => _hint = '画面识别未取得可信轨迹($logTrack),已退回纯陀螺仪稳定');
+      }
+    }
+
     if (stabGyro.length >= 4 && stabEndEpoch > stabStartEpoch) {
       job.stage = '分析陀螺仪数据…';
       final plan = GyroStabilizer.analyze(
@@ -1350,12 +1475,35 @@ class _CameraPageState extends State<CameraPage> {
         final n = plan.dx.length < plan.dy.length
             ? plan.dx.length
             : plan.dy.length;
+        // 融合:低频用画面识别(把目标死死钉在正中,且不会像陀螺仪那样漂移),
+        //       高频用陀螺仪(10fps 的跟踪看不到高频抖动,那部分只能靠陀螺仪)
+        List<List<double>>? lockX;
+        List<List<double>>? lockY;
+        List<double>? ghpX;
+        List<double>? ghpY;
+        if (lockXY != null && lockXY.length >= 2) {
+          lockX = lockXY.map((e) => <double>[e[0], e[1]]).toList();
+          lockY = lockXY.map((e) => <double>[e[0], e[2]]).toList();
+          ghpX = _highPass(plan.dx, 0.6, 60);
+          ghpY = _highPass(plan.dy, 0.6, 60);
+        }
+        final limX = plan.margin * width;
+        final limY = plan.margin * height;
         for (var i = 0; i < n; i++) {
-          final t = plan.dx[i][0].toStringAsFixed(4);
-          final x = (baseX - zoom * plan.dx[i][1]).round().clamp(0, maxX);
-          final y = (baseY - zoom * plan.dy[i][1]).round().clamp(0, maxY);
-          sb.writeln('$t crop@c x $x;');
-          sb.writeln('$t crop@c y $y;');
+          final t = plan.dx[i][0];
+          var dxPx = plan.dx[i][1];
+          var dyPx = plan.dy[i][1];
+          if (lockX != null && lockY != null && ghpX != null && ghpY != null) {
+            dxPx = TargetTracker.interp(lockX, t) + ghpX[i];
+            dyPx = TargetTracker.interp(lockY, t) + ghpY[i];
+            dxPx = dxPx.clamp(-limX, limX);
+            dyPx = dyPx.clamp(-limY, limY);
+          }
+          final ts = t.toStringAsFixed(4);
+          final x = (baseX - zoom * dxPx).round().clamp(0, maxX);
+          final y = (baseY - zoom * dyPx).round().clamp(0, maxY);
+          sb.writeln('$ts crop@c x $x;');
+          sb.writeln('$ts crop@c y $y;');
         }
         final cmdsFile = File('${workDir.path}/${stamp}_cmds.txt');
         cmdsFile.writeAsStringSync(sb.toString());
@@ -1380,7 +1528,8 @@ class _CameraPageState extends State<CameraPage> {
             '${plan.maxShiftX.toStringAsFixed(0)},'
             '${plan.maxShiftY.toStringAsFixed(0)}px · '
             '逐帧 60Hz($n 点) · '
-            '陀螺仪 ${stabGyro.length} 条';
+            '陀螺仪 ${stabGyro.length} 条'
+            '${lockX != null ? ' · $logTrack' : ''}';
       }
       if (stabPrefix.isEmpty && stabPrefixExpr.isEmpty) {
         job.stabInfo = '陀螺仪数据不足(${stabGyro.length} 条),未应用运动稳定';
@@ -1576,6 +1725,9 @@ class _CameraPageState extends State<CameraPage> {
   static String get _hwEncoderName =>
       Platform.isIOS ? 'h264_videotoolbox' : 'h264_mediacodec';
 
+  /// 画面识别的诊断文字
+  String get logTrack => '画面锁定 $_trackOkFrames/$_trackFrames 帧可信';
+
   /// sendcmd 是否可用(首次失败后本次运行不再尝试,避免每次导出都白跑一遍)
   bool _sendcmdOk = true;
 
@@ -1595,6 +1747,107 @@ class _CameraPageState extends State<CameraPage> {
           '-bufsize ${kbps * 4}k$extra';
     }
     return '-c:v libx264 -preset ultrafast -crf 23 -threads 0';
+  }
+
+  /// 画面识别:把成片抽成低分辨率灰度帧,在独立 isolate 里用 SAD 块匹配
+  /// 逐帧跟踪用户框住的目标,返回"把目标拉到画面正中"所需的画面位移曲线
+  /// [t秒, vx, vy](成片像素)。
+  ///
+  /// 注意抽帧一定要带上 [vfPrefix](transpose):跟踪用的画面朝向必须和成片一致,
+  /// 否则框的坐标会整体转 90°。
+  Future<List<List<double>>?> _trackTargetPath({
+    required String rawPath,
+    required String vfPrefix,
+    required int outW,
+    required int outH,
+    required Rect box,
+    required Directory workDir,
+    required int stamp,
+    required RenderJob job,
+  }) async {
+    final tw = kTrackWidth;
+    var th = ((tw * outH) / outW / 2).round() * 2;
+    if (th < 8) th = 8;
+    final grayPath = '${workDir.path}/${stamp}_track.gray';
+    final ok = await _runFfmpeg(
+      '-y -loglevel error -i "$rawPath" '
+      '-vf "${vfPrefix}fps=$kTrackFps,scale=$tw:$th,format=gray" '
+      '-f rawvideo -pix_fmt gray "$grayPath"',
+      0, // 传 0 表示不上报进度,避免污染主进度条
+      job,
+    );
+    final f = File(grayPath);
+    if (!ok || !f.existsSync()) {
+      try {
+        f.deleteSync();
+      } catch (_) {}
+      return null;
+    }
+    final bytes = await f.readAsBytes();
+    try {
+      f.deleteSync();
+    } catch (_) {}
+    final frameBytes = tw * th;
+    final frames = bytes.length ~/ frameBytes;
+    if (frames < 4) return null;
+
+    // 用户的框(归一化) → 跟踪帧像素
+    final bw = (box.width * tw).round().clamp(6, tw);
+    final bh = (box.height * th).round().clamp(6, th);
+    final bx = (box.left * tw).round().clamp(0, tw - bw);
+    final by = (box.top * th).round().clamp(0, th - bh);
+
+    // 放到独立 isolate:3 分钟素材约 8 秒,不能卡住界面
+    final raw = await Isolate.run(() {
+      final pts = TargetTracker.track(
+        gray: bytes,
+        w: tw,
+        h: th,
+        frames: frames,
+        boxX: bx,
+        boxY: by,
+        boxW: bw,
+        boxH: bh,
+        fps: kTrackFps,
+      );
+      return pts
+          .map((p) => <double>[p.t, p.cx, p.cy, p.mad, p.ok ? 1 : 0])
+          .toList();
+    });
+    final pts = raw
+        .map((e) => TrackPoint(e[0], e[1], e[2], e[3], e[4] > 0.5))
+        .toList();
+    _trackFrames = pts.length;
+    _trackOkFrames = pts.where((p) => p.ok).length;
+    // 可信帧太少就当作跟踪失败,退回纯陀螺仪
+    if (pts.length < 4 || _trackOkFrames < pts.length * 0.5) return null;
+    return TargetTracker.lockCurve(
+      pts: pts,
+      frameW: outW.toDouble(),
+      frameH: outH.toDouble(),
+      trackW: tw,
+      trackH: th,
+    );
+  }
+
+  /// 取曲线的高频分量(原曲线 - 低频)。画面识别只有 10fps,看不到高频抖动,
+  /// 所以低频交给它、高频留给陀螺仪。
+  List<double> _highPass(List<List<double>> curve, double winSec, double hz) {
+    final n = curve.length;
+    final half = math.max(1, (winSec * hz / 2).round());
+    final out = List<double>.filled(n, 0);
+    for (var i = 0; i < n; i++) {
+      var s = 0.0;
+      var c = 0;
+      for (var k = -half; k <= half; k++) {
+        final j = i + k;
+        if (j < 0 || j >= n) continue;
+        s += curve[j][1];
+        c++;
+      }
+      out[i] = curve[i][1] - (c > 0 ? s / c : curve[i][1]);
+    }
+    return out;
   }
 
   /// 执行 FFmpeg,并用 statistics 回调上报进度与速度(预计剩余时间)
@@ -1934,173 +2187,257 @@ class _CameraPageState extends State<CameraPage> {
                       mainAxisSize: MainAxisSize.min,
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                  const Text(
-                    '运动稳定',
-                    style: TextStyle(
-                      color: Colors.white,
-                      fontSize: 18,
-                      fontWeight: FontWeight.bold,
-                    ),
-                  ),
-                  const SizedBox(height: 4),
-                  const Text(
-                    '用陀螺仪补偿手抖:先用超广角并把画面放大留出余量,再开始稳定',
-                    style: TextStyle(color: Colors.white54, fontSize: 12),
-                  ),
-                  SwitchListTile(
-                    contentPadding: EdgeInsets.zero,
-                    value: _stabilizeEnabled,
-                    activeThumbColor: Colors.redAccent,
-                    title: const Text(
-                      '运动稳定',
-                      style: TextStyle(color: Colors.white, fontSize: 15),
-                    ),
-                    subtitle: Text(
-                      _stabilizeEnabled ? '已开启 · 可双指缩放画面' : '关闭',
-                      style: const TextStyle(
-                        color: Colors.white38,
-                        fontSize: 12,
-                      ),
-                    ),
-                    onChanged: (v) {
-                      // 先同步更新 UI,再去做异步的变焦查询:避免开关看起来"点不动"
-                      setState(() {
-                        _stabilizeEnabled = v;
-                        if (!v) {
-                          _stabRunning = false;
-                          _stabOffsetY = 0;
-                          _stabOffsetX = 0;
-                        }
-                      });
-                      if (v) {
-                        _startGyroSession();
-                        unawaited(
-                          _loadZoomRange().then((_) {
-                            if (mounted) setSheetState(() {});
-                          }),
-                        );
-                      } else {
-                        _stopGyroSession();
-                      }
-                      setSheetState(() {});
-                    },
-                  ),
-                  const Divider(color: Colors.white12, height: 1),
-                  ListTile(
-                    contentPadding: EdgeInsets.zero,
-                    leading: const Icon(
-                      Icons.screen_rotation,
-                      color: Colors.white70,
-                    ),
-                    title: const Text(
-                      '陀螺仪测试',
-                      style: TextStyle(color: Colors.white, fontSize: 15),
-                    ),
-                    subtitle: const Text(
-                      '立方体随陀螺仪旋转,显示 XYZ 数据',
-                      style: TextStyle(color: Colors.white38, fontSize: 11),
-                    ),
-                    trailing: const Icon(
-                      Icons.chevron_right,
-                      color: Colors.white38,
-                    ),
-                    onTap: () {
-                      Navigator.pop(ctx);
-                      _openGyroTest();
-                    },
-                  ),
-                  if (_stabilizeEnabled) ...[
-                    const SizedBox(height: 8),
-                    Container(
-                      width: double.infinity,
-                      padding: const EdgeInsets.all(12),
-                      decoration: BoxDecoration(
-                        color: Colors.white10,
-                        borderRadius: BorderRadius.circular(10),
-                      ),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(
-                            '当前变焦 $zoomText'
-                            '${hasWide ? '(支持超广角)' : '(镜头最小变焦)'}',
+                        const Text(
+                          '运动稳定',
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontSize: 18,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                        const SizedBox(height: 4),
+                        const Text(
+                          '用陀螺仪补偿手抖:先用超广角并把画面放大留出余量,再开始稳定',
+                          style: TextStyle(color: Colors.white54, fontSize: 12),
+                        ),
+                        SwitchListTile(
+                          contentPadding: EdgeInsets.zero,
+                          value: _stabilizeEnabled,
+                          activeThumbColor: Colors.redAccent,
+                          title: const Text(
+                            '运动稳定',
+                            style: TextStyle(color: Colors.white, fontSize: 15),
+                          ),
+                          subtitle: Text(
+                            _stabilizeEnabled ? '已开启 · 可双指缩放画面' : '关闭',
                             style: const TextStyle(
-                              color: Colors.white,
-                              fontSize: 13,
+                              color: Colors.white38,
+                              fontSize: 12,
                             ),
                           ),
-                          const SizedBox(height: 4),
+                          onChanged: (v) {
+                            // 先同步更新 UI,再去做异步的变焦查询:避免开关看起来"点不动"
+                            setState(() {
+                              _stabilizeEnabled = v;
+                              if (!v) {
+                                _stabRunning = false;
+                                _stabOffsetY = 0;
+                                _stabOffsetX = 0;
+                              }
+                            });
+                            if (v) {
+                              _startGyroSession();
+                              unawaited(
+                                _loadZoomRange().then((_) {
+                                  if (mounted) setSheetState(() {});
+                                }),
+                              );
+                            } else {
+                              _stopGyroSession();
+                            }
+                            setSheetState(() {});
+                          },
+                        ),
+                        const Divider(color: Colors.white12, height: 1),
+                        ListTile(
+                          contentPadding: EdgeInsets.zero,
+                          leading: const Icon(
+                            Icons.screen_rotation,
+                            color: Colors.white70,
+                          ),
+                          title: const Text(
+                            '陀螺仪测试',
+                            style: TextStyle(color: Colors.white, fontSize: 15),
+                          ),
+                          subtitle: const Text(
+                            '立方体随陀螺仪旋转,显示 XYZ 数据',
+                            style: TextStyle(
+                              color: Colors.white38,
+                              fontSize: 11,
+                            ),
+                          ),
+                          trailing: const Icon(
+                            Icons.chevron_right,
+                            color: Colors.white38,
+                          ),
+                          onTap: () {
+                            Navigator.pop(ctx);
+                            _openGyroTest();
+                          },
+                        ),
+                        const Divider(color: Colors.white12, height: 1),
+                        SwitchListTile(
+                          contentPadding: EdgeInsets.zero,
+                          value: _lockEnabled,
+                          activeThumbColor: Colors.redAccent,
+                          title: const Text(
+                            '画面识别锁定',
+                            style: TextStyle(color: Colors.white, fontSize: 15),
+                          ),
+                          subtitle: Text(
+                            !_lockEnabled
+                                ? '关闭(需先开启运动稳定并点开始稳定)'
+                                : (_lockBox == null
+                                      ? '请在预览里单指拖拽,画框圈住目标'
+                                      : '已锁定目标框 · 导出时钉在画面正中'),
+                            style: const TextStyle(
+                              color: Colors.white38,
+                              fontSize: 11,
+                            ),
+                          ),
+                          onChanged: (v) {
+                            setState(() {
+                              _lockEnabled = v;
+                              if (!v) {
+                                _lockBox = null;
+                                _dragFrom = null;
+                                _dragTo = null;
+                              } else {
+                                _hint = '请在预览里单指拖拽,画框圈住要锁定的目标';
+                              }
+                            });
+                            setSheetState(() {});
+                          },
+                        ),
+                        if (_lockEnabled)
+                          Padding(
+                            padding: const EdgeInsets.only(bottom: 8),
+                            child: Row(
+                              children: [
+                                Expanded(
+                                  child: Text(
+                                    _trackFrames > 0
+                                        ? '上次识别:$logTrack'
+                                        : (_lockBox == null
+                                              ? '尚未画框:单指在预览上拖出矩形'
+                                              : '目标框已就绪(双指仍可缩放)'),
+                                    style: const TextStyle(
+                                      color: Colors.white38,
+                                      fontSize: 11,
+                                    ),
+                                  ),
+                                ),
+                                if (_lockBox != null)
+                                  TextButton(
+                                    onPressed: () {
+                                      setState(() => _lockBox = null);
+                                      setSheetState(() {});
+                                    },
+                                    child: const Text(
+                                      '清除框',
+                                      style: TextStyle(fontSize: 12),
+                                    ),
+                                  ),
+                              ],
+                            ),
+                          ),
+                        if (_stabilizeEnabled) ...[
+                          const SizedBox(height: 8),
+                          Container(
+                            width: double.infinity,
+                            padding: const EdgeInsets.all(12),
+                            decoration: BoxDecoration(
+                              color: Colors.white10,
+                              borderRadius: BorderRadius.circular(10),
+                            ),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  '当前变焦 $zoomText'
+                                  '${hasWide ? '(支持超广角)' : '(镜头最小变焦)'}',
+                                  style: const TextStyle(
+                                    color: Colors.white,
+                                    fontSize: 13,
+                                  ),
+                                ),
+                                const SizedBox(height: 4),
+                                const Text(
+                                  '① 切到最广 → ② 点开始稳定 → ③ 正常拍摄'
+                                  '(裁切放大固定,抖得再大也不会变)',
+                                  style: TextStyle(
+                                    color: Colors.white38,
+                                    fontSize: 11,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                          const SizedBox(height: 10),
+                          Row(
+                            children: [
+                              const Text(
+                                '稳定强度',
+                                style: TextStyle(
+                                  color: Colors.white70,
+                                  fontSize: 12,
+                                ),
+                              ),
+                              const SizedBox(width: 10),
+                              ...[(0.6, '柔和'), (1.0, '标准'), (1.6, '强')].map((
+                                o,
+                              ) {
+                                final sel = (_stabStrength - o.$1).abs() < 0.01;
+                                return Padding(
+                                  padding: const EdgeInsets.only(right: 6),
+                                  child: ChoiceChip(
+                                    label: Text(
+                                      o.$2,
+                                      style: TextStyle(
+                                        fontSize: 11,
+                                        color: sel
+                                            ? Colors.black
+                                            : Colors.white,
+                                      ),
+                                    ),
+                                    selected: sel,
+                                    selectedColor: Colors.redAccent,
+                                    backgroundColor: Colors.black,
+                                    side: BorderSide(
+                                      color: sel
+                                          ? Colors.redAccent
+                                          : Colors.white24,
+                                    ),
+                                    onSelected: (_) => setSheetState(
+                                      () => _stabStrength = o.$1,
+                                    ),
+                                  ),
+                                );
+                              }),
+                            ],
+                          ),
+                          const SizedBox(height: 10),
+                          SizedBox(
+                            width: double.infinity,
+                            child: OutlinedButton.icon(
+                              style: OutlinedButton.styleFrom(
+                                foregroundColor: Colors.white70,
+                                side: const BorderSide(color: Colors.white24),
+                              ),
+                              onPressed: () async {
+                                if (_recording) {
+                                  lockedHint();
+                                  return;
+                                }
+                                await _switchToWidest();
+                                setSheetState(() {});
+                              },
+                              icon: const Icon(Icons.zoom_out_map, size: 18),
+                              label: Text(
+                                '切到最广 ${_minZoom.toStringAsFixed(1)}x',
+                              ),
+                            ),
+                          ),
+                        ] else ...[
+                          const SizedBox(height: 12),
                           const Text(
-                            '① 切到最广 → ② 点开始稳定 → ③ 正常拍摄'
-                            '(裁切放大固定,抖得再大也不会变)',
+                            '开启后可:双指缩放画面留出余量、实时记录陀螺仪并补偿画面位移。',
                             style: TextStyle(
                               color: Colors.white38,
                               fontSize: 11,
                             ),
                           ),
                         ],
-                      ),
-                    ),
-                    const SizedBox(height: 10),
-                    Row(
-                      children: [
-                        const Text(
-                          '稳定强度',
-                          style: TextStyle(color: Colors.white70, fontSize: 12),
-                        ),
-                        const SizedBox(width: 10),
-                        ...[(0.6, '柔和'), (1.0, '标准'), (1.6, '强')].map((o) {
-                          final sel = (_stabStrength - o.$1).abs() < 0.01;
-                          return Padding(
-                            padding: const EdgeInsets.only(right: 6),
-                            child: ChoiceChip(
-                              label: Text(
-                                o.$2,
-                                style: TextStyle(
-                                  fontSize: 11,
-                                  color: sel ? Colors.black : Colors.white,
-                                ),
-                              ),
-                              selected: sel,
-                              selectedColor: Colors.redAccent,
-                              backgroundColor: Colors.black,
-                              side: BorderSide(
-                                color: sel ? Colors.redAccent : Colors.white24,
-                              ),
-                              onSelected: (_) =>
-                                  setSheetState(() => _stabStrength = o.$1),
-                            ),
-                          );
-                        }),
-                      ],
-                    ),
-                    const SizedBox(height: 10),
-                    SizedBox(
-                      width: double.infinity,
-                      child: OutlinedButton.icon(
-                        style: OutlinedButton.styleFrom(
-                          foregroundColor: Colors.white70,
-                          side: const BorderSide(color: Colors.white24),
-                        ),
-                        onPressed: () async {
-                          if (_recording) {
-                            lockedHint();
-                            return;
-                          }
-                          await _switchToWidest();
-                          setSheetState(() {});
-                        },
-                        icon: const Icon(Icons.zoom_out_map, size: 18),
-                        label: Text('切到最广 ${_minZoom.toStringAsFixed(1)}x'),
-                      ),
-                    ),
-                  ] else ...[
-                    const SizedBox(height: 12),
-                    const Text(
-                      '开启后可:双指缩放画面留出余量、实时记录陀螺仪并补偿画面位移。',
-                      style: TextStyle(color: Colors.white38, fontSize: 11),
-                    ),
-                  ],
                       ],
                     ),
                   ),
@@ -2155,9 +2492,7 @@ class _CameraPageState extends State<CameraPage> {
                             icon: Icon(
                               _stabRunning ? Icons.stop : Icons.play_arrow,
                             ),
-                            label: Text(
-                              _stabRunning ? '停止稳定(并关闭设置)' : '开始稳定',
-                            ),
+                            label: Text(_stabRunning ? '停止稳定(并关闭设置)' : '开始稳定'),
                           ),
                         ),
                         const SizedBox(height: 6),
@@ -2508,13 +2843,35 @@ class _CameraPageState extends State<CameraPage> {
           if (cam != null && cam.value.isInitialized)
             Positioned.fill(
               child: GestureDetector(
-                // 运动稳定开启后:双指缩放画面(留出可移动余量)
+                // 单指拖拽 = 画锁定框(开启画面锁定时);
+                // 双指缩放 = 画面放大留出余量(开启运动稳定时)。
                 // 注意:录像/处理中不接管手势,否则会抢走录像按钮的点击
-                onScaleStart: (_stabilizeEnabled && !_recording && !_busy)
-                    ? (_) => _zoomAtGestureStart = _zoom
+                onScaleStart:
+                    (!_recording &&
+                        !_busy &&
+                        (_stabilizeEnabled || _lockEnabled))
+                    ? (d) {
+                        if (d.pointerCount >= 2) {
+                          _dragging = false;
+                          _zoomAtGestureStart = _zoom;
+                        } else if (_lockEnabled) {
+                          _dragging = true;
+                          _dragFrom = d.localFocalPoint;
+                          _dragTo = d.localFocalPoint;
+                          setState(() {});
+                        }
+                      }
                     : null,
-                onScaleUpdate: (_stabilizeEnabled && !_recording && !_busy)
+                onScaleUpdate:
+                    (!_recording &&
+                        !_busy &&
+                        (_stabilizeEnabled || _lockEnabled))
                     ? (d) async {
+                        if (_dragging) {
+                          setState(() => _dragTo = d.localFocalPoint);
+                          return;
+                        }
+                        if (!_stabilizeEnabled) return;
                         final camNow = _cam;
                         if (camNow == null) return;
                         final z = (_zoomAtGestureStart * d.scale).clamp(
@@ -2526,6 +2883,14 @@ class _CameraPageState extends State<CameraPage> {
                           await camNow.setZoomLevel(z);
                         } catch (_) {}
                         if (mounted) setState(() => _zoom = z);
+                      }
+                    : null,
+                onScaleEnd: (!_recording && !_busy && _lockEnabled)
+                    ? (_) {
+                        if (_dragging) {
+                          _dragging = false;
+                          _commitLockBox();
+                        }
                       }
                     : null,
                 child: LayoutBuilder(
@@ -2555,6 +2920,7 @@ class _CameraPageState extends State<CameraPage> {
                       }
                       iw *= over;
                       ih *= over;
+                      _imgMap = [iw, ih, dx, dy];
                       return Center(
                         child: SizedBox(
                           width: sw,
@@ -2597,6 +2963,7 @@ class _CameraPageState extends State<CameraPage> {
                     }
                     iw *= over;
                     ih *= over;
+                    _imgMap = [iw, ih, dx, dy];
                     return Center(
                       child: SizedBox(
                         width: tw,
@@ -2642,6 +3009,22 @@ class _CameraPageState extends State<CameraPage> {
                       style: TextStyle(color: Colors.white54, fontSize: 13),
                     ),
                   ],
+                ),
+              ),
+            ),
+
+          // ── 锁定框(画面识别目标)+ 画面正中十字 ──
+          if (cam != null && cam.value.isInitialized && _lockEnabled)
+            Positioned.fill(
+              child: IgnorePointer(
+                child: Builder(
+                  builder: (_) {
+                    final r = _lockBoxScreen;
+                    return CustomPaint(
+                      painter: _LockBoxPainter(r, _stabRunning),
+                      size: Size.infinite,
+                    );
+                  },
                 ),
               ),
             ),
@@ -3105,6 +3488,65 @@ class _CameraPageState extends State<CameraPage> {
     _cam?.dispose();
     super.dispose();
   }
+}
+
+/// 锁定框画笔:四角括线 + 画面正中十字。
+/// 十字表示"目标会被钉在这个位置",框表示"要锁的是这个目标"。
+class _LockBoxPainter extends CustomPainter {
+  final Rect? rect;
+  final bool running;
+  _LockBoxPainter(this.rect, this.running);
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final center = Offset(size.width / 2, size.height / 2);
+
+    // 画面正中十字(锁定目标会被移动到这里)
+    final cross = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1.5
+      ..color = running ? const Color(0xFFFF3B30) : const Color(0x88FF3B30);
+    const arm = 12.0;
+    canvas.drawLine(
+      center - const Offset(arm, 0),
+      center + const Offset(arm, 0),
+      cross,
+    );
+    canvas.drawLine(
+      center - const Offset(0, arm),
+      center + const Offset(0, arm),
+      cross,
+    );
+
+    final r = rect;
+    if (r == null) return;
+    canvas.drawRect(
+      r,
+      Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 1.5
+        ..color = const Color(0x99FF3B30),
+    );
+    final thick = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 3.5
+      ..strokeCap = StrokeCap.round
+      ..color = const Color(0xFFFF3B30);
+    final len = math.min(r.width, r.height) * 0.22;
+    void corner(Offset o, double sx, double sy) {
+      canvas.drawLine(o, o + Offset(len * sx, 0), thick);
+      canvas.drawLine(o, o + Offset(0, len * sy), thick);
+    }
+
+    corner(r.topLeft, 1, 1);
+    corner(r.topRight, -1, 1);
+    corner(r.bottomLeft, 1, -1);
+    corner(r.bottomRight, -1, -1);
+  }
+
+  @override
+  bool shouldRepaint(covariant _LockBoxPainter old) =>
+      old.rect != rect || old.running != running;
 }
 
 /// 心率曲线画笔:横轴为最近的心率历史,纵轴按数据范围自适应
