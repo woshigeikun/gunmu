@@ -1303,10 +1303,22 @@ class _CameraPageState extends State<CameraPage> {
     }
     final String vfPrefix = needRotate ? 'transpose=$transposeMode,' : '';
 
+    final workDir = Directory('${docs.path}/work');
+    if (!workDir.existsSync()) workDir.createSync(recursive: true);
+
     // 1.5) 运动稳定分析:**尽早**算出来,这样进度窗一出现就能看到稳定参数,
     //      不用等心率曲线生成完(曲线阶段可能要好几秒)。
     //      四元数姿态积分 → 平滑虚拟相机路径 → 双轴补偿曲线 + 固定裁切余量。
-    String stabPrefix = ''; // 末尾带逗号,后面还要接 ass=
+    //
+    //      位移是怎么施加的(关键改动):
+    //      原来把曲线塞进 crop 的 x/y 表达式里,节点数被限制在 60 个 ——
+    //      3 分钟的视频算下来每 3 秒才一个节点,而手抖是 1~8Hz,
+    //      裁切框根本跟不上,等于没做稳定。
+    //      现在改成 sendcmd 逐帧命令(60Hz),crop 的 x/y 每帧都被改写,
+    //      分辨率提升两个数量级。expression 版本保留为首选失败时的退路。
+    String stabPrefix = ''; // sendcmd 逐帧方案(首选),末尾带逗号以接 ass=
+    String stabPrefixExpr = ''; // 表达式方案(退路)
+    String? cmdsPath; // 逐帧命令文件(临时,出片后删除)
     if (stabGyro.length >= 4 && stabEndEpoch > stabStartEpoch) {
       job.stage = '分析陀螺仪数据…';
       final plan = GyroStabilizer.analyze(
@@ -1317,6 +1329,7 @@ class _CameraPageState extends State<CameraPage> {
         frameH: height.toDouble(),
         fovDeg: stabFov,
         strength: stabStrength,
+        curveStep: 1 / 60, // 60Hz 逐帧
       );
       if (plan.usable) {
         final zoom = plan.zoom;
@@ -1324,25 +1337,52 @@ class _CameraPageState extends State<CameraPage> {
         final scaledH = ((height * zoom) / 2).floor() * 2;
         final baseX = (scaledW - width) / 2;
         final baseY = (scaledH - height) / 2;
-        final exprX = GyroStabilizer.toCropExpr(plan.dx);
-        final exprY = GyroStabilizer.toCropExpr(plan.dy);
+        final maxX = scaledW - width;
+        final maxY = scaledH - height;
+        final bx = baseX.round().clamp(0, maxX);
+        final by = baseY.round().clamp(0, maxY);
+
+        // ── sendcmd 逐帧命令文件 ──
+        // 注意符号:预览用 Transform.translate(+d) 平移画面,内容位移 = +d;
+        // 而这里是移动**裁切窗口**,窗口右移 ⇒ 内容在成片里左移,
+        // 所以成片的位移是 -d。两处必须相反,否则成片方向和预览是镜像的。
+        final sb = StringBuffer();
+        final n = plan.dx.length < plan.dy.length
+            ? plan.dx.length
+            : plan.dy.length;
+        for (var i = 0; i < n; i++) {
+          final t = plan.dx[i][0].toStringAsFixed(4);
+          final x = (baseX - zoom * plan.dx[i][1]).round().clamp(0, maxX);
+          final y = (baseY - zoom * plan.dy[i][1]).round().clamp(0, maxY);
+          sb.writeln('$t crop@c x $x;');
+          sb.writeln('$t crop@c y $y;');
+        }
+        final cmdsFile = File('${workDir.path}/${stamp}_cmds.txt');
+        cmdsFile.writeAsStringSync(sb.toString());
+        cmdsPath = cmdsFile.path;
+        stabPrefix =
+            'sendcmd=f=$cmdsPath,'
+            'scale=$scaledW:$scaledH:flags=bilinear,'
+            'crop@c=$width:$height:$bx:$by,';
+
+        // ── 退路:表达式方案(分辨率受限,只在 sendcmd 不可用时用)──
+        final exprX = GyroStabilizer.toCropExpr(plan.dx, maxKnots: 160);
+        final exprY = GyroStabilizer.toCropExpr(plan.dy, maxKnots: 160);
         if (exprX != null && exprY != null) {
-          // 注意符号:预览用 Transform.translate(+d) 平移画面,内容位移 = +d;
-          // 而这里是移动**裁切窗口**,窗口右移 ⇒ 内容在成片里左移,
-          // 所以成片的位移是 -d。两处必须相反,否则成片方向和预览是镜像的。
-          stabPrefix =
+          stabPrefixExpr =
               'scale=$scaledW:$scaledH:flags=bilinear,'
               'crop=$width:$height:'
               "'(${baseX.toStringAsFixed(1)}-$zoom*($exprX))':"
               "'(${baseY.toStringAsFixed(1)}-$zoom*($exprY))',";
-          job.stabInfo =
-              '运动稳定 ×${zoom.toStringAsFixed(2)} · 位移≤'
-              '${plan.maxShiftX.toStringAsFixed(0)},'
-              '${plan.maxShiftY.toStringAsFixed(0)}px · '
-              '陀螺仪 ${stabGyro.length} 条';
         }
+        job.stabInfo =
+            '运动稳定 ×${zoom.toStringAsFixed(2)} · 位移≤'
+            '${plan.maxShiftX.toStringAsFixed(0)},'
+            '${plan.maxShiftY.toStringAsFixed(0)}px · '
+            '逐帧 60Hz($n 点) · '
+            '陀螺仪 ${stabGyro.length} 条';
       }
-      if (stabPrefix.isEmpty) {
+      if (stabPrefix.isEmpty && stabPrefixExpr.isEmpty) {
         job.stabInfo = '陀螺仪数据不足(${stabGyro.length} 条),未应用运动稳定';
       }
       if (mounted) setState(() => _hint = job.stabInfo ?? '');
@@ -1356,9 +1396,7 @@ class _CameraPageState extends State<CameraPage> {
     job.encoderText = '编码器 $_hwEncoderName(硬件加速)';
     final threads = Platform.numberOfProcessors.clamp(2, 8);
 
-    // 2) 字幕 + 曲线参数
-    final workDir = Directory('${docs.path}/work');
-    if (!workDir.existsSync()) workDir.createSync(recursive: true);
+    // 2) 字幕 + 曲线参数(workDir 已在 1.5 步建好)
     final assPath = '${workDir.path}/$stamp.ass';
     final hasCurve = samples.where((s) => s.bpm > 0).length >= 2;
 
@@ -1437,6 +1475,7 @@ class _CameraPageState extends State<CameraPage> {
       }
       try {
         File(assPath).deleteSync();
+        if (cmdsPath != null) File(cmdsPath).deleteSync();
       } catch (_) {}
       job.progress = 1.0;
       return;
@@ -1470,27 +1509,49 @@ class _CameraPageState extends State<CameraPage> {
           '$enc -c:a aac -b:a 128k "$outPath"';
     }
 
+    // 尝试顺序:
+    //   ① sendcmd 逐帧位移(首选,分辨率最高)
+    //   ② 表达式位移(退路;若该 ffmpeg 包没编入 sendcmd 就走这里)
+    //   ③ 软件编码重试(硬件编码不可用时)
+    //   ④ 完全不加稳定(至少保证能出片)
     job.stage = '合成中…';
-    var ok = await _runFfmpeg(buildCmd(stabPrefix, encHw), durationSec, job);
-    if (!ok) {
-      // 硬件编码失败(该 ffmpeg 包未编入硬件编码器等)→ 退回软件编码重试
-      job
-        ..stage = '改用软件编码重试…'
-        ..progress = 0.40
-        ..encoderText = '软件编码 libx264(硬件编码不可用)';
-      ok = await _runFfmpeg(buildCmd(stabPrefix, encSw), durationSec, job);
+    var ok = false;
+    var stabApplied = false;
+    if (stabPrefix.isNotEmpty && _sendcmdOk) {
+      ok = await _runFfmpeg(buildCmd(stabPrefix, encHw), durationSec, job);
+      stabApplied = ok;
+      if (!ok) {
+        _sendcmdOk = false;
+        job
+          ..stage = '换用兼容稳定方案重试…'
+          ..progress = 0.40;
+      }
     }
-    if (!ok && stabPrefix.isNotEmpty) {
-      // 稳定滤镜失败时自动回退(至少保证出片)
+    if (!ok) {
+      final st = stabPrefixExpr;
+      ok = await _runFfmpeg(buildCmd(st, encHw), durationSec, job);
+      stabApplied = ok && st.isNotEmpty;
+      if (!ok) {
+        // 硬件编码失败(该 ffmpeg 包未编入硬件编码器等)→ 退回软件编码
+        job
+          ..stage = '改用软件编码重试…'
+          ..progress = 0.40
+          ..encoderText = '软件编码 libx264(硬件编码不可用)';
+        ok = await _runFfmpeg(buildCmd(st, encSw), durationSec, job);
+        stabApplied = ok && st.isNotEmpty;
+      }
+    }
+    if (!ok && (stabPrefix.isNotEmpty || stabPrefixExpr.isNotEmpty)) {
       job
         ..stage = '稳定处理失败,改为普通合成…'
         ..progress = 0.40;
       ok = await _runFfmpeg(buildCmd('', encSw), durationSec, job);
-      if (ok && mounted) {
-        setState(() => _hint = '运动稳定未能应用,已导出普通视频');
-      }
+      stabApplied = false;
     }
     if (!ok) throw Exception('FFmpeg 合成失败');
+    if (mounted && !stabApplied && stabGyro.isNotEmpty) {
+      setState(() => _hint = '运动稳定未能应用,已导出普通视频');
+    }
 
     // 4) 保存到录像目录 + 清理临时文件
     job
@@ -1499,6 +1560,7 @@ class _CameraPageState extends State<CameraPage> {
     await File(outPath).copy(saved);
     try {
       File(assPath).deleteSync();
+      if (cmdsPath != null) File(cmdsPath).deleteSync();
       if (seqDir != null) {
         Directory(seqDir).deleteSync(recursive: true);
       }
@@ -1513,6 +1575,9 @@ class _CameraPageState extends State<CameraPage> {
   /// 本平台该用的硬件 H.264 编码器名
   static String get _hwEncoderName =>
       Platform.isIOS ? 'h264_videotoolbox' : 'h264_mediacodec';
+
+  /// sendcmd 是否可用(首次失败后本次运行不再尝试,避免每次导出都白跑一遍)
+  bool _sendcmdOk = true;
 
   /// 视频编码参数。
   /// 默认用硬件编码器(iPhone 的 VideoToolbox / 安卓的 MediaCodec,由 SoC 里
