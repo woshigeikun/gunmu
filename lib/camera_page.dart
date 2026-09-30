@@ -1476,16 +1476,28 @@ class _CameraPageState extends State<CameraPage> {
             ? plan.dx.length
             : plan.dy.length;
         // 融合:低频用画面识别(把目标死死钉在正中,且不会像陀螺仪那样漂移),
-        //       高频用陀螺仪(10fps 的跟踪看不到高频抖动,那部分只能靠陀螺仪)
+        //       高频用陀螺仪(10fps 的跟踪看不到高频抖动,那部分只能靠陀螺仪)。
+        // 关键:两个频段必须**互补且不重叠**。视觉曲线本身也含 5Hz 以内的信息,
+        // 如果直接整体相加,1.7~5Hz 那一段会被补偿两次 → 过补偿、画面来回甩。
+        // 所以视觉只取低频、陀螺仪只取高频,同一段动作永远只被补偿一次。
         List<List<double>>? lockX;
         List<List<double>>? lockY;
         List<double>? ghpX;
         List<double>? ghpY;
         if (lockXY != null && lockXY.length >= 2) {
-          lockX = lockXY.map((e) => <double>[e[0], e[1]]).toList();
-          lockY = lockXY.map((e) => <double>[e[0], e[2]]).toList();
-          ghpX = _highPass(plan.dx, 0.6, 60);
-          ghpY = _highPass(plan.dy, 0.6, 60);
+          const win = 0.6;
+          lockX = _lowPassCurve(
+            lockXY.map((e) => <double>[e[0], e[1]]).toList(),
+            win,
+            kTrackFps,
+          );
+          lockY = _lowPassCurve(
+            lockXY.map((e) => <double>[e[0], e[2]]).toList(),
+            win,
+            kTrackFps,
+          );
+          ghpX = _highPass(plan.dx, win, 60);
+          ghpY = _highPass(plan.dy, win, 60);
         }
         final limX = plan.margin * width;
         final limY = plan.margin * height;
@@ -1828,6 +1840,29 @@ class _CameraPageState extends State<CameraPage> {
       trackW: tw,
       trackH: th,
     );
+  }
+
+  /// 对曲线做对称滑动平均(零相位低通)
+  List<List<double>> _lowPassCurve(
+    List<List<double>> curve,
+    double winSec,
+    double hz,
+  ) {
+    if (curve.length < 3) return curve;
+    final half = math.max(1, (winSec * hz / 2).round());
+    final out = <List<double>>[];
+    for (var i = 0; i < curve.length; i++) {
+      var s = 0.0;
+      var c = 0;
+      for (var k = -half; k <= half; k++) {
+        final j = i + k;
+        if (j < 0 || j >= curve.length) continue;
+        s += curve[j][1];
+        c++;
+      }
+      out.add(<double>[curve[i][0], s / c]);
+    }
+    return out;
   }
 
   /// 取曲线的高频分量(原曲线 - 低频)。画面识别只有 10fps,看不到高频抖动,
