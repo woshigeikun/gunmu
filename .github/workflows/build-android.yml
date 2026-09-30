@@ -2,6 +2,9 @@ name: build-android
 on:
   workflow_dispatch:          # 手动触发
 
+permissions:
+  contents: write             # 发布 Release 需要写权限
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -21,9 +24,14 @@ jobs:
       # 按 CPU 架构分包,避免单个 APK 过大(内含 FFmpeg 原生库)
       - run: flutter build apk --release --split-per-abi
 
-      # 产物只保留 2 天:Android 三个 APK 合计约 220MB,是容量占用的大头。
-      - uses: actions/upload-artifact@v4
-        with:
-          name: app-apk
-          path: build/app/outputs/flutter-apk/*.apk
-          retention-days: 2
+      # 同 iOS:不用 Actions 产物(会占满 500MB Actions 存储导致上传失败),
+      # 改为发布到 Release 附件,同名覆盖,不占 Actions 配额。
+      - name: 发布 APK 到 Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view latest-android >/dev/null 2>&1 \
+            || gh release create latest-android \
+                 --title "Android 最新构建" \
+                 --notes "由 GitHub Actions 自动构建;每次构建覆盖同名附件。"
+          gh release upload latest-android build/app/outputs/flutter-apk/*.apk --clobber
