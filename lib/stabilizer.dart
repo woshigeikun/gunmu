@@ -89,12 +89,12 @@ class GyroStabilizer {
   /// 视场角 fovDeg 描述的是原始横向捕获的长边,所以必须用长边反推,
   /// 两个轴才能得到同一个正确的 f(否则补偿量会小 1.7 倍以上)。
   static double focalPx(double frameW, double frameH, double fovDeg) =>
-      (math.max(frameW, frameH) / 2) /
-      math.tan(fovDeg * math.pi / 180 / 2);
+      (math.max(frameW, frameH) / 2) / math.tan(fovDeg * math.pi / 180 / 2);
 
   /// 稳定强度 → 裁切余量(画面每边可移动的比例)
   /// 柔和 0.6→4.2% / 标准 1.0→7% / 强 1.6→11.2%
-  static double marginFor(double strength) => (0.07 * strength).clamp(0.04, 0.12);
+  static double marginFor(double strength) =>
+      (0.07 * strength).clamp(0.04, 0.12);
 
   /// 余量 → 固定裁切放大倍率。余量恒定 ⇒ 画面永远不会越挪越放大。
   static double zoomForMargin(double margin) =>
