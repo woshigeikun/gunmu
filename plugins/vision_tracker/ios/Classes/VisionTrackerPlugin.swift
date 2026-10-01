@@ -183,16 +183,33 @@ public class VisionTrackerPlugin: NSObject, FlutterPlugin {
 
     // 跟踪放在后台队列:上千帧要跑好几秒,不能占着主线程
     DispatchQueue.global(qos: .userInitiated).async {
+      // 锚点:每 5 个一组 [帧序号, x, y, w, h](已是归一化坐标)
+      var anchors: [Int: CGRect] = [:]
+      if let flat = args["anchors"] as? [Double], flat.count >= 5 {
+        var i = 0
+        while i + 4 < flat.count {
+          let f = Int(flat[i].rounded())
+          anchors[f] = CGRect(
+            x: flat[i + 1], y: flat[i + 2], width: flat[i + 3], height: flat[i + 4])
+          i += 5
+        }
+      }
       let out = self.track(
         path: path, w: w, h: h, frames: frames, fps: fps,
-        box: CGRect(x: boxX, y: boxY, width: boxW, height: boxH))
+        box: CGRect(x: boxX, y: boxY, width: boxW, height: boxH),
+        anchors: anchors)
       DispatchQueue.main.async { result(out) }
     }
   }
 
   /// 返回扁平数组,每帧 5 个值:[t, cx, cy, confidence, ok]
+  ///
+  /// [anchors] 是"重新捕获点":键为帧序号,值为归一化框(左上原点)。
+  /// 到了这些帧就用识别出来的新位置把跟踪器重新初始化 —— 长视频里
+  /// Vision 跟踪器也会慢慢飘,每 10 秒拉回来一次能显著延长可用时长。
   private func track(
-    path: String, w: Int, h: Int, frames: Int, fps: Double, box: CGRect
+    path: String, w: Int, h: Int, frames: Int, fps: Double, box: CGRect,
+    anchors: [Int: CGRect] = [:]
   ) -> [Double] {
     var out: [Double] = []
     guard w > 0, h > 0, frames > 0,
@@ -215,6 +232,14 @@ public class VisionTrackerPlugin: NSObject, FlutterPlugin {
       let off = f * frameBytes
       if off + frameBytes > data.count { break }
       guard let img = grayImage(data: data, offset: off, w: w, h: h) else { break }
+
+      // 重新捕获点:用识别出来的新位置重建观测,把跟踪器拉回正确位置
+      if let a = anchors[f], f > 0 {
+        last = VNDetectedObjectObservation(
+          boundingBox: CGRect(
+            x: a.minX, y: 1.0 - a.maxY, width: a.width, height: a.height))
+        lostStreak = 0
+      }
 
       let req = VNTrackObjectRequest(detectedObjectObservation: last)
       req.trackingLevel = .accurate
