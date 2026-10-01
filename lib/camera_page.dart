@@ -2087,18 +2087,24 @@ class _CameraPageState extends State<CameraPage> {
       refIdx = 1;
       autoBox = pick.box;
     }
-    var refPatch = TargetTracker.patchOf(
+    // 取样块的物理边长:取参考框长边的 1.25 倍,且不小于 24px
+    final patchPx = math.max(
+      24.0,
+      math.max(ref.width * cw, ref.height * ch) * 1.25,
+    );
+    var refPatch = TargetTracker.patchCentered(
       bytes,
       cw,
       ch,
-      ref.left,
-      ref.top,
-      ref.width,
-      ref.height,
+      (ref.left + ref.width / 2) * cw,
+      (ref.top + ref.height / 2) * ch,
+      patchPx,
     );
 
     final anchors = <List<double>>[];
     final refAr = ref.width / ref.height;
+    var ckFrames = 0; // 有候选的检查点数
+    var bestSeen = 0.0; // 全程最高相似度(诊断用)
     for (var i = 0; i < count; i++) {
       if (i == refIdx) continue;
       final t = i * 5.0;
@@ -2109,6 +2115,7 @@ class _CameraPageState extends State<CameraPage> {
         w: cw,
         h: ch,
       );
+      if (cands.isNotEmpty) ckFrames++;
       TargetCandidate? best;
       var bestScore = 0.55; // 相似度阈值:低于这个值宁可不用锚点
       for (final c in cands) {
@@ -2116,16 +2123,16 @@ class _CameraPageState extends State<CameraPage> {
         if ((math.log(refAr / (c.box.width / c.box.height))).abs() > 0.35) {
           continue;
         }
-        final p = TargetTracker.patchOf(
+        final p = TargetTracker.patchCentered(
           frame,
           cw,
           ch,
-          c.box.left,
-          c.box.top,
-          c.box.width,
-          c.box.height,
+          (c.box.left + c.box.width / 2) * cw,
+          (c.box.top + c.box.height / 2) * ch,
+          patchPx,
         );
         final s = TargetTracker.ncc(refPatch, p);
+        if (s > bestSeen) bestSeen = s;
         if (s > bestScore) {
           bestScore = s;
           best = c;
@@ -2140,21 +2147,22 @@ class _CameraPageState extends State<CameraPage> {
           best.box.height * trackH,
         ]);
         ref = best.box;
-        refPatch = TargetTracker.patchOf(
+        refPatch = TargetTracker.patchCentered(
           frame,
           cw,
           ch,
-          ref.left,
-          ref.top,
-          ref.width,
-          ref.height,
+          (ref.left + ref.width / 2) * cw,
+          (ref.top + ref.height / 2) * ch,
+          patchPx,
         );
       }
     }
     return (
       autoBox: autoBox,
       anchors: anchors,
-      info: '检查点 $count 个 · 重捕获 ${anchors.length} 次',
+      info:
+          '检查点 $count 个 · 有候选 $ckFrames 帧 · '
+          '最高相似 ${bestSeen.toStringAsFixed(2)} · 重捕获 ${anchors.length} 次',
     );
   }
 
