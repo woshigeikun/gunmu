@@ -1636,6 +1636,7 @@ class _CameraPageState extends State<CameraPage> {
         fovDeg: stabFov,
         strength: stabStrength,
         curveStep: 1 / 60, // 60Hz 逐帧
+        roll: stabStrength >= 1.6, // 「强」「激进」档启用地平线锁定(横滚校正)
       );
     }
 
@@ -1786,6 +1787,18 @@ class _CameraPageState extends State<CameraPage> {
         // ── 退路:表达式方案(分辨率受限,只在 sendcmd 不可用时用)──
         final exprX = GyroStabilizer.toCropExpr(plan.dx, maxKnots: 160);
         final exprY = GyroStabilizer.toCropExpr(plan.dy, maxKnots: 160);
+        // 地平线锁定:用 rotate 逐帧把画面转回来(角度可逐帧表达式)。
+        // 注意 rotate 的 a 是弧度、正值 = 顺时针。
+        final exprRoll = plan.hasRoll
+            ? GyroStabilizer.toCropExpr(plan.roll, maxKnots: 160)
+            : null;
+        if (exprRoll != null) {
+          stabPrefix =
+              'sendcmd=f=$cmdsPath,'
+              'scale=$scaledW:$scaledH:flags=bilinear,'
+              "rotate=a='$exprRoll':ow=iw:oh=ih,"
+              'crop@c=$width:$height:$bx:$by,';
+        }
         if (exprX != null && exprY != null) {
           stabPrefixExpr =
               'scale=$scaledW:$scaledH:flags=bilinear,'
