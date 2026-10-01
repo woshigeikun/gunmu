@@ -54,6 +54,12 @@ class StabPlan {
   /// 使用的裁切余量(比例)
   final double margin;
 
+  /// 横滚(地平线)校正曲线 [t秒, 弧度]。空表示不做地平线锁定。
+  final List<List<double>> roll;
+
+  /// 实际用到的最大横滚(度,诊断用)
+  final double maxRollDeg;
+
   const StabPlan({
     required this.dx,
     required this.dy,
@@ -61,9 +67,12 @@ class StabPlan {
     required this.maxShiftX,
     required this.maxShiftY,
     required this.margin,
+    this.roll = const [],
+    this.maxRollDeg = 0,
   });
 
   bool get usable => dx.length >= 2 && dy.length >= 2;
+  bool get hasRoll => roll.length >= 2 && maxRollDeg > 0.05;
 
   static const empty = StabPlan(
     dx: [],
@@ -112,16 +121,19 @@ class GyroStabilizer {
     double strength = 1.0,
     double curveStep = 0.2,
     double? margin,
+    bool roll = false,
   }) {
     final m = (margin ?? marginFor(strength)).clamp(0.02, 0.16);
-    final zoom = zoomForMargin(m);
     final maxShiftXPx = m * frameW;
     final maxShiftYPx = m * frameH;
+    final useRoll = roll;
+    const maxRollRad = 3.0 * math.pi / 180;
 
-    // 1) 积分姿态(取旋转向量的 x=pitch、y=yaw 作为相机指向)
+    // 1) 积分姿态(取旋转向量的 x=pitch、y=yaw、z=横滚)
     final ts = <double>[];
     final rawX = <double>[];
     final rawY = <double>[];
+    final rawZ = <double>[];
     var q = Quat.identity;
     double? prev;
     for (final s in samples) {
@@ -136,37 +148,43 @@ class GyroStabilizer {
       ts.add(t - startEpoch);
       rawX.add(rv[0]);
       rawY.add(rv[1]);
+      rawZ.add(rv[2]);
     }
     if (ts.length < 4) return StabPlan.empty;
 
     // 2) 对称移动平均平滑(离线用对称窗,不会引入滞后)
     final smX = List<double>.filled(ts.length, 0);
     final smY = List<double>.filled(ts.length, 0);
+    final smZ = List<double>.filled(ts.length, 0);
     var lo = 0, hi = 0;
-    var sumX = 0.0, sumY = 0.0;
+    var sumX = 0.0, sumY = 0.0, sumZ = 0.0;
     for (var i = 0; i < ts.length; i++) {
       final tLo = ts[i] - smoothSec / 2;
       final tHi = ts[i] + smoothSec / 2;
       while (hi < ts.length && ts[hi] <= tHi) {
         sumX += rawX[hi];
         sumY += rawY[hi];
+        sumZ += rawZ[hi];
         hi++;
       }
       while (lo < hi && ts[lo] < tLo) {
         sumX -= rawX[lo];
         sumY -= rawY[lo];
+        sumZ -= rawZ[lo];
         lo++;
       }
       final n = hi - lo;
       smX[i] = n > 0 ? sumX / n : rawX[i];
       smY[i] = n > 0 ? sumY / n : rawY[i];
+      smZ[i] = n > 0 ? sumZ / n : rawZ[i];
     }
 
-    // 3) 修正角 → 像素位移,并硬限制在裁切余量内
+    // 3) 修正角 → 像素位移 / 横滚角,并硬限制在预算内
     final f = focalPx(frameW, frameH, fovDeg);
     final dxs = List<double>.filled(ts.length, 0);
     final dys = List<double>.filled(ts.length, 0);
-    var maxX = 0.0, maxY = 0.0;
+    final rls = List<double>.filled(ts.length, 0);
+    var maxX = 0.0, maxY = 0.0, maxR = 0.0;
     for (var i = 0; i < ts.length; i++) {
       final cx = ((rawX[i] - smX[i]) * strength).clamp(-1.0, 1.0);
       final cy = ((rawY[i] - smY[i]) * strength).clamp(-1.0, 1.0);
@@ -177,16 +195,25 @@ class GyroStabilizer {
       dxs[i] = dxPx;
       maxX = math.max(maxX, dxPx.abs());
       maxY = math.max(maxY, dyPx.abs());
+      if (useRoll) {
+        // 横滚(地平线锁定):绕光轴把画面转回来。
+        // 上限 3°:再歪就不是手抖而是有意倾斜,硬掰会让人物跟着歪。
+        final cr = ((rawZ[i] - smZ[i]) * strength).clamp(-maxRollRad, maxRollRad);
+        rls[i] = cr;
+        maxR = math.max(maxR, cr.abs());
+      }
     }
 
     // 4) 按固定间隔采样成曲线(供 FFmpeg 表达式使用)
     final dxCurve = <List<double>>[];
     final dyCurve = <List<double>>[];
+    final rollCurve = <List<double>>[];
     var nextT = 0.0;
     for (var i = 0; i < ts.length; i++) {
       if (ts[i] >= nextT) {
         dxCurve.add(<double>[ts[i], dxs[i]]);
         dyCurve.add(<double>[ts[i], dys[i]]);
+        if (useRoll) rollCurve.add(<double>[ts[i], rls[i]]);
         nextT = ts[i] + curveStep;
       }
     }
@@ -194,7 +221,15 @@ class GyroStabilizer {
     if (dxCurve.isNotEmpty && ts.isNotEmpty) {
       dxCurve.add(<double>[ts.last, dxs.last]);
       dyCurve.add(<double>[ts.last, dys.last]);
+      if (useRoll) rollCurve.add(<double>[ts.last, rls.last]);
     }
+
+    // 5) 裁切倍率 = 位移余量 × 横滚覆盖(旋转会切掉四角,必须额外放大盖住)
+    final zoom =
+        (zoomForMargin(m) * rollCoverage(maxR, frameW, frameH) * 1.005).clamp(
+          1.0,
+          1.6,
+        );
 
     return StabPlan(
       dx: dxCurve,
@@ -203,7 +238,18 @@ class GyroStabilizer {
       maxShiftX: maxX,
       maxShiftY: maxY,
       margin: m,
+      roll: rollCurve,
+      maxRollDeg: maxR * 180 / math.pi,
     );
+  }
+
+  /// 横滚 θ 时,要让旋转后的画面仍然盖住中间的 W×H 取景框,需要的最小放大倍率
+  /// (旋转矩形覆盖轴对齐矩形的条件)。不额外放大就会露出黑边。
+  static double rollCoverage(double theta, double w, double h) {
+    final t = theta.abs();
+    if (t < 1e-6 || w <= 0 || h <= 0) return 1.0;
+    final c = math.cos(t), s = math.sin(t);
+    return math.max(c + h / w * s, c + w / h * s);
   }
 
   /// 把曲线转成 FFmpeg crop 的位移表达式(节点数受限,避免表达式过深)
