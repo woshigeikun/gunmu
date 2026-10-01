@@ -40,7 +40,11 @@ class TargetTracker {
   ///
   /// [gray] 连续 [frames] 帧灰度数据(每帧 w*h 字节,行优先);
   /// [boxX]/[boxY]/[boxW]/[boxH] 第一帧里的初始目标框(像素);
-  /// [search] 每帧在上一帧位置附近搜索的半径(像素)。
+  /// [search] 每帧在上一帧位置附近搜索的半径(像素);
+  /// [anchors] 中途重新捕获的锚点,每个元素是
+  /// [帧序号, 框x, 框y, 框w, 框h](跟踪帧像素)。
+  /// 长视频里跟踪器难免会慢慢飘走,锚点允许在每 10 秒的检查点上
+  /// 用"重新识别出来的同一目标"把跟踪器重新初始化一次。
   static List<TrackPoint> track({
     required Uint8List gray,
     required int w,
@@ -54,31 +58,53 @@ class TargetTracker {
     int search = 14,
     List<double>? priorDx,
     List<double>? priorDy,
+    List<List<double>>? anchors,
   }) {
-    final out = <TrackPoint>[];
+    var out = <TrackPoint>[];
+    // 累计重捕获次数(诊断:反映锚点有没有起作用)
+    var reacquired = 0;
     if (w <= 0 || h <= 0 || frames <= 0) return out;
     final frameBytes = w * h;
     if (gray.length < frameBytes) return out;
     if (boxW < 4 || boxH < 4) return out;
 
-    final bx = boxX.clamp(0, w - boxW < 0 ? 0 : w - boxW);
-    final by = boxY.clamp(0, h - boxH < 0 ? 0 : h - boxH);
-
-    // 模板采样点:上限约 700 个,保证每帧计算量恒定可控
-    final step = math.max(1, ((boxW * boxH) / 700).ceil());
-    final rel = <int>[]; // 相对模板左上角的偏移
-    final tpl = <int>[]; // 模板灰度值(取自第一帧)
-    for (var y = 0; y < boxH; y += step) {
-      for (var x = 0; x < boxW; x += step) {
-        rel.add(y * w + x);
-        tpl.add(gray[(by + y) * w + bx + x]);
+    // 锚点表:帧序号 → 框
+    final anchorMap = <int, List<double>>{};
+    if (anchors != null) {
+      for (final a in anchors) {
+        if (a.length >= 5) anchorMap[a[0].round()] = a;
       }
     }
-    final n = rel.length;
-    if (n < 9) return out;
 
-    final maxX = w - boxW;
-    final maxY = h - boxH;
+    var bw = boxW, bh = boxH;
+    var bx = boxX.clamp(0, w - bw < 0 ? 0 : w - bw);
+    var by = boxY.clamp(0, h - bh < 0 ? 0 : h - bh);
+
+    var rel = <int>[];
+    var tpl = <int>[];
+    var n = 0;
+
+    /// 用当前帧的某个框重建模板(锚点重捕获时调用)
+    void seed(int f, int sx, int sy, int sw, int sh) {
+      bw = sw;
+      bh = sh;
+      bx = sx.clamp(0, w - bw < 0 ? 0 : w - bw);
+      by = sy.clamp(0, h - bh < 0 ? 0 : h - bh);
+      final step = math.max(1, ((bw * bh) / 700).ceil());
+      rel = <int>[];
+      tpl = <int>[];
+      final base = f * frameBytes;
+      for (var y = 0; y < bh; y += step) {
+        for (var x = 0; x < bw; x += step) {
+          rel.add(y * w + x);
+          tpl.add(gray[base + (by + y) * w + bx + x]);
+        }
+      }
+      n = rel.length;
+    }
+
+    seed(0, bx, by, bw, bh);
+    if (n < 9) return out;
 
     int sadAt(int base, int tx, int ty) {
       final p = base + ty * w + tx;
@@ -90,9 +116,9 @@ class TargetTracker {
     }
 
     // 初始位置 = 用户框的位置
-    var cx = bx + boxW / 2.0;
-    var cy = by + boxH / 2.0;
-    final boxCx0 = cx, boxCy0 = cy;
+    var cx = bx + bw / 2.0;
+    var cy = by + bh / 2.0;
+    var boxCx0 = cx, boxCy0 = cy;
     var lastX = cx, lastY = cy;
     var velX = 0.0, velY = 0.0;
     // 视觉测得的偏差累积量(见下面的"绝对预测 + 累积修正")
@@ -101,6 +127,32 @@ class TargetTracker {
     for (var f = 0; f < frames; f++) {
       final base = f * frameBytes;
       if (base + frameBytes > gray.length) break;
+
+      // ── 锚点重捕获 ──
+      // 到了检查点且这一帧重新识别出了同一目标:用它把跟踪器重新初始化。
+      // 关键是同时把"绝对预测"的基准也跟着平移,否则陀螺仪先验会把
+      // 重新捕获到的新位置又拉回旧位置上去。
+      final anc = anchorMap[f];
+      if (anc != null && f > 0) {
+        final aw = anc[3].round().clamp(6, w - 2);
+        final ah = anc[4].round().clamp(6, h - 2);
+        seed(f, anc[1].round(), anc[2].round(), aw, ah);
+        if (n >= 9) {
+          cx = bx + bw / 2.0;
+          cy = by + bh / 2.0;
+          lastX = cx;
+          lastY = cy;
+          velX = 0;
+          velY = 0;
+          accX = 0;
+          accY = 0;
+          final px = (priorDx != null && f < priorDx.length) ? priorDx[f] : 0.0;
+          final py = (priorDy != null && f < priorDy.length) ? priorDy[f] : 0.0;
+          boxCx0 = cx - px;
+          boxCy0 = cy - py;
+          reacquired++;
+        }
+      }
 
       // 运动预测:
       //   * 有陀螺仪先验时(推荐):预测 = 初始位置 + 陀螺仪算出的累计位移 + 累积修正。
@@ -131,14 +183,16 @@ class TargetTracker {
       final effSearch = usePri
           ? math.min(search, math.max(3, search ~/ 4))
           : search;
+      final mx = w - bw;
+      final my = h - bh;
       final predX = predX0;
       final predY = predY0;
-      final wantX = (predX - boxW / 2.0).round();
-      final wantY = (predY - boxH / 2.0).round();
-      final sx0 = (wantX - effSearch).clamp(0, maxX);
-      final sx1 = (wantX + effSearch).clamp(0, maxX);
-      final sy0 = (wantY - effSearch).clamp(0, maxY);
-      final sy1 = (wantY + effSearch).clamp(0, maxY);
+      final wantX = (predX - bw / 2.0).round();
+      final wantY = (predY - bh / 2.0).round();
+      final sx0 = (wantX - effSearch).clamp(0, mx);
+      final sx1 = (wantX + effSearch).clamp(0, mx);
+      final sy0 = (wantY - effSearch).clamp(0, my);
+      final sy1 = (wantY + effSearch).clamp(0, my);
 
       var bestScore = double.infinity;
       var bestSad = 0;
@@ -147,8 +201,8 @@ class TargetTracker {
         for (var tx = sx0; tx <= sx1; tx++) {
           final s = sadAt(base, tx, ty);
           final mad = s / n;
-          final dx = (tx + boxW / 2.0 - predX).abs();
-          final dy = (ty + boxH / 2.0 - predY).abs();
+          final dx = (tx + bw / 2.0 - predX).abs();
+          final dy = (ty + bh / 2.0 - predY).abs();
           final score = mad + _distPenalty * (dx + dy);
           if (score < bestScore) {
             bestScore = score;
@@ -179,8 +233,8 @@ class TargetTracker {
         }
       }
 
-      cx = bestX + subX + boxW / 2.0;
-      cy = bestY + subY + boxH / 2.0;
+      cx = bestX + subX + bw / 2.0;
+      cy = bestY + subY + bh / 2.0;
       if (usePri) {
         // 把"实测位置与预测位置的差"以一半权重并入累积修正:
         // 陀螺仪的缓慢漂移能被纠正,而单帧的测量噪声不会直接进入预测
@@ -203,8 +257,66 @@ class TargetTracker {
       // 残差过大 = 目标被遮挡/丢失;此时仍给出位置(沿用当前最佳),但标记不可信
       out.add(TrackPoint(f / fps, cx, cy, mad, mad < 45));
     }
+    _lastReacquired = reacquired;
     return out;
   }
+
+  /// 上次跟踪里实际生效的锚点重捕获次数(诊断用)
+  static int _lastReacquired = 0;
+  static int get lastReacquired => _lastReacquired;
+
+  /// 把一个归一化框里的小块采样成固定的 24×24 灰度,用于跨帧比较外观。
+  /// 固定在同一个尺寸上比较,才能容忍目标的远近/大小变化。
+  static List<double> patchOf(
+    Uint8List gray,
+    int w,
+    int h,
+    double left,
+    double top,
+    double width,
+    double height,
+  ) {
+    const n = kNccSize;
+    final out = List<double>.filled(n * n, 0);
+    final x0 = left * w, y0 = top * h;
+    final bw = width * w, bh = height * h;
+    if (bw < 2 || bh < 2) return out;
+    for (var j = 0; j < n; j++) {
+      final sy = (y0 + bh * (j + 0.5) / n).round().clamp(0, h - 1);
+      for (var i = 0; i < n; i++) {
+        final sx = (x0 + bw * (i + 0.5) / n).round().clamp(0, w - 1);
+        out[j * n + i] = gray[sy * w + sx].toDouble();
+      }
+    }
+    return out;
+  }
+
+  /// 归一化互相关(-1~1,越大越像)。
+  /// 用 NCC 而不是直接比灰度:目标在录像过程中亮度/对比度会变(自动曝光),
+  /// 直接比会误判成"不是同一个目标"。
+  static double ncc(List<double> a, List<double> b) {
+    final n = a.length < b.length ? a.length : b.length;
+    if (n == 0) return 0;
+    var ma = 0.0, mb = 0.0;
+    for (var i = 0; i < n; i++) {
+      ma += a[i];
+      mb += b[i];
+    }
+    ma /= n;
+    mb /= n;
+    var sa = 0.0, sb = 0.0, sab = 0.0;
+    for (var i = 0; i < n; i++) {
+      final da = a[i] - ma;
+      final db = b[i] - mb;
+      sa += da * da;
+      sb += db * db;
+      sab += da * db;
+    }
+    final d = math.sqrt(sa * sb);
+    return d < 1e-6 ? 0 : sab / d;
+  }
+
+  static const int kNccSize = 24;
 
   /// 线性插值取曲线在 [t] 时刻的值
   static double interp(List<List<double>> curve, double t) {
