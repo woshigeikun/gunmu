@@ -78,9 +78,18 @@ class VisionTracker {
     required double boxY,
     required double boxW,
     required double boxH,
+    List<List<double>>? anchors,
   }) async {
     if (!isSupported) return null;
     try {
+      // 锚点:每 5 个值 [帧序号, x, y, w, h](像素)→ 归一化后传给原生
+      final anc = <double>[];
+      if (anchors != null) {
+        for (final a in anchors) {
+          if (a.length < 5) continue;
+          anc.addAll(<double>[a[0], a[1] / w, a[2] / h, a[3] / w, a[4] / h]);
+        }
+      }
       final raw = await _ch.invokeMethod<List<dynamic>>('trackGray', {
         'path': path,
         'w': w,
@@ -91,6 +100,7 @@ class VisionTracker {
         'boxY': boxY,
         'boxW': boxW,
         'boxH': boxH,
+        'anchors': anc,
       });
       if (raw == null || raw.isEmpty) return null;
       final out = <List<double>>[];
