@@ -291,6 +291,35 @@ class TargetTracker {
     return out;
   }
 
+  /// 以 (cx,cy) 为中心、边长为 sizePx 的正方形小块,采样成 24×24 灰度。
+  ///
+  /// 为什么不用"目标框本身"取块:同一个目标在不同帧里,识别给出的框尺寸会变
+  /// (Vision 的文字框尤其明显)。按框取块再缩放,内容在块里的占比就跟着变,
+  /// NCC 会直接掉到阈值以下 —— 表现就是"永远匹配不上、重捕获恒为 0"。
+  /// 固定"物理尺寸 + 中心"取样,两侧内容占比一致,才比得准。
+  static List<double> patchCentered(
+    Uint8List gray,
+    int w,
+    int h,
+    double cx,
+    double cy,
+    double sizePx,
+  ) {
+    const n = kNccSize;
+    final out = List<double>.filled(n * n, 0);
+    final half = sizePx / 2;
+    final x0 = cx - half, y0 = cy - half;
+    if (sizePx < 2) return out;
+    for (var j = 0; j < n; j++) {
+      final sy = (y0 + sizePx * (j + 0.5) / n).round().clamp(0, h - 1);
+      for (var i = 0; i < n; i++) {
+        final sx = (x0 + sizePx * (i + 0.5) / n).round().clamp(0, w - 1);
+        out[j * n + i] = gray[sy * w + sx].toDouble();
+      }
+    }
+    return out;
+  }
+
   /// 归一化互相关(-1~1,越大越像)。
   /// 用 NCC 而不是直接比灰度:目标在录像过程中亮度/对比度会变(自动曝光),
   /// 直接比会误判成"不是同一个目标"。
