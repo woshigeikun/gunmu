@@ -1112,7 +1112,29 @@ class _CameraPageState extends State<CameraPage> {
       _lockBox = picked.box;
       _hint = '已锁定「${picked.label}」;开始稳定后导出时把它钉在画面正中';
     });
+    // 选中候选就自动开始稳定,不必再回弹窗点一次「开始稳定」
+    _autoStartStabilize();
     return true;
+  }
+
+  /// 选中目标后就地开始稳定(等价于用户点了「开始稳定」)
+  void _autoStartStabilize() {
+    if (_stabRunning || _recording || _busy) return;
+    setState(() {
+      _stabilizeEnabled = true;
+      _onlineStab.reset();
+      _stabOffsetX = 0;
+      _stabOffsetY = 0;
+      _stabAutoZoom = GyroStabilizer.zoomForMargin(
+        GyroStabilizer.marginFor(_stabStrength),
+      );
+      _stabCorrDeg = 0;
+      _stabLog.clear();
+      _stabLast = DateTime.now();
+      _stabRunning = true;
+      _hint = '${_hint.isEmpty ? '' : '$_hint '}稳定已自动开启,可以直接录制';
+    });
+    _startGyroSession();
   }
 
   // ─────────────── 画面锁定:画框与坐标换算 ───────────────
@@ -1169,6 +1191,8 @@ class _CameraPageState extends State<CameraPage> {
       _lockBox = Rect.fromLTRB(l, t, r, btm);
       _hint = '已锁定目标框;开始稳定后导出时会把框内目标钉在画面正中';
     });
+    // 手动画框同样自动开始稳定
+    _autoStartStabilize();
   }
 
   /// 锁定框的屏幕矩形(拖拽中显示临时框)
@@ -1615,10 +1639,40 @@ class _CameraPageState extends State<CameraPage> {
       );
     }
 
+    // 1.35) 多遍识别:检查点重新识别(每 10 秒一次)+ 用户没选时在 5 秒自动选目标
+    List<List<double>>? anchors;
+    var effBox = lockBox;
+    var ckInfo = '';
+    if (plan != null && plan.usable) {
+      job
+        ..stage = '检查点重新识别…'
+        ..progress = 0.02;
+      try {
+        final ck = await _detectCheckpoints(
+          rawPath: raw.path,
+          vfPrefix: vfPrefix,
+          refBox: lockBox,
+          trackW: kTrackWidth,
+          trackH: ((kTrackWidth * height) / width / 2).round() * 2,
+          workDir: workDir,
+          stamp: stamp,
+          job: job,
+        );
+        if (ck != null) {
+          effBox ??= ck.autoBox;
+          anchors = ck.anchors;
+          ckInfo = ck.info;
+          if (ck.autoBox != null && mounted) {
+            setState(() => _hint = '开头未选目标,已自动锁定画面中的「文字/数字」目标');
+          }
+        }
+      } catch (_) {}
+    }
+
     // 1.4) 画面锁定:跟踪出目标轨迹(必须在方向判定之后,因为抽帧要跟着转置;
     //      也必须在陀螺仪分析之后,因为要用它当先验)
     List<List<double>>? lockXY;
-    if (lockBox != null && plan != null && plan.usable) {
+    if (effBox != null && plan != null && plan.usable) {
       job
         ..stage = '画面识别(目标锁定)…'
         ..progress = 0.02;
@@ -1642,12 +1696,13 @@ class _CameraPageState extends State<CameraPage> {
           vfPrefix: vfPrefix,
           outW: width,
           outH: height,
-          box: lockBox,
+          box: effBox,
           workDir: workDir,
           stamp: stamp,
           job: job,
           priorDx: priorX,
           priorDy: priorY,
+          anchors: anchors,
         );
       } catch (e) {
         lockXY = null;
@@ -1744,7 +1799,8 @@ class _CameraPageState extends State<CameraPage> {
             '${plan.maxShiftY.toStringAsFixed(0)}px · '
             '逐帧 60Hz($n 点) · '
             '陀螺仪 ${stabGyro.length} 条'
-            '${lockX != null ? ' · $logTrack' : ''}';
+            '${lockX != null ? ' · $logTrack' : ''}'
+            '${ckInfo.isEmpty ? '' : ' · $ckInfo'}';
       }
       if (stabPrefix.isEmpty && stabPrefixExpr.isEmpty) {
         job.stabInfo = '陀螺仪数据不足(${stabGyro.length} 条),未应用运动稳定';
@@ -1968,6 +2024,140 @@ class _CameraPageState extends State<CameraPage> {
     return '-c:v libx264 -preset ultrafast -crf 23 -threads 0';
   }
 
+  /// 多遍识别:每隔 5 秒抽一帧做一次候选识别,
+  ///   * 用户没选目标 → 在 5 秒处自动选一个"文字/数字"候选当参考;
+  ///   * 以后每 10 秒用外观相似度(NCC)找一次"同一个目标",找到就作为锚点,
+  ///     让跟踪器在那个时间点重新初始化 —— 长视频里跟踪器难免慢慢飘走,
+  ///     这就是把它拉回来的机制。
+  Future<({Rect? autoBox, List<List<double>> anchors, String info})?>
+  _detectCheckpoints({
+    required String rawPath,
+    required String vfPrefix,
+    required Rect? refBox,
+    required int trackW,
+    required int trackH,
+    required Directory workDir,
+    required int stamp,
+    required RenderJob job,
+  }) async {
+    if (!VisionTracker.isSupported) return null;
+    const cw = 1024;
+    var ch = ((cw * trackH) / trackW / 2).round() * 2;
+    if (ch < 8) ch = 8;
+    final path = '${workDir.path}/${stamp}_check.gray';
+    final ok = await _runFfmpeg(
+      '-y -loglevel error -i "$rawPath" '
+      '-vf "${vfPrefix}fps=1/5,scale=$cw:$ch,format=gray" '
+      '-f rawvideo -pix_fmt gray "$path"',
+      0,
+      job,
+    );
+    final f = File(path);
+    if (!ok || !f.existsSync()) return null;
+    final bytes = await f.readAsBytes();
+    try {
+      f.deleteSync();
+    } catch (_) {}
+    final fb = cw * ch;
+    final count = bytes.length ~/ fb;
+    if (count < 2) return null;
+    Uint8List fr(int i) =>
+        Uint8List.view(bytes.buffer, bytes.offsetInBytes + i * fb, fb);
+
+    // 参考目标:优先用户选的框;否则在 5 秒那一帧自动找"文字/数字"
+    var ref = refBox;
+    var refIdx = 0;
+    Rect? autoBox;
+    if (ref == null) {
+      final cands = await VisionTracker.detectTargets(
+        bytes: fr(1),
+        w: cw,
+        h: ch,
+      );
+      TargetCandidate? pick;
+      for (final c in cands) {
+        if (c.label.startsWith('文字')) {
+          pick = c;
+          break;
+        }
+      }
+      if (pick == null && cands.isNotEmpty) pick = cands.first;
+      if (pick == null) return null;
+      ref = pick.box;
+      refIdx = 1;
+      autoBox = pick.box;
+    }
+    var refPatch = TargetTracker.patchOf(
+      bytes,
+      cw,
+      ch,
+      ref.left,
+      ref.top,
+      ref.width,
+      ref.height,
+    );
+
+    final anchors = <List<double>>[];
+    final refAr = ref.width / ref.height;
+    for (var i = 0; i < count; i++) {
+      if (i == refIdx) continue;
+      final t = i * 5.0;
+      if (t % 10 != 0) continue; // 只在每 10 秒的检查点动作
+      final frame = fr(i);
+      final cands = await VisionTracker.detectTargets(
+        bytes: frame,
+        w: cw,
+        h: ch,
+      );
+      TargetCandidate? best;
+      var bestScore = 0.55; // 相似度阈值:低于这个值宁可不用锚点
+      for (final c in cands) {
+        // 长宽比差太多就不是同一个东西
+        if ((math.log(refAr / (c.box.width / c.box.height))).abs() > 0.35) {
+          continue;
+        }
+        final p = TargetTracker.patchOf(
+          frame,
+          cw,
+          ch,
+          c.box.left,
+          c.box.top,
+          c.box.width,
+          c.box.height,
+        );
+        final s = TargetTracker.ncc(refPatch, p);
+        if (s > bestScore) {
+          bestScore = s;
+          best = c;
+        }
+      }
+      if (best != null) {
+        anchors.add(<double>[
+          t * kTrackFps,
+          best.box.left * trackW,
+          best.box.top * trackH,
+          best.box.width * trackW,
+          best.box.height * trackH,
+        ]);
+        ref = best.box;
+        refPatch = TargetTracker.patchOf(
+          frame,
+          cw,
+          ch,
+          ref.left,
+          ref.top,
+          ref.width,
+          ref.height,
+        );
+      }
+    }
+    return (
+      autoBox: autoBox,
+      anchors: anchors,
+      info: '检查点 $count 个 · 重捕获 ${anchors.length} 次',
+    );
+  }
+
   /// 画面识别:把成片抽成低分辨率灰度帧,在独立 isolate 里用 SAD 块匹配
   /// 逐帧跟踪用户框住的目标,返回"把目标拉到画面正中"所需的画面位移曲线
   /// [t秒, vx, vy](成片像素)。
@@ -1985,6 +2175,7 @@ class _CameraPageState extends State<CameraPage> {
     required RenderJob job,
     List<double>? priorDx,
     List<double>? priorDy,
+    List<List<double>>? anchors,
   }) async {
     final tw = kTrackWidth;
     var th = ((tw * outH) / outW / 2).round() * 2;
@@ -2036,6 +2227,7 @@ class _CameraPageState extends State<CameraPage> {
         boxY: by.toDouble(),
         boxW: bw.toDouble(),
         boxH: bh.toDouble(),
+        anchors: anchors,
       );
       if (v != null) {
         pts = v
@@ -2060,6 +2252,7 @@ class _CameraPageState extends State<CameraPage> {
           fps: kTrackFps,
           priorDx: priorDx,
           priorDy: priorDy,
+          anchors: anchors,
         );
         return r
             .map((p) => <double>[p.t, p.cx, p.cy, p.mad, p.ok ? 1 : 0])
