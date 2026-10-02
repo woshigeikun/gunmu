@@ -27,7 +27,7 @@ import 'target_tracker.dart';
 /// 画面锁定的跟踪帧宽度。
 /// iOS 走系统 Vision(算力不在 Dart 侧),可以用更大分辨率换精度;
 /// 其他平台退回 Dart 的 SAD 块匹配,小一点才跑得动。
-const int kTrackWidthVision = 256;
+const int kTrackWidthVision = 320;
 const int kTrackWidthSad = 128;
 int get kTrackWidth =>
     VisionTracker.isSupported ? kTrackWidthVision : kTrackWidthSad;
@@ -2164,13 +2164,15 @@ class _CameraPageState extends State<CameraPage> {
     required RenderJob job,
   }) async {
     if (!VisionTracker.isSupported) return null;
-    const cw = 1024;
-    var ch = ((cw * trackH) / trackW / 2).round() * 2;
+    // 按 0.1 秒(10fps)抽帧,和跟踪用同一套分辨率 —— 这样每个跟踪帧
+    // 都有一份文字候选,目标的中心位置就是 0.1 秒级的。
+    final cw = trackW;
+    var ch = trackH;
     if (ch < 8) ch = 8;
     final path = '${workDir.path}/${stamp}_check.gray';
     final ok = await _runFfmpeg(
       '-y -loglevel error -i "$rawPath" '
-      '-vf "${vfPrefix}fps=1/5,scale=$cw:$ch,format=gray" '
+      '-vf "${vfPrefix}fps=$kTrackFps,scale=$cw:$ch,format=gray" '
       '-f rawvideo -pix_fmt gray "$path"',
       0,
       job,
@@ -2192,10 +2194,13 @@ class _CameraPageState extends State<CameraPage> {
     var refIdx = 0;
     Rect? autoBox;
     if (ref == null) {
+      // 开头没选目标:在 5 秒处(第 50 帧)找文字/数字候选当参考
+      final idx5 = (5 * kTrackFps).round().clamp(0, count - 1);
       final cands = await VisionTracker.detectTargets(
-        bytes: fr(1),
+        bytes: fr(idx5),
         w: cw,
         h: ch,
+        textOnly: true,
       );
       TargetCandidate? pick;
       for (final c in cands) {
@@ -2207,7 +2212,7 @@ class _CameraPageState extends State<CameraPage> {
       if (pick == null && cands.isNotEmpty) pick = cands.first;
       if (pick == null) return null;
       ref = pick.box;
-      refIdx = 1;
+      refIdx = idx5;
       autoBox = pick.box;
     }
     // 取样块的物理边长:取参考框长边的 1.25 倍,且不小于 24px
@@ -2226,17 +2231,20 @@ class _CameraPageState extends State<CameraPage> {
 
     final anchors = <List<double>>[];
     final refAr = ref.width / ref.height;
-    var ckFrames = 0; // 有候选的检查点数
+    var ckFrames = 0; // 有候选的帧数
     var bestSeen = 0.0; // 全程最高相似度(诊断用)
     for (var i = 0; i < count; i++) {
       if (i == refIdx) continue;
-      final t = i * 5.0;
-      if (t % 10 != 0) continue; // 只在每 10 秒的检查点动作
+      // 每一帧都做文字候选(0.1 秒一次),命中就成为锚点:
+      // 跟踪器每个锚点都会重新初始化,于是目标位置就是 0.1 秒级的
+      // "文字框中心",而不是靠累计跟踪漂出来的。
+      final t = i / kTrackFps;
       final frame = fr(i);
       final cands = await VisionTracker.detectTargets(
         bytes: frame,
         w: cw,
         h: ch,
+        textOnly: true,
       );
       if (cands.isNotEmpty) ckFrames++;
       TargetCandidate? best;
@@ -2284,8 +2292,8 @@ class _CameraPageState extends State<CameraPage> {
       autoBox: autoBox,
       anchors: anchors,
       info:
-          '检查点 $count 个 · 有候选 $ckFrames 帧 · '
-          '最高相似 ${bestSeen.toStringAsFixed(2)} · 重捕获 ${anchors.length} 次',
+          '逐帧候选 $count 帧 · 命中 $ckFrames · '
+          '最高相似 ${bestSeen.toStringAsFixed(2)} · 锚点 ${anchors.length}',
     );
   }
 
