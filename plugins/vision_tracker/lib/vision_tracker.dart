@@ -28,6 +28,7 @@ class VisionTracker {
     required int w,
     required int h,
     int rotationQuarterTurns = 0,
+    bool textOnly = false,
   }) async {
     if (!isSupported) return const [];
     try {
@@ -36,6 +37,7 @@ class VisionTracker {
         'w': w,
         'h': h,
         'rotation': rotationQuarterTurns,
+        'textOnly': textOnly,
       });
       if (raw == null || raw.isEmpty) return const [];
       const labels = ['文字/数字', '醒目区域', '矩形物体'];
