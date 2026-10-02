@@ -211,6 +211,11 @@ class _CameraPageState extends State<CameraPage> {
   List<TargetCandidate> _candidates = const [];
   bool _detecting = false;
 
+  // ── 实时候选识别(开关形式,每 0.1 秒刷新一次)──
+  bool _liveDetect = false;
+  Timer? _liveTimer;
+  CameraImage? _liveFrame;
+
   // ── 导出/渲染状态 ──
   RenderJob? _job; // 当前渲染任务(用于进度弹窗与后台进度条)
   bool _renderBackground = false; // 用户是否选择"后台渲染"
@@ -1041,7 +1046,101 @@ class _CameraPageState extends State<CameraPage> {
     return (out, fw, fh);
   }
 
-  /// 识别候选目标:给用户几个可以直接点的框,找不到再手动画
+  /// 开关:实时识别候选目标(每 0.1 秒刷新一次)
+  ///
+  /// 为什么用开关而不是按钮:取景时目标是会动、会进出画面的,
+  /// 一次性识别出来的框几秒后就对不上了。保持图像流常开、每 0.1 秒重识别,
+  /// 候选框才能跟着画面走。
+  /// 注意:iOS 不允许"录像 + 取图像流"并存,所以录像开始时必须暂停。
+  Future<void> _setLiveDetect(bool on) async {
+    if (on == _liveDetect) return;
+    final cam = _cam;
+    if (on) {
+      if (cam == null || !cam.value.isInitialized) {
+        if (mounted) {
+          setState(() {
+            _liveDetect = false;
+            _hint = '相机未就绪,无法开启实时识别';
+          });
+        }
+        return;
+      }
+      setState(() {
+        _liveDetect = true;
+        _hint = '实时识别中:每 0.1 秒刷新候选目标';
+      });
+      await _resumeLive();
+    } else {
+      setState(() {
+        _liveDetect = false;
+        _candidates = const [];
+        _hint = '';
+      });
+      await _pauseLive();
+    }
+  }
+
+  /// 启动图像流与 0.1 秒定时器
+  Future<void> _resumeLive() async {
+    final cam = _cam;
+    if (cam == null || !cam.value.isInitialized) return;
+    try {
+      await cam.startImageStream((f) => _liveFrame = f);
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _liveDetect = false;
+          _hint = '无法开启实时识别: $e';
+        });
+      }
+      return;
+    }
+    _liveTimer?.cancel();
+    _liveTimer = Timer.periodic(
+      const Duration(milliseconds: 100),
+      (_) => _liveTick(),
+    );
+  }
+
+  /// 停掉图像流与定时器(录像前必须调用)
+  Future<void> _pauseLive() async {
+    _liveTimer?.cancel();
+    _liveTimer = null;
+    _liveFrame = null;
+    try {
+      await _cam?.stopImageStream();
+    } catch (_) {}
+  }
+
+  /// 每 0.1 秒跑一次:取最新帧 → 灰度 → Vision 检测 → 刷新候选框
+  Future<void> _liveTick() async {
+    if (!_liveDetect || _detecting || _recording || _busy) return;
+    final f = _liveFrame;
+    if (f == null || !mounted) return;
+    // 跨 await 前先读上下文
+    final portrait = MediaQuery.of(context).orientation == Orientation.portrait;
+    _detecting = true;
+    try {
+      final turns = (portrait && f.width > f.height) ? 1 : 0;
+      final g = _frameToGray(f, turns, 1024);
+      if (g == null) return;
+      final list = await VisionTracker.detectTargets(
+        bytes: g.$1,
+        w: g.$2,
+        h: g.$3,
+        rotationQuarterTurns: turns,
+      );
+      if (!mounted || !_liveDetect) return;
+      setState(() => _candidates = list);
+    } catch (_) {
+      // 单帧识别失败不影响下一帧
+    } finally {
+      _detecting = false;
+    }
+  }
+
+  /// 识别候选目标:单次识别(实时候选开关关闭时的备用入口)
+  // ignore: unused_element
   Future<void> _detectCandidates() async {
     if (_detecting || _recording || _busy) return;
     if (!VisionTracker.isSupported) {
@@ -1241,7 +1340,16 @@ class _CameraPageState extends State<CameraPage> {
     try {
       if (!_recording) {
         // ── 开始录像 ──
-        await cam.startVideoRecording();
+        // iOS 不允许"取图像流 + 录像"并存,必须先把实时识别停掉,
+        // 否则 startVideoRecording 会直接抛错。
+        final wasLive = _liveDetect;
+        if (wasLive) await _pauseLive();
+        try {
+          await cam.startVideoRecording();
+        } catch (e) {
+          if (wasLive) await _resumeLive();
+          rethrow;
+        }
         _timer
           ..reset()
           ..start();
@@ -1284,6 +1392,8 @@ class _CameraPageState extends State<CameraPage> {
 
         final XFile file = await cam.stopVideoRecording();
         if (mounted) setState(() => _recording = false);
+        // 录像结束,恢复实时识别
+        if (_liveDetect) unawaited(_resumeLive());
         // 快照本段数据:后台渲染期间可以继续拍摄,不能被下一段覆盖
         final samplesSnapshot = List<_HrSample>.from(_samples);
         final hadBleSnapshot = _recordHadBle;
@@ -2790,9 +2900,9 @@ class _CameraPageState extends State<CameraPage> {
                             });
                             setSheetState(() {});
                             if (v) {
-                              // 打开就先自动识别一次,让用户能直接点选候选
+                              // 打开锁定就直接进实时识别,省一次点击
                               Navigator.pop(ctx);
-                              _detectCandidates();
+                              _setLiveDetect(true);
                             }
                           },
                         ),
@@ -2803,15 +2913,17 @@ class _CameraPageState extends State<CameraPage> {
                               children: [
                                 Expanded(
                                   child: Text(
-                                    _detecting
-                                        ? '正在识别候选目标…'
-                                        : (_trackFrames > 0
-                                              ? '上次识别:$logTrack'
-                                              : (_candidates.isNotEmpty
-                                                    ? '已识别 ${_candidates.length} 个候选:点预览里的青色框'
-                                                    : (_lockBox == null
-                                                          ? '点右侧「识别候选」自动找,或直接拖拽画框'
-                                                          : '目标框已就绪(双指仍可缩放)'))),
+                                    _liveDetect
+                                        ? '实时识别中 · 每 0.1 秒刷新(${_candidates.length} 个候选)'
+                                        : (_detecting
+                                              ? '正在识别候选目标…'
+                                              : (_trackFrames > 0
+                                                    ? '上次识别:$logTrack'
+                                                    : (_candidates.isNotEmpty
+                                                          ? '识别到 ${_candidates.length} 个候选:点预览里的青色框'
+                                                          : (_lockBox == null
+                                                                ? '打开实时识别自动找,或直接拖拽画框'
+                                                                : '目标框已就绪(双指仍可缩放)')))),
                                     style: const TextStyle(
                                       color: Colors.white38,
                                       fontSize: 11,
@@ -2829,17 +2941,20 @@ class _CameraPageState extends State<CameraPage> {
                                       style: TextStyle(fontSize: 12),
                                     ),
                                   ),
-                                TextButton(
-                                  onPressed: _detecting
-                                      ? null
-                                      : () {
-                                          Navigator.pop(ctx);
-                                          _detectCandidates();
-                                        },
-                                  child: const Text(
-                                    '识别候选',
-                                    style: TextStyle(fontSize: 12),
+                                const Text(
+                                  '实时',
+                                  style: TextStyle(
+                                    color: Colors.white70,
+                                    fontSize: 12,
                                   ),
+                                ),
+                                Switch(
+                                  value: _liveDetect,
+                                  activeThumbColor: Colors.redAccent,
+                                  onChanged: (v) {
+                                    setSheetState(() {});
+                                    _setLiveDetect(v);
+                                  },
                                 ),
                               ],
                             ),
@@ -4002,6 +4117,11 @@ class _CameraPageState extends State<CameraPage> {
   @override
   void dispose() {
     _ticker?.cancel();
+    _liveTimer?.cancel();
+    _liveTimer = null;
+    try {
+      _cam?.stopImageStream();
+    } catch (_) {}
     _timer.stop();
     _stopGyroSession();
     _stabTick.dispose();
