@@ -43,7 +43,9 @@ public class VisionTrackerPlugin: NSObject, FlutterPlugin {
       return
     }
     DispatchQueue.global(qos: .userInitiated).async {
-      let out = self.detect(bytes: typed.data, w: w, h: h, rotation: rot)
+      let out = self.detect(
+        bytes: typed.data, w: w, h: h, rotation: rot,
+        textOnly: (args["textOnly"] as? Bool) ?? false)
       DispatchQueue.main.async { result(out) }
     }
   }
@@ -65,7 +67,10 @@ public class VisionTrackerPlugin: NSObject, FlutterPlugin {
   ///   * VNDetectRectanglesRequest —— 屏幕/牌子/纸面等矩形物体
   /// 返回扁平数组,每个候选 6 个值:[x, y, w, h, score, kind](归一化、左上原点)。
   /// kind: 0=文字 1=醒目区域 2=矩形
-  private func detect(bytes: Data, w: Int, h: Int, rotation: Int) -> [Double] {
+  /// [textOnly] 只跑文字检测:渲染时要按 0.1 秒跑上千次,只跑文字能省掉三分之二耗时。
+  private func detect(
+    bytes: Data, w: Int, h: Int, rotation: Int, textOnly: Bool = false
+  ) -> [Double] {
     guard w > 8, h > 8, bytes.count >= w * h,
       let provider = CGDataProvider(data: bytes as CFData),
       let img = CGImage(
@@ -93,7 +98,7 @@ public class VisionTrackerPlugin: NSObject, FlutterPlugin {
     rectReq.minimumAspectRatio = 0.2
 
     do {
-      try handler.perform([textReq, salReq, rectReq])
+      try handler.perform(textOnly ? [textReq] : [textReq, salReq, rectReq])
     } catch {
       return []
     }
