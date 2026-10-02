@@ -254,6 +254,9 @@ class _CameraPageState extends State<CameraPage> {
     super.initState();
     _initCamera();
     _loadExports(); // 启动时载入已有作品
+    // 启动就清一次临时文件:导出中途失败/被杀掉会留下几百 MB 的抽帧文件,
+    // 不主动清就会一直在手机里堆积(实测能堆到几个 GB)。
+    unawaited(_purgeWork(quiet: true));
     // 订阅心率:录像中记录时间线;屏幕历史始终累积
     widget.ble.bpmStream.listen((bpm) {
       _history.add(bpm);
@@ -954,6 +957,92 @@ class _CameraPageState extends State<CameraPage> {
     );
   }
 
+  // ─────────────── 临时文件清理(缓存)───────────────
+
+  /// 工作目录:导出过程的所有临时文件都放这里
+  Future<Directory> _workDir() async {
+    final docs = await getApplicationDocumentsDirectory();
+    return Directory('${docs.path}/work');
+  }
+
+  /// 统计并清理临时文件。返回释放的字节数。
+  /// [quiet] = true 时不改提示条(启动时静默清理)。
+  Future<int> _purgeWork({bool quiet = false}) async {
+    var freed = 0;
+    try {
+      final work = await _workDir();
+      if (work.existsSync()) {
+        for (final e in work.listSync()) {
+          try {
+            if (e is File) {
+              freed += e.lengthSync();
+              e.deleteSync();
+            } else if (e is Directory) {
+              for (final f in e.listSync(recursive: true)) {
+                if (f is File) freed += f.lengthSync();
+              }
+              e.deleteSync(recursive: true);
+            }
+          } catch (_) {}
+        }
+      }
+      // 相机插件录的原始视频也在临时目录里,导出成功才删;顺手一起清
+      final tmp = await getTemporaryDirectory();
+      if (tmp.existsSync()) {
+        for (final e in tmp.listSync()) {
+          if (e is File &&
+              (e.path.endsWith('.mp4') ||
+                  e.path.endsWith('.mov') ||
+                  e.path.endsWith('.gray'))) {
+            try {
+              freed += e.lengthSync();
+              e.deleteSync();
+            } catch (_) {}
+          }
+        }
+      }
+    } catch (_) {}
+    if (!quiet && mounted) {
+      setState(
+        () => _hint = freed <= 0
+            ? '缓存已经是干净的'
+            : '已清理缓存,释放 ${(freed / 1048576).toStringAsFixed(1)} MB',
+      );
+    }
+    return freed;
+  }
+
+  /// 当前缓存占用(供按钮显示)
+  Future<int> _cacheBytes() async {
+    var total = 0;
+    try {
+      final work = await _workDir();
+      if (work.existsSync()) {
+        for (final e in work.listSync(recursive: true)) {
+          if (e is File) {
+            try {
+              total += e.lengthSync();
+            } catch (_) {}
+          }
+        }
+      }
+      final tmp = await getTemporaryDirectory();
+      if (tmp.existsSync()) {
+        for (final e in tmp.listSync()) {
+          if (e is File &&
+              (e.path.endsWith('.mp4') ||
+                  e.path.endsWith('.mov') ||
+                  e.path.endsWith('.gray'))) {
+            try {
+              total += e.lengthSync();
+            } catch (_) {}
+          }
+        }
+      }
+    } catch (_) {}
+    return total;
+  }
+
   // ─────────────── 画面锁定:候选目标自动识别 ───────────────
 
   /// 抓一帧预览画面并转成灰度 + 缩放,供候选目标识别使用。
@@ -1499,6 +1588,9 @@ class _CameraPageState extends State<CameraPage> {
       if (mounted) setState(() => _hint = '导出失败: $e');
     } finally {
       _popRenderDialog();
+      // 无论成功、失败还是转为后台渲染,都清一次临时文件:
+      // 抽帧文件动辄几百 MB,留着就是存储泄漏。
+      unawaited(_purgeWork(quiet: true));
       await _restoreCamera();
       if (mounted) setState(() {});
       Future.delayed(const Duration(seconds: 2), () {
@@ -2571,6 +2663,41 @@ class _CameraPageState extends State<CameraPage> {
                       ),
                     ),
                     const Spacer(),
+                    // 缓存清理:导出过程的抽帧文件可能有几百 MB,而且导出失败时
+                    // 不会自动删除,必须给用户一个手动清理的入口。
+                    FutureBuilder<int>(
+                      future: _cacheBytes(),
+                      builder: (_, snap) {
+                        final mb = ((snap.data ?? 0) / 1048576);
+                        return TextButton.icon(
+                          onPressed: () async {
+                            final freed = await _purgeWork();
+                            if (ctx.mounted) Navigator.pop(ctx);
+                            if (mounted && freed > 0) {
+                              setState(
+                                () => _hint =
+                                    '已清理缓存,释放 '
+                                    '${(freed / 1048576).toStringAsFixed(1)} MB',
+                              );
+                            }
+                          },
+                          icon: const Icon(
+                            Icons.cleaning_services,
+                            size: 16,
+                            color: Colors.white70,
+                          ),
+                          label: Text(
+                            mb < 0.05
+                                ? '清理缓存'
+                                : '清理缓存 ${mb.toStringAsFixed(0)}MB',
+                            style: const TextStyle(
+                              color: Colors.white70,
+                              fontSize: 12,
+                            ),
+                          ),
+                        );
+                      },
+                    ),
                     Text(
                       '${_exports.length} 个',
                       style: const TextStyle(
