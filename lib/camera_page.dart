@@ -1782,22 +1782,35 @@ class _CameraPageState extends State<CameraPage> {
     job
       ..stage = '写出陀螺仪数据…'
       ..progress = 0.4;
-    final csv = File('$folderPath/${stamp}_gyro.csv');
+    // Gyroflow **不认普通 CSV**:它有原生格式 GCSV,解析器要求第一行必须是
+    // "GYROFLOW IMU LOG",否则直接报 IO error / unsupported file format。
+    // 之前写的是带中文注释的 CSV,所以连文件类型都没被认出来。
+    // 另外按规范:文件里存**整数原始值**,由 tscale / gscale 换算成 秒 / rad/s。
+    const tScale = 0.0001; // 时间分辨率 0.1ms
+    const gScale = 0.0001; // 角速度分辨率 1e-4 rad/s(≈0.006°/s)
+    final gcsv = File('$folderPath/${stamp}_gyro.gcsv');
     final sb = StringBuffer()
-      ..writeln('# 心率相机 陀螺仪数据')
-      ..writeln('# 时间从视频第 0 帧起算(秒);角速度单位 rad/s;轴为设备轴 x=右 y=上 z=朝屏外')
-      ..writeln('time,gx,gy,gz');
+      ..writeln('GYROFLOW IMU LOG')
+      ..writeln('version,1.3')
+      ..writeln('id,heart_rate_camera')
+      ..writeln('orientation,XYZ')
+      ..writeln('note,heart rate camera (iPhone) gyro log')
+      ..writeln('timestamp,${DateTime.now().millisecondsSinceEpoch ~/ 1000}')
+      ..writeln('videofilename,${stamp}_原始.mp4')
+      ..writeln('tscale,$tScale')
+      ..writeln('gscale,$gScale')
+      ..writeln('t,gx,gy,gz');
     final dur = stabEndEpoch - stabStartEpoch;
     for (final s in stabGyro) {
       final t = s[0] - stabStartEpoch;
       if (t < -0.2 || t > dur + 0.2) continue;
       sb.writeln(
-        '${t.toStringAsFixed(5)},'
-        '${s[1].toStringAsFixed(6)},${s[2].toStringAsFixed(6)},'
-        '${s[3].toStringAsFixed(6)}',
+        '${(t / tScale).round()},'
+        '${(s[1] / gScale).round()},${(s[2] / gScale).round()},'
+        '${(s[3] / gScale).round()}',
       );
     }
-    csv.writeAsStringSync(sb.toString());
+    gcsv.writeAsStringSync(sb.toString());
 
     // 3) 心率透明视频:数字 + 曲线,透明背景,整帧分辨率,30fps
     String? hrPath;
@@ -1986,11 +1999,11 @@ class _CameraPageState extends State<CameraPage> {
     // (Gyroflow 桌面版 / 剪映)。理由:Gyroflow 有相机配置(畸变、卷帘、
     // 轴向、时间对齐)、用 GPU 逐帧重投影,精度不是应用内简化模型能比的;
     // 我们把自己定位在"采集 + 心率渲染"更实在。
-    //   只开稳定        → 原始视频 + 陀螺仪数据 CSV
+    //   只开稳定        → 原始视频 + 陀螺仪数据 GCSV
     //   稳定 + 心率      → 上面两份 + 心率透明视频(ProRes 4444 带 alpha)
     //   只开心率        → 走下面原有逻辑(直接烧录),不变
-    // 另外:开启了稳定时**仍然继续生成一份应用内稳定的成片**,
-    // 方便你直接把两边结果对比(代价是导出时间变长)。
+    // 注意:材料模式下**成片本身不做稳定**(稳定交给 Gyroflow),
+    // 所以不会再额外生成一份应用内稳定的版本。
     final bool materialMode =
         stabGyro.length >= 4 && stabEndEpoch > stabStartEpoch;
     if (materialMode) {
@@ -2006,11 +2019,8 @@ class _CameraPageState extends State<CameraPage> {
         fallbackDuration: fallbackDuration,
         job: job,
       );
-      // 材料已出,接着生成应用内稳定成片(换一个文件名,不覆盖原始视频)
-      saved = '${folder.path}/${stamp}_稳定.mp4';
-      job
-        ..stage = '生成稳定成片…'
-        ..progress = 0.02;
+      // 只出素材:成片里不做稳定(稳定交给 Gyroflow),所以到此为止
+      return;
     }
 
     // 1) 解析原视频尺寸与时长(字幕坐标需要像素尺寸)
