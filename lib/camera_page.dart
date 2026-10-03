@@ -193,6 +193,8 @@ class _CameraPageState extends State<CameraPage> {
 
   // ── 画面锁定(目标跟踪稳定)──
   bool _lockEnabled = false; // 开关:是否启用画面识别锁定
+  /// 导出模式:false = 应用内稳定成片(原逻辑);true = 只输出素材给 Gyroflow
+  bool _materialExport = false;
   // 用户画的框,归一化到"预览里显示的那幅图"的坐标(0~1)。
   // 该图与成片是同一幅画面(同比例、同朝向),所以能直接映射到成片中。
   Rect? _lockBox;
@@ -877,34 +879,34 @@ class _CameraPageState extends State<CameraPage> {
                       ),
                     ),
                     const SizedBox(height: 16),
-                    const Text(
-                      '画质',
-                      style: TextStyle(color: Colors.white70, fontSize: 13),
+                    // 画质:由"低中高"按钮改成滑块(按档位吸附拖动)
+                    Row(
+                      children: [
+                        const Text(
+                          '画质',
+                          style: TextStyle(color: Colors.white70, fontSize: 13),
+                        ),
+                        const Spacer(),
+                        Text(
+                          '$_qualityLabel $_qualityFpsHint',
+                          style: const TextStyle(
+                            color: Colors.redAccent,
+                            fontSize: 12,
+                          ),
+                        ),
+                      ],
                     ),
-                    const SizedBox(height: 8),
-                    Wrap(
-                      spacing: 8,
-                      runSpacing: 8,
-                      children: _qualityOptions.map((q) {
-                        final sel = q.$1 == _quality;
-                        return ChoiceChip(
-                          label: Text(
-                            '${q.$2} ${q.$3}',
-                            style: TextStyle(
-                              fontSize: 12,
-                              color: sel ? Colors.black : Colors.white,
-                            ),
-                          ),
-                          selected: sel,
-                          selectedColor: Colors.redAccent,
-                          backgroundColor: Colors.black,
-                          side: BorderSide(
-                            color: sel ? Colors.redAccent : Colors.white24,
-                          ),
-                          onSelected: (_) =>
-                              setSheetState(() => _quality = q.$1),
-                        );
-                      }).toList(),
+                    Slider(
+                      value: _qualityIndex.toDouble(),
+                      min: 0,
+                      max: (_qualityOptions.length - 1).toDouble(),
+                      divisions: _qualityOptions.length - 1,
+                      activeColor: Colors.redAccent,
+                      inactiveColor: Colors.white24,
+                      label: _qualityLabel,
+                      onChanged: (v) => setSheetState(
+                        () => _quality = _qualityOptions[v.round()].$1,
+                      ),
                     ),
                     const SizedBox(height: 16),
                     const Text(
@@ -2005,7 +2007,9 @@ class _CameraPageState extends State<CameraPage> {
     // 注意:材料模式下**成片本身不做稳定**(稳定交给 Gyroflow),
     // 所以不会再额外生成一份应用内稳定的版本。
     final bool materialMode =
-        stabGyro.length >= 4 && stabEndEpoch > stabStartEpoch;
+        _materialExport &&
+        stabGyro.length >= 4 &&
+        stabEndEpoch > stabStartEpoch;
     if (materialMode) {
       await _exportMaterials(
         raw: raw,
@@ -3372,6 +3376,35 @@ class _CameraPageState extends State<CameraPage> {
                         const Divider(color: Colors.white12, height: 1),
                         SwitchListTile(
                           contentPadding: EdgeInsets.zero,
+                          value: _materialExport,
+                          activeThumbColor: Colors.redAccent,
+                          title: const Text(
+                            '只输出素材(Gyroflow 模式)',
+                            style: TextStyle(color: Colors.white, fontSize: 15),
+                          ),
+                          subtitle: Text(
+                            _materialExport
+                                ? '导出:原始视频 + 陀螺仪 .gcsv(+ 心率透明视频);'
+                                      '应用内不做稳定'
+                                : '导出:应用内稳定成片(心率直接烧录)',
+                            style: const TextStyle(
+                              color: Colors.white38,
+                              fontSize: 11,
+                            ),
+                          ),
+                          onChanged: (v) {
+                            setState(() {
+                              _materialExport = v;
+                              _hint = v
+                                  ? '已切换为素材模式:导出原始视频 + 陀螺仪数据,'
+                                        '稳定交给 Gyroflow'
+                                  : '已切换为成片模式:导出应用内稳定好的视频';
+                            });
+                            setSheetState(() {});
+                          },
+                        ),
+                        SwitchListTile(
+                          contentPadding: EdgeInsets.zero,
                           value: _lockEnabled,
                           activeThumbColor: Colors.redAccent,
                           title: const Text(
@@ -4605,6 +4638,22 @@ class _CameraPageState extends State<CameraPage> {
         ],
       ),
     );
+  }
+
+  /// 当前画质档位在选项表里的下标(滑块用)
+  int get _qualityIndex {
+    for (var i = 0; i < _qualityOptions.length; i++) {
+      if (_qualityOptions[i].$1 == _quality) return i;
+    }
+    return 0;
+  }
+
+  /// 当前画质档位的说明文字(如 "1080p 30fps")
+  String get _qualityFpsHint {
+    for (final q in _qualityOptions) {
+      if (q.$1 == _quality) return q.$3;
+    }
+    return '';
   }
 
   /// 当前画质档位的中文名(供顶栏显示)
