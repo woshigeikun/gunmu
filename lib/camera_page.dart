@@ -879,34 +879,34 @@ class _CameraPageState extends State<CameraPage> {
                       ),
                     ),
                     const SizedBox(height: 16),
-                    // 画质:由"低中高"按钮改成滑块(按档位吸附拖动)
-                    Row(
-                      children: [
-                        const Text(
-                          '画质',
-                          style: TextStyle(color: Colors.white70, fontSize: 13),
-                        ),
-                        const Spacer(),
-                        Text(
-                          '$_qualityLabel $_qualityFpsHint',
-                          style: const TextStyle(
-                            color: Colors.redAccent,
-                            fontSize: 12,
-                          ),
-                        ),
-                      ],
+                    const Text(
+                      '画质',
+                      style: TextStyle(color: Colors.white70, fontSize: 13),
                     ),
-                    Slider(
-                      value: _qualityIndex.toDouble(),
-                      min: 0,
-                      max: (_qualityOptions.length - 1).toDouble(),
-                      divisions: _qualityOptions.length - 1,
-                      activeColor: Colors.redAccent,
-                      inactiveColor: Colors.white24,
-                      label: _qualityLabel,
-                      onChanged: (v) => setSheetState(
-                        () => _quality = _qualityOptions[v.round()].$1,
-                      ),
+                    const SizedBox(height: 8),
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: _qualityOptions.map((q) {
+                        final sel = q.$1 == _quality;
+                        return ChoiceChip(
+                          label: Text(
+                            '${q.$2} ${q.$3}',
+                            style: TextStyle(
+                              fontSize: 12,
+                              color: sel ? Colors.black : Colors.white,
+                            ),
+                          ),
+                          selected: sel,
+                          selectedColor: Colors.redAccent,
+                          backgroundColor: Colors.black,
+                          side: BorderSide(
+                            color: sel ? Colors.redAccent : Colors.white24,
+                          ),
+                          onSelected: (_) =>
+                              setSheetState(() => _quality = q.$1),
+                        );
+                      }).toList(),
                     ),
                     const SizedBox(height: 16),
                     const Text(
@@ -3535,38 +3535,38 @@ class _CameraPageState extends State<CameraPage> {
                                   fontSize: 12,
                                 ),
                               ),
-                              const SizedBox(width: 10),
-                              ...[(0.6, '柔和'), (1.0, '标准'), (1.6, '强')].map((
-                                o,
-                              ) {
-                                final sel = (_stabStrength - o.$1).abs() < 0.01;
-                                return Padding(
-                                  padding: const EdgeInsets.only(right: 6),
-                                  child: ChoiceChip(
-                                    label: Text(
-                                      o.$2,
-                                      style: TextStyle(
-                                        fontSize: 11,
-                                        color: sel
-                                            ? Colors.black
-                                            : Colors.white,
-                                      ),
-                                    ),
-                                    selected: sel,
-                                    selectedColor: Colors.redAccent,
-                                    backgroundColor: Colors.black,
-                                    side: BorderSide(
-                                      color: sel
-                                          ? Colors.redAccent
-                                          : Colors.white24,
-                                    ),
-                                    onSelected: (_) => setSheetState(
-                                      () => _stabStrength = o.$1,
-                                    ),
-                                  ),
-                                );
-                              }),
+                              const Spacer(),
+                              Text(
+                                '$_stabStrengthName ×'
+                                '${_stabStrength.toStringAsFixed(1)}',
+                                style: const TextStyle(
+                                  color: Colors.redAccent,
+                                  fontSize: 11,
+                                ),
+                              ),
                             ],
+                          ),
+                          // 稳定强度:连续滑块。它同时决定补偿增益、裁切余量,
+                          // 以及是否启用横滚(≥1.6 时开地平线锁定)。
+                          Slider(
+                            value: _stabStrength.clamp(0.4, 2.5),
+                            min: 0.4,
+                            max: 2.5,
+                            divisions: 21,
+                            activeColor: Colors.redAccent,
+                            inactiveColor: Colors.white24,
+                            label: _stabStrengthName,
+                            onChanged: (v) =>
+                                setSheetState(() => _stabStrength = v),
+                          ),
+                          Text(
+                            '裁切 '
+                            '${GyroStabilizer.zoomForMargin(GyroStabilizer.marginFor(_stabStrength)).toStringAsFixed(2)}x'
+                            '${_stabStrength >= 1.6 ? ' · 含地平线锁定' : ''}',
+                            style: const TextStyle(
+                              color: Colors.white38,
+                              fontSize: 10,
+                            ),
                           ),
                           const SizedBox(height: 10),
                           SizedBox(
@@ -4640,7 +4640,17 @@ class _CameraPageState extends State<CameraPage> {
     );
   }
 
-  /// 当前画质档位在选项表里的下标(滑块用)
+  /// 稳定强度的档位名(滑块位置 → 直观说法)
+  String get _stabStrengthName {
+    final s = _stabStrength;
+    if (s < 0.8) return '柔和';
+    if (s < 1.3) return '标准';
+    if (s < 1.9) return '强';
+    return '激进';
+  }
+
+  /// 当前画质档位在选项表里的下标(备查)
+  // ignore: unused_element
   int get _qualityIndex {
     for (var i = 0; i < _qualityOptions.length; i++) {
       if (_qualityOptions[i].$1 == _quality) return i;
@@ -4649,6 +4659,7 @@ class _CameraPageState extends State<CameraPage> {
   }
 
   /// 当前画质档位的说明文字(如 "1080p 30fps")
+  // ignore: unused_element
   String get _qualityFpsHint {
     for (final q in _qualityOptions) {
       if (q.$1 == _quality) return q.$3;
