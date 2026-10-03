@@ -1762,9 +1762,8 @@ class _CameraPageState extends State<CameraPage> {
   /// 材料模式导出:原始视频 + 陀螺仪数据 CSV(+ 心率透明视频)
   Future<void> _exportMaterials({
     required XFile raw,
-    required String saved,
     required int stamp,
-    required Directory docs,
+    required String folderPath,
     required bool hadBle,
     required List<_HrSample> samples,
     required List<List<double>> stabGyro,
@@ -1777,14 +1776,13 @@ class _CameraPageState extends State<CameraPage> {
     job
       ..stage = '保存原始视频…'
       ..progress = 0.15;
-    await raw.saveTo(saved);
+    await raw.saveTo('$folderPath/${stamp}_原始.mp4');
 
     // 2) 陀螺仪数据 CSV:Gyroflow 等工具可直接导入
     job
       ..stage = '写出陀螺仪数据…'
       ..progress = 0.4;
-    final base = saved.substring(0, saved.length - 4);
-    final csv = File('${base}_gyro.csv');
+    final csv = File('$folderPath/${stamp}_gyro.csv');
     final sb = StringBuffer()
       ..writeln('# 心率相机 陀螺仪数据')
       ..writeln('# 时间从视频第 0 帧起算(秒);角速度单位 rad/s;轴为设备轴 x=右 y=上 z=朝屏外')
@@ -1808,7 +1806,7 @@ class _CameraPageState extends State<CameraPage> {
         ..stage = '生成心率透明视频…'
         ..progress = 0.45;
       hrPath = await _renderHrOverlayVideo(
-        docs: docs,
+        folderPath: folderPath,
         stamp: stamp,
         fallbackDuration: fallbackDuration,
         samples: samples,
@@ -1832,7 +1830,7 @@ class _CameraPageState extends State<CameraPage> {
   /// 用 ProRes 4444 是因为它是剪辑软件(剪映/达芬奇/Premiere)对透明通道
   /// 支持最可靠的格式;H.264 无法承载 alpha 通道。
   Future<String?> _renderHrOverlayVideo({
-    required Directory docs,
+    required String folderPath,
     required int stamp,
     required double fallbackDuration,
     required List<_HrSample> samples,
@@ -1861,6 +1859,7 @@ class _CameraPageState extends State<CameraPage> {
       height = t;
     }
 
+    final docs = await getApplicationDocumentsDirectory();
     final work = Directory('${docs.path}/work/${stamp}_hr');
     if (work.existsSync()) work.deleteSync(recursive: true);
     work.createSync(recursive: true);
@@ -1886,7 +1885,7 @@ class _CameraPageState extends State<CameraPage> {
       job.progress = 0.45 + 0.35 * (f + 1) / frames;
     }
 
-    final out = '${docs.path}/录像/${stamp}_心率.mov';
+    final out = '$folderPath/${stamp}_心率.mov';
     final ok = await _runFfmpeg(
       '-y -loglevel error -framerate 1 -i "${work.path}/hr_%04d.png" '
       '-vf "fps=30" -c:v prores_ks -profile:v 4444 -pix_fmt yuva444p10le '
@@ -1980,7 +1979,7 @@ class _CameraPageState extends State<CameraPage> {
     final folder = Directory('${docs.path}/录像');
     if (!folder.existsSync()) folder.createSync(recursive: true);
     final stamp = DateTime.now().millisecondsSinceEpoch;
-    final saved = '${folder.path}/$stamp.mp4';
+    String saved = '${folder.path}/$stamp.mp4';
 
     // ── 材料模式(开启稳定时)─────────────────────────────
     // 开启稳定 = 采集端模式:只输出素材,稳定与合成交给外部工具
@@ -1990,14 +1989,15 @@ class _CameraPageState extends State<CameraPage> {
     //   只开稳定        → 原始视频 + 陀螺仪数据 CSV
     //   稳定 + 心率      → 上面两份 + 心率透明视频(ProRes 4444 带 alpha)
     //   只开心率        → 走下面原有逻辑(直接烧录),不变
+    // 另外:开启了稳定时**仍然继续生成一份应用内稳定的成片**,
+    // 方便你直接把两边结果对比(代价是导出时间变长)。
     final bool materialMode =
         stabGyro.length >= 4 && stabEndEpoch > stabStartEpoch;
     if (materialMode) {
       await _exportMaterials(
         raw: raw,
-        saved: saved,
         stamp: stamp,
-        docs: docs,
+        folderPath: folder.path,
         hadBle: hadBle,
         samples: samples,
         stabGyro: stabGyro,
@@ -2006,7 +2006,11 @@ class _CameraPageState extends State<CameraPage> {
         fallbackDuration: fallbackDuration,
         job: job,
       );
-      return;
+      // 材料已出,接着生成应用内稳定成片(换一个文件名,不覆盖原始视频)
+      saved = '${folder.path}/${stamp}_稳定.mp4';
+      job
+        ..stage = '生成稳定成片…'
+        ..progress = 0.02;
     }
 
     // 1) 解析原视频尺寸与时长(字幕坐标需要像素尺寸)
