@@ -1759,6 +1759,210 @@ class _CameraPageState extends State<CameraPage> {
   }
 
   /// 实际渲染:无心率直接保存原视频;有心率则烧字幕 + 曲线
+  /// 材料模式导出:原始视频 + 陀螺仪数据 CSV(+ 心率透明视频)
+  Future<void> _exportMaterials({
+    required XFile raw,
+    required String saved,
+    required int stamp,
+    required Directory docs,
+    required bool hadBle,
+    required List<_HrSample> samples,
+    required List<List<double>> stabGyro,
+    required double stabStartEpoch,
+    required double stabEndEpoch,
+    required double fallbackDuration,
+    required RenderJob job,
+  }) async {
+    // 1) 原始视频原样保存(不重编码 → 秒级完成,也不会有二次压缩损失)
+    job
+      ..stage = '保存原始视频…'
+      ..progress = 0.15;
+    await raw.saveTo(saved);
+
+    // 2) 陀螺仪数据 CSV:Gyroflow 等工具可直接导入
+    job
+      ..stage = '写出陀螺仪数据…'
+      ..progress = 0.4;
+    final base = saved.substring(0, saved.length - 4);
+    final csv = File('${base}_gyro.csv');
+    final sb = StringBuffer()
+      ..writeln('# 心率相机 陀螺仪数据')
+      ..writeln('# 时间从视频第 0 帧起算(秒);角速度单位 rad/s;轴为设备轴 x=右 y=上 z=朝屏外')
+      ..writeln('time,gx,gy,gz');
+    final dur = stabEndEpoch - stabStartEpoch;
+    for (final s in stabGyro) {
+      final t = s[0] - stabStartEpoch;
+      if (t < -0.2 || t > dur + 0.2) continue;
+      sb.writeln(
+        '${t.toStringAsFixed(5)},'
+        '${s[1].toStringAsFixed(6)},${s[2].toStringAsFixed(6)},'
+        '${s[3].toStringAsFixed(6)}',
+      );
+    }
+    csv.writeAsStringSync(sb.toString());
+
+    // 3) 心率透明视频:数字 + 曲线,透明背景,整帧分辨率,30fps
+    String? hrPath;
+    if (hadBle && samples.where((s) => s.bpm > 0).length >= 2) {
+      job
+        ..stage = '生成心率透明视频…'
+        ..progress = 0.45;
+      hrPath = await _renderHrOverlayVideo(
+        docs: docs,
+        stamp: stamp,
+        fallbackDuration: fallbackDuration,
+        samples: samples,
+        rawPath: raw.path,
+        job: job,
+      );
+    }
+
+    job.progress = 1.0;
+    if (mounted) {
+      setState(
+        () => _hint =
+            '已输出素材:原始视频 + 陀螺仪数据'
+            '${hrPath != null ? ' + 心率透明视频' : ''}'
+            ' · 点顶部文件夹查看',
+      );
+    }
+  }
+
+  /// 渲染心率透明视频:逐秒画一张**透明背景**的整帧 PNG,再编码成带 alpha 的 MOV。
+  /// 用 ProRes 4444 是因为它是剪辑软件(剪映/达芬奇/Premiere)对透明通道
+  /// 支持最可靠的格式;H.264 无法承载 alpha 通道。
+  Future<String?> _renderHrOverlayVideo({
+    required Directory docs,
+    required int stamp,
+    required double fallbackDuration,
+    required List<_HrSample> samples,
+    required String rawPath,
+    required RenderJob job,
+  }) async {
+    // 尺寸与朝向:和成片保持一致(竖屏录制则转成竖向)
+    var width = 1080, height = 1920;
+    double durationSec = fallbackDuration <= 0 ? 1.0 : fallbackDuration;
+    try {
+      final info = await FFprobeKit.getMediaInformation(rawPath);
+      final mi = info.getMediaInformation();
+      for (final s in mi?.getStreams() ?? const []) {
+        if (s.getType() == 'video') {
+          width = s.getWidth() ?? width;
+          height = s.getHeight() ?? height;
+        }
+      }
+      final d = mi?.getDuration();
+      final parsed = d != null ? double.tryParse(d) : null;
+      if (parsed != null && parsed > 0) durationSec = parsed;
+    } catch (_) {}
+    if (_recordPortrait && width > height) {
+      final t = width;
+      width = height;
+      height = t;
+    }
+
+    final work = Directory('${docs.path}/work/${stamp}_hr');
+    if (work.existsSync()) work.deleteSync(recursive: true);
+    work.createSync(recursive: true);
+    final pts = samples.where((s) => s.bpm > 0).toList();
+    if (pts.isEmpty) return null;
+    final frames = durationSec.ceil() + 1;
+    var idx = 0;
+    for (var f = 0; f < frames; f++) {
+      final ms = (f * 1000).clamp(0, (durationSec * 1000).round());
+      while (idx + 1 < pts.length && pts[idx + 1].ms <= ms) {
+        idx++;
+      }
+      final img = await _renderHrOverlayFrame(
+        width,
+        height,
+        ms,
+        curBpm: pts[idx].bpm.toDouble(),
+        samples: samples,
+      );
+      final data = await img.toByteData(format: ui.ImageByteFormat.png);
+      File('${work.path}/hr_${f.toString().padLeft(4, '0')}.png')
+          .writeAsBytesSync(data!.buffer.asUint8List());
+      job.progress = 0.45 + 0.35 * (f + 1) / frames;
+    }
+
+    final out = '${docs.path}/录像/${stamp}_心率.mov';
+    final ok = await _runFfmpeg(
+      '-y -loglevel error -framerate 1 -i "${work.path}/hr_%04d.png" '
+      '-vf "fps=30" -c:v prores_ks -profile:v 4444 -pix_fmt yuva444p10le '
+      '"$out"',
+      durationSec,
+      job,
+    );
+    try {
+      work.deleteSync(recursive: true);
+    } catch (_) {}
+    return ok ? out : null;
+  }
+
+  /// 画一张透明背景的整帧:心率数字(红字黑描边)+ 心率曲线
+  Future<ui.Image> _renderHrOverlayFrame(
+    int w,
+    int h,
+    int ms, {
+    required double curBpm,
+    required List<_HrSample> samples,
+  }) async {
+    final rec = ui.PictureRecorder();
+    final canvas = Canvas(rec);
+    // 故意不填背景 → 输出带 alpha 通道的透明帧
+    final fontSize = (h * 0.045).round().clamp(24, 200);
+    const marginRight = 30.0;
+    const marginTop = 40.0;
+    final curW = (fontSize * 3.0).round().clamp(80, 720);
+    final curH = (fontSize * 1.35).round().clamp(32, 320);
+    final curX = (w - marginRight - curW).round();
+    final curY = (marginTop + fontSize * 1.12).round();
+    final curveImg = await _renderCurveFrame(
+      curW,
+      curH,
+      ms,
+      curBpm: curBpm,
+      samples: samples,
+    );
+    canvas.drawImage(
+      curveImg,
+      Offset(curX.toDouble(), curY.toDouble()),
+      Paint(),
+    );
+    // 数字:先黑描边后红填充(和烧录版观感一致)
+    final label = '♥ ${curBpm.round()}';
+    final outline = TextPainter(
+      text: TextSpan(
+        text: label,
+        style: TextStyle(
+          fontSize: fontSize.toDouble(),
+          fontWeight: FontWeight.bold,
+          foreground: Paint()
+            ..style = PaintingStyle.stroke
+            ..strokeWidth = 4
+            ..color = Colors.black,
+        ),
+      ),
+      textDirection: TextDirection.ltr,
+    )..layout();
+    final fill = TextPainter(
+      text: TextSpan(
+        text: label,
+        style: TextStyle(
+          fontSize: fontSize.toDouble(),
+          fontWeight: FontWeight.bold,
+          color: const Color(0xFFFF3B30),
+        ),
+      ),
+      textDirection: TextDirection.ltr,
+    )..layout();
+    final tx = (w - marginRight - fill.width).clamp(0.0, w - fill.width);
+    outline.paint(canvas, Offset(tx, marginTop));
+    fill.paint(canvas, Offset(tx, marginTop));
+    return rec.endRecording().toImage(w, h);
+  }
+
   Future<void> _renderVideo({
     required XFile raw,
     required List<_HrSample> samples,
@@ -1777,6 +1981,33 @@ class _CameraPageState extends State<CameraPage> {
     if (!folder.existsSync()) folder.createSync(recursive: true);
     final stamp = DateTime.now().millisecondsSinceEpoch;
     final saved = '${folder.path}/$stamp.mp4';
+
+    // ── 材料模式(开启稳定时)─────────────────────────────
+    // 开启稳定 = 采集端模式:只输出素材,稳定与合成交给外部工具
+    // (Gyroflow 桌面版 / 剪映)。理由:Gyroflow 有相机配置(畸变、卷帘、
+    // 轴向、时间对齐)、用 GPU 逐帧重投影,精度不是应用内简化模型能比的;
+    // 我们把自己定位在"采集 + 心率渲染"更实在。
+    //   只开稳定        → 原始视频 + 陀螺仪数据 CSV
+    //   稳定 + 心率      → 上面两份 + 心率透明视频(ProRes 4444 带 alpha)
+    //   只开心率        → 走下面原有逻辑(直接烧录),不变
+    final bool materialMode =
+        stabGyro.length >= 4 && stabEndEpoch > stabStartEpoch;
+    if (materialMode) {
+      await _exportMaterials(
+        raw: raw,
+        saved: saved,
+        stamp: stamp,
+        docs: docs,
+        hadBle: hadBle,
+        samples: samples,
+        stabGyro: stabGyro,
+        stabStartEpoch: stabStartEpoch,
+        stabEndEpoch: stabEndEpoch,
+        fallbackDuration: fallbackDuration,
+        job: job,
+      );
+      return;
+    }
 
     // 1) 解析原视频尺寸与时长(字幕坐标需要像素尺寸)
     job
@@ -2707,7 +2938,11 @@ class _CameraPageState extends State<CameraPage> {
       final files = folder
           .listSync()
           .whereType<File>()
-          .where((f) => f.path.toLowerCase().endsWith('.mp4'))
+          .where(
+            (f) =>
+                f.path.toLowerCase().endsWith('.mp4') ||
+                f.path.toLowerCase().endsWith('.mov'),
+          )
           .toList();
       files.sort(
         (a, b) => b.statSync().modified.compareTo(a.statSync().modified),
