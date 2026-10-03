@@ -1878,6 +1878,41 @@ class _CameraPageState extends State<CameraPage> {
       } catch (_) {}
     }
 
+    // 1.45) 时空对齐:用画面识别的**绝对轨迹**检验并校正陀螺仪
+    //   * 时间偏移 τ:两条时间线没对齐时,高频补偿会施加在错误的时刻,
+    //     不只是"补不够",而是可能把抖动放大 —— 这是最容易被忽略的误差源
+    //   * 焦距尺度 s:陀螺仪测角度、视觉测像素,相除等于用拍摄过程自身标定焦距
+    var alignInfo = '';
+    if (anchors != null && anchors.isNotEmpty && plan != null && plan.usable) {
+      try {
+        final fit = _alignGyroToVision(
+          anchors: anchors,
+          plan: plan,
+          trackW: kTrackWidth,
+          outW: width,
+        );
+        if (fit != null) {
+          alignInfo = fit.info;
+          // 偏移或尺度明显偏离,就用修正后的参数重算整套方案
+          if (fit.tau.abs() >= 0.005 || (fit.scale - 1).abs() >= 0.02) {
+            final corrected = GyroStabilizer.analyze(
+              samples: stabGyro,
+              startEpoch: stabStartEpoch + fit.tau,
+              endEpoch: stabEndEpoch,
+              frameW: width.toDouble(),
+              frameH: height.toDouble(),
+              fovDeg: stabFov,
+              strength: stabStrength,
+              curveStep: 1 / 60,
+              roll: stabStrength >= 1.6,
+              camZoom: _recordZoom * fit.scale,
+            );
+            if (corrected.usable) plan = corrected;
+          }
+        }
+      } catch (_) {}
+    }
+
     // 1.4) 画面锁定:跟踪出目标轨迹(必须在方向判定之后,因为抽帧要跟着转置;
     //      也必须在陀螺仪分析之后,因为要用它当先验)
     List<List<double>>? lockXY;
@@ -2021,7 +2056,8 @@ class _CameraPageState extends State<CameraPage> {
             '逐帧 60Hz($n 点) · '
             '陀螺仪 ${stabGyro.length} 条'
             '${lockX != null ? ' · $logTrack' : ''}'
-            '${ckInfo.isEmpty ? '' : ' · $ckInfo'}';
+            '${ckInfo.isEmpty ? '' : ' · $ckInfo'}'
+            '${alignInfo.isEmpty ? '' : ' · $alignInfo'}';
       }
       if (stabPrefix.isEmpty && stabPrefixExpr.isEmpty) {
         job.stabInfo = '陀螺仪数据不足(${stabGyro.length} 条),未应用运动稳定';
@@ -2392,6 +2428,81 @@ class _CameraPageState extends State<CameraPage> {
       info:
           '逐帧候选 $count 帧 · 命中 $ckFrames · '
           '最高相似 ${bestSeen.toStringAsFixed(2)} · 锚点 ${anchors.length}',
+    );
+  }
+
+  /// 陀螺仪 ↔ 画面 自动对齐:求**时间偏移**与**焦距尺度**。
+  ///
+  /// 为什么必须用"画面识别"的轨迹来标定,而不能用跟踪器的输出:
+  /// 跟踪器每帧的搜索窗口是被"陀螺仪先验"约束住的(±3px)。拿一个被先验
+  /// 约束出来的轨迹去拟合先验,结果必然是 τ=0、尺度=1 —— 自我实现,毫无信息。
+  /// 而每 0.1 秒的文字候选重检测只看画面、不看陀螺仪,是**绝对测量**,
+  /// 才能反过来检验陀螺仪。
+  ///
+  /// 做法:把"视觉测出的目标位移"与"陀螺仪算出的位移"做互相关求时间偏移,
+  /// 再用最小二乘拟合两者幅度比 —— 比值就是焦距的修正系数
+  /// (陀螺仪测角度、视觉测像素,两者相除等于用拍摄过程本身做标定)。
+  ({double tau, double scale, double corr, String info})? _alignGyroToVision({
+    required List<List<double>> anchors,
+    required StabPlan plan,
+    required int trackW,
+    required int outW,
+  }) {
+    if (anchors.length < 8 || plan.dx.length < 4) return null;
+    final k = outW / trackW; // 跟踪帧像素 → 成片像素
+    final vs = <List<double>>[];
+    double? x0, y0;
+    for (final a in anchors) {
+      if (a.length < 5) continue;
+      final t = a[0] / kTrackFps;
+      final cx = (a[1] + a[3] / 2) * k;
+      final cy = (a[2] + a[4] / 2) * k;
+      x0 ??= cx;
+      y0 ??= cy;
+      vs.add(<double>[t, cx - x0, cy - y0]);
+    }
+    if (vs.length < 8) return null;
+    // 陀螺仪:目标在原始帧里的位移 = -D(画面内容移动了 -D)
+    final gx = plan.dx.map((e) => <double>[e[0], -e[1]]).toList();
+
+    var bestTau = 0.0;
+    var bestR = -2.0;
+    for (var i = -50; i <= 50; i++) {
+      final tau = i * 0.01; // ±0.5 秒,10ms 步进
+      final n = vs.length;
+      var sa = 0.0, sb = 0.0, sab = 0.0, saa = 0.0, sbb = 0.0;
+      for (final v in vs) {
+        final a = v[1];
+        final b = TargetTracker.interp(gx, v[0] + tau);
+        sa += a;
+        sb += b;
+        sab += a * b;
+        saa += a * a;
+        sbb += b * b;
+      }
+      final num = n * sab - sa * sb;
+      final den = math.sqrt((n * saa - sa * sa) * (n * sbb - sb * sb));
+      final r = den < 1e-9 ? 0.0 : num / den;
+      if (r > bestR) {
+        bestR = r;
+        bestTau = tau;
+      }
+    }
+    // 尺度:最小二乘 V ≈ s·G(负值说明方向反了,是重要发现)
+    var sgv = 0.0, sgg = 0.0;
+    for (final v in vs) {
+      final b = TargetTracker.interp(gx, v[0] + bestTau);
+      sgv += v[1] * b;
+      sgg += b * b;
+    }
+    final scale = sgg < 1e-6 ? 1.0 : (sgv / sgg).clamp(0.25, 4.0);
+    return (
+      tau: bestTau,
+      scale: scale,
+      corr: bestR,
+      info:
+          '对齐 τ=${(bestTau * 1000).round()}ms · 相关 ${bestR.toStringAsFixed(2)}'
+          ' · 焦距×${scale.toStringAsFixed(2)}',
     );
   }
 
