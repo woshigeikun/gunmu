@@ -122,6 +122,9 @@ class GyroStabilizer {
     double curveStep = 0.2,
     double? margin,
     bool roll = false,
+    // 录制时的相机放大倍数。放大后等效焦距按倍数增长,同样的抖动产生的
+    // 像素位移也按倍数增长 —— 不乘这一项,补偿量就只剩应有值的一半。
+    double camZoom = 1.0,
   }) {
     final m = (margin ?? marginFor(strength)).clamp(0.02, 0.16);
     final maxShiftXPx = m * frameW;
@@ -180,7 +183,8 @@ class GyroStabilizer {
     }
 
     // 3) 修正角 → 像素位移 / 横滚角,并硬限制在预算内
-    final f = focalPx(frameW, frameH, fovDeg);
+    // 焦距 × 放大倍数:放大 z 倍 ⇒ 等效焦距 z 倍 ⇒ 同样的角度产生 z 倍像素位移
+    final f = focalPx(frameW, frameH, fovDeg) * camZoom.clamp(1.0, 8.0);
     final dxs = List<double>.filled(ts.length, 0);
     final dys = List<double>.filled(ts.length, 0);
     final rls = List<double>.filled(ts.length, 0);
@@ -198,7 +202,10 @@ class GyroStabilizer {
       if (useRoll) {
         // 横滚(地平线锁定):绕光轴把画面转回来。
         // 上限 3°:再歪就不是手抖而是有意倾斜,硬掰会让人物跟着歪。
-        final cr = ((rawZ[i] - smZ[i]) * strength).clamp(-maxRollRad, maxRollRad);
+        final cr = ((rawZ[i] - smZ[i]) * strength).clamp(
+          -maxRollRad,
+          maxRollRad,
+        );
         rls[i] = cr;
         maxR = math.max(maxR, cr.abs());
       }
@@ -225,11 +232,8 @@ class GyroStabilizer {
     }
 
     // 5) 裁切倍率 = 位移余量 × 横滚覆盖(旋转会切掉四角,必须额外放大盖住)
-    final zoom =
-        (zoomForMargin(m) * rollCoverage(maxR, frameW, frameH) * 1.005).clamp(
-          1.0,
-          1.6,
-        );
+    final zoom = (zoomForMargin(m) * rollCoverage(maxR, frameW, frameH) * 1.005)
+        .clamp(1.0, 1.6);
 
     return StabPlan(
       dx: dxCurve,
