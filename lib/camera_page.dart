@@ -188,6 +188,8 @@ class _CameraPageState extends State<CameraPage> {
   bool _recordHadBle = false;
   // 本段录像是否为竖屏(竖屏则成片需旋转为竖向)
   bool _recordPortrait = true;
+  // 本段录像开始时的相机放大倍数(稳定算法用它换算等效焦距)
+  double _recordZoom = 1.0;
 
   // ── 画面锁定(目标跟踪稳定)──
   bool _lockEnabled = false; // 开关:是否启用画面识别锁定
@@ -1447,6 +1449,9 @@ class _CameraPageState extends State<CameraPage> {
         _recordHadBle = widget.ble.isConnected;
         // 记录本段录制方向:竖屏则成片需要旋转为竖向
         _recordPortrait = isPortraitNow;
+        // 记录本段录制时的相机放大倍数:放大后等效焦距按倍数增长,
+        // 补偿量必须跟着放大,否则放大后稳定会明显变弱。
+        _recordZoom = _zoom <= 0 ? 1.0 : _zoom;
         // 快照本段的画面锁定目标框(录制中可以继续调,不影响这一段)
         _lockBoxSnapshot = _lockEnabled ? _lockBox : null;
         // 记录本段开始时刻(用于切分陀螺仪数据)
@@ -1837,6 +1842,7 @@ class _CameraPageState extends State<CameraPage> {
         frameH: height.toDouble(),
         fovDeg: stabFov,
         strength: stabStrength,
+        camZoom: _recordZoom, // 放大倍数:等效焦距要跟着放大
         curveStep: 1 / 60, // 60Hz 逐帧
         roll: stabStrength >= 1.6, // 「强」「激进」档启用地平线锁定(横滚校正)
       );
