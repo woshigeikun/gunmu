@@ -198,6 +198,9 @@ class _CameraPageState extends State<CameraPage> {
   bool _lockEnabled = false; // 开关:是否启用画面识别锁定
   /// 导出模式:false = 应用内稳定成片(原逻辑);true = 只输出素材给 Gyroflow
   bool _materialExport = false;
+
+  /// 圆形取景:圆内显示画面、圆外纯黑,并把边缘做桶形(鱼眼式)畸变
+  bool _circularView = false; // ignore: prefer_final_fields
   // 用户画的框,归一化到"预览里显示的那幅图"的坐标(0~1)。
   // 该图与成片是同一幅画面(同比例、同朝向),所以能直接映射到成片中。
   Rect? _lockBox;
@@ -1801,6 +1804,36 @@ class _CameraPageState extends State<CameraPage> {
   }
 
   /// 实际渲染:无心率直接保存原视频;有心率则烧字幕 + 曲线
+  /// 生成圆形取景遮罩:圆内**透明**(露出画面),圆外纯黑。
+  /// 半径按**宽度内切** —— 左右贴合画面边缘,上下留出黑带,
+  /// 这样无论竖屏还是横屏,圆形都能完整落在画面里。
+  Future<String> _writeCircularMask(
+    Directory workDir,
+    int stamp,
+    int w,
+    int h,
+  ) async {
+    final rec = ui.PictureRecorder();
+    final canvas = Canvas(rec);
+    final r = w / 2;
+    // 先整幅涂黑
+    canvas.drawRect(
+      Rect.fromLTWH(0, 0, w.toDouble(), h.toDouble()),
+      Paint()..color = Colors.black,
+    );
+    // 再用 BlendMode.clear 在中间挖出一个透明的圆
+    canvas.drawCircle(
+      Offset(w / 2, h / 2),
+      r,
+      Paint()..blendMode = BlendMode.clear,
+    );
+    final img = await rec.endRecording().toImage(w, h);
+    final data = await img.toByteData(format: ui.ImageByteFormat.png);
+    final p = '${workDir.path}/${stamp}_mask.png';
+    File(p).writeAsBytesSync(data!.buffer.asUint8List());
+    return p;
+  }
+
   /// 材料模式导出:原始视频 + 陀螺仪数据 CSV(+ 心率透明视频)
   Future<void> _exportMaterials({
     required XFile raw,
@@ -2359,6 +2392,17 @@ class _CameraPageState extends State<CameraPage> {
               "'(${baseX.toStringAsFixed(1)}-$zoom*($exprX))':"
               "'(${baseY.toStringAsFixed(1)}-$zoom*($exprY))',";
         }
+        // ── 圆形取景:边缘桶形畸变 ──
+        // 放在裁切**之后、字幕之前**:畸变只作用于画面,心率的数字和曲线
+        // 是叠加的 UI,不该跟着一起弯。用桶形(k1 为负)让边缘向外鼓,
+        // 配合圆形遮罩就呈现鱼眼式取景。
+        if (_circularView) {
+          const lens = 'lenscorrection=cx=0.5:cy=0.5:k1=-0.20:k2=0.05,';
+          stabPrefix = '$stabPrefix$lens';
+          if (stabPrefixExpr.isNotEmpty) {
+            stabPrefixExpr = '$stabPrefixExpr$lens';
+          }
+        }
         job.stabInfo =
             '运动稳定 ×${zoom.toStringAsFixed(2)} · 位移≤'
             '${plan.maxShiftX.toStringAsFixed(0)},'
@@ -2474,6 +2518,10 @@ class _CameraPageState extends State<CameraPage> {
       ..stage = '合成中…'
       ..progress = 0.40;
     final outPath = '${workDir.path}/$stamp.mp4';
+    // 圆形取景需要一张遮罩图(圆内透明、圆外纯黑),作为最后一路输入叠加
+    final String? maskPath = _circularView
+        ? await _writeCircularMask(workDir, stamp, width, height)
+        : null;
 
     // 提速要点:
     //   * 全局多线程:scale/transpose/overlay 都支持切片并行,-filter_threads
@@ -2481,6 +2529,28 @@ class _CameraPageState extends State<CameraPage> {
     //   * 缩放用 bilinear(原来是 bicubic):1080p 逐帧上采样便宜一大截;
     //   * 编码走硬件(见上面 1.6 步)。
     String buildCmd(String stab, String enc) {
+      // 圆形取景:遮罩必须**最后**叠加(心率的数字/曲线也要在圆内),
+      // 所以这时整条链改用 filter_complex 多路输入:
+      //   [0]=原始视频  [1]=曲线序列(可选)  [末]=圆形遮罩(可选)
+      if (_circularView && maskPath != null) {
+        final hasCurve = seqDir != null;
+        final seqIn = hasCurve
+            ? '-framerate 1 -i "$seqDir/curve_%04d.png" '
+            : '';
+        final maskIdx = hasCurve ? 2 : 1;
+        final chain = hasCurve
+            ? '[0:v]$vfPrefix${stab}ass=$assPath[base];'
+                  '[1:v]format=rgba,fps=30[ov];'
+                  '[base][ov]overlay=x=$curX:y=$curY:eof_action=repeat[tmp];'
+                  '[tmp][$maskIdx:v]overlay=0:0[outv]'
+            : '[0:v]$vfPrefix${stab}ass=$assPath[b];'
+                  '[b][$maskIdx:v]overlay=0:0[outv]';
+        return '-y -filter_threads $threads -filter_complex_threads $threads '
+            '-i "${raw.path}" $seqIn-i "$maskPath" '
+            '-filter_complex "$chain" '
+            '-map "[outv]" -map 0:a? '
+            '$enc -c:a aac -b:a 128k "$outPath"';
+      }
       if (seqDir != null) {
         // 输入0=原始视频(先旋转/稳定再烧字幕),输入1=曲线动画序列(1帧/秒)
         return '-y -filter_threads $threads -filter_complex_threads $threads '
@@ -3439,6 +3509,31 @@ class _CameraPageState extends State<CameraPage> {
                           },
                         ),
                         const Divider(color: Colors.white12, height: 1),
+                        SwitchListTile(
+                          contentPadding: EdgeInsets.zero,
+                          value: _circularView,
+                          activeThumbColor: Colors.redAccent,
+                          title: const Text(
+                            '圆形取景(黑边 + 边缘畸变)',
+                            style: TextStyle(color: Colors.white, fontSize: 15),
+                          ),
+                          subtitle: Text(
+                            _circularView
+                                ? '成片:画面呈圆形,圆外纯黑,边缘做桶形畸变'
+                                : '成片:矩形画面(带黑边补偿)',
+                            style: const TextStyle(
+                              color: Colors.white38,
+                              fontSize: 11,
+                            ),
+                          ),
+                          onChanged: (v) {
+                            setState(() {
+                              _circularView = v;
+                              _hint = v ? '已开启圆形取景:导出时画面为圆形,圆外纯黑' : '已切换为矩形取景';
+                            });
+                            setSheetState(() {});
+                          },
+                        ),
                         SwitchListTile(
                           contentPadding: EdgeInsets.zero,
                           value: _materialExport,
