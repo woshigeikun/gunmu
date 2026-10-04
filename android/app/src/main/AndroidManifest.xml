@@ -6,8 +6,12 @@
     <!-- 蓝牙(心率) -->
     <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
     <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
-    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" android:maxSdkVersion="30" />
-    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" android:maxSdkVersion="28" />
+    <!-- 定位:很多 ROM(尤其国产)在 Android 12+ 上**仍然**要求定位权限 +
+         定位服务开启,才肯返回 BLE 扫描结果。原来限制 maxSdkVersion=30,
+         导致新系统上系统认为本应用不需要该权限,连申请弹窗都不出现,
+         直接判为拒绝 → 扫描永远扫不到设备。 -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
     <uses-permission android:name="android.permission.BLUETOOTH_SCAN" android:usesPermissionFlags="neverForLocation" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
 
