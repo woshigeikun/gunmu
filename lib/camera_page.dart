@@ -2248,10 +2248,21 @@ class _CameraPageState extends State<CameraPage> {
         final zoom = plan.zoom;
         final scaledW = ((width * zoom) / 2).floor() * 2;
         final scaledH = ((height * zoom) / 2).floor() * 2;
-        final baseX = (scaledW - width) / 2;
-        final baseY = (scaledH - height) / 2;
-        final maxX = scaledW - width;
-        final maxY = scaledH - height;
+        // ── 允许黑边 ──
+        // 以前为了"绝不出现黑边",补偿只能限制在裁切余量内(标准档 ±7%),
+        // 这是"移动不够"的根本限制。现在改成:把放大后的画面**再加一圈黑边
+        // 垫层**,裁切窗口可以在垫层里移动 —— 小幅抖动仍被放大倍率吃掉(没有
+        // 黑边),只有大幅晃动才会在边缘露出黑边,而补偿范围直接放大到 ±padFrac。
+        // 这是用"允许黑边"换"补偿范围"的交易。
+        const padFrac = 0.25; // 每个方向可移动 ±25% 的画幅
+        final padX = (width * padFrac).round();
+        final padY = (height * padFrac).round();
+        final padW = scaledW + padX * 2;
+        final padH = scaledH + padY * 2;
+        final baseX = padX.toDouble(); // 中性位置 = 垫层中心
+        final baseY = padY.toDouble();
+        final maxX = padX * 2;
+        final maxY = padY * 2;
         final bx = baseX.round().clamp(0, maxX);
         final by = baseY.round().clamp(0, maxY);
 
@@ -2287,8 +2298,9 @@ class _CameraPageState extends State<CameraPage> {
           ghpX = _highPass(plan.dx, win, 60);
           ghpY = _highPass(plan.dy, win, 60);
         }
-        final limX = plan.margin * width;
-        final limY = plan.margin * height;
+        // 补偿上限 = 垫层宽度(不再是 7% 的裁切余量)
+        final limX = padX.toDouble();
+        final limY = padY.toDouble();
         for (var i = 0; i < n; i++) {
           final t = plan.dx[i][0];
           var dxPx = plan.dx[i][1];
@@ -2311,6 +2323,7 @@ class _CameraPageState extends State<CameraPage> {
         stabPrefix =
             'sendcmd=f=$cmdsPath,'
             'scale=$scaledW:$scaledH:flags=bilinear,'
+            'pad=$padW:$padH:$padX:$padY:black,'
             'crop@c=$width:$height:$bx:$by,';
 
         // ── 退路:表达式方案(分辨率受限,只在 sendcmd 不可用时用)──
@@ -2318,6 +2331,8 @@ class _CameraPageState extends State<CameraPage> {
         final exprY = GyroStabilizer.toCropExpr(plan.dy, maxKnots: 160);
         // 地平线锁定:用 rotate 逐帧把画面转回来(角度可逐帧表达式)。
         // 注意 rotate 的 a 是弧度、正值 = 顺时针。
+        // 允许黑边之后,rotate 不需要再额外放大来盖住四角了 —— 转出去的部分
+        // 直接是黑的,这正是"用黑边换补偿范围"的又一笔收益。
         final exprRoll = plan.hasRoll
             ? GyroStabilizer.toCropExpr(plan.roll, maxKnots: 160)
             : null;
@@ -2325,12 +2340,14 @@ class _CameraPageState extends State<CameraPage> {
           stabPrefix =
               'sendcmd=f=$cmdsPath,'
               'scale=$scaledW:$scaledH:flags=bilinear,'
-              "rotate=a='$exprRoll':ow=iw:oh=ih,"
+              "rotate=a='$exprRoll':ow=iw:oh=ih:fillcolor=black,"
+              'pad=$padW:$padH:$padX:$padY:black,'
               'crop@c=$width:$height:$bx:$by,';
         }
         if (exprX != null && exprY != null) {
           stabPrefixExpr =
               'scale=$scaledW:$scaledH:flags=bilinear,'
+              'pad=$padW:$padH:$padX:$padY:black,'
               'crop=$width:$height:'
               "'(${baseX.toStringAsFixed(1)}-$zoom*($exprX))':"
               "'(${baseY.toStringAsFixed(1)}-$zoom*($exprY))',";
@@ -2339,6 +2356,7 @@ class _CameraPageState extends State<CameraPage> {
             '运动稳定 ×${zoom.toStringAsFixed(2)} · 位移≤'
             '${plan.maxShiftX.toStringAsFixed(0)},'
             '${plan.maxShiftY.toStringAsFixed(0)}px · '
+            '可移动 ±${(padFrac * 100).round()}%(允许黑边) · '
             '逐帧 60Hz($n 点) · '
             '陀螺仪 ${stabGyro.length} 条'
             '${lockX != null ? ' · $logTrack' : ''}'
