@@ -2259,10 +2259,14 @@ class _CameraPageState extends State<CameraPage> {
         final padY = (height * padFrac).round();
         final padW = scaledW + padX * 2;
         final padH = scaledH + padY * 2;
-        final baseX = padX.toDouble(); // 中性位置 = 垫层中心
-        final baseY = padY.toDouble();
-        final maxX = padX * 2;
-        final maxY = padY * 2;
+        // 中性位置 = 垫层偏移 + 放大后多出来的那一半。
+        // 少了后面这一半,裁切窗口就会贴到内容的左上角,画面被挤到一个角上、
+        // 另一边露黑(上一版就是这个 bug)。
+        final baseX = padX + (scaledW - width) / 2;
+        final baseY = padY + (scaledH - height) / 2;
+        // 窗口可移动的整个范围:放大余量 + 两侧垫层
+        final maxX = padW - width;
+        final maxY = padH - height;
         final bx = baseX.round().clamp(0, maxX);
         final by = baseY.round().clamp(0, maxY);
 
@@ -2298,9 +2302,9 @@ class _CameraPageState extends State<CameraPage> {
           ghpX = _highPass(plan.dx, win, 60);
           ghpY = _highPass(plan.dy, win, 60);
         }
-        // 补偿上限 = 垫层宽度(不再是 7% 的裁切余量)
-        final limX = padX.toDouble();
-        final limY = padY.toDouble();
+        // 补偿上限 = 放大余量 + 垫层(换算回原始像素要除以放大倍率)
+        final limX = ((scaledW - width) / 2 + padX) / zoom;
+        final limY = ((scaledH - height) / 2 + padY) / zoom;
         for (var i = 0; i < n; i++) {
           final t = plan.dx[i][0];
           var dxPx = plan.dx[i][1];
