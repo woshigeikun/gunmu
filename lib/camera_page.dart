@@ -633,12 +633,49 @@ class _CameraPageState extends State<CameraPage> {
 
   /// 扫描附近可连接设备
   Future<void> _startScan(StateSetter setSheetState) async {
-    // Android:扫描 BLE 需要定位权限
+    // Android 的蓝牙扫描有三道门,任何一道没过都扫不到设备:
+    //   ① Android 12+ 的"附近的设备"权限(BLUETOOTH_SCAN / BLUETOOTH_CONNECT)
+    //   ② 定位权限(12 以前是硬性要求;12+ 很多 ROM 仍然检查)
+    //   ③ 定位服务必须处于**开启**状态 —— 只给权限不开 GPS,扫描同样返回空
     if (!kIsWeb && Platform.isAndroid) {
       try {
+        final bt = await [
+          Permission.bluetoothScan,
+          Permission.bluetoothConnect,
+        ].request();
+        if (bt[Permission.bluetoothScan]?.isGranted != true) {
+          if (mounted) {
+            setState(
+              () => _bleStatus = '缺少"附近的设备"权限:请在 系统设置 → 应用 → 心率相机 → 权限 里打开',
+            );
+          }
+          if (mounted) setSheetState(() {});
+          return;
+        }
         final loc = await Permission.locationWhenInUse.request();
         if (!loc.isGranted) {
-          if (mounted) setState(() => _bleStatus = '需要定位权限才能扫描设备');
+          if (mounted) {
+            setState(
+              () => _bleStatus = loc.isPermanentlyDenied
+                  ? '定位权限被拒绝:请在 系统设置 → 应用 → 心率相机 → 权限 里打开"位置信息"'
+                  : '需要定位权限才能扫描设备(Android 的硬性要求)',
+            );
+          }
+          if (mounted) setSheetState(() {});
+          // 永久拒绝时系统不会再弹窗,只能引导用户去设置里开
+          if (loc.isPermanentlyDenied) await openAppSettings();
+          return;
+        }
+        // 权限有了,但定位服务没开也扫不到 —— 这一步最容易被忽略
+        final svc = await Permission.location.serviceStatus;
+        if (svc != ServiceStatus.enabled) {
+          if (mounted) {
+            setState(
+              () => _bleStatus =
+                  '请打开手机的"定位服务"(下拉通知栏的 GPS 开关);'
+                  '只给权限不开定位,Android 的蓝牙扫描会返回空结果',
+            );
+          }
           if (mounted) setSheetState(() {});
           return;
         }
