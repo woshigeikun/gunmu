@@ -35,6 +35,9 @@ int get kTrackWidth =>
 /// 跟踪抽帧帧率
 const double kTrackFps = 10;
 
+/// 允许黑边时,每个方向可移动的画幅比例(预览与导出必须一致)
+const double kPadFrac = 0.25;
+
 /// 一次心率采样:相对录像开始的时间(毫秒)+ 心率值
 class _HrSample {
   final int ms;
@@ -2254,7 +2257,7 @@ class _CameraPageState extends State<CameraPage> {
         // 垫层**,裁切窗口可以在垫层里移动 —— 小幅抖动仍被放大倍率吃掉(没有
         // 黑边),只有大幅晃动才会在边缘露出黑边,而补偿范围直接放大到 ±padFrac。
         // 这是用"允许黑边"换"补偿范围"的交易。
-        const padFrac = 0.25; // 每个方向可移动 ±25% 的画幅
+        const padFrac = kPadFrac; // 每个方向可移动 ±25% 的画幅
         final padX = (width * padFrac).round();
         final padY = (height * padFrac).round();
         final padW = scaledW + padX * 2;
@@ -3283,12 +3286,15 @@ class _CameraPageState extends State<CameraPage> {
           final wPx = _previewSize.width <= 0 ? 1080.0 : _previewSize.width;
           final hPx = _previewSize.height <= 0 ? 1920.0 : _previewSize.height;
           final margin = GyroStabilizer.marginFor(_stabStrength);
+          // 预览的位移上限 = 裁切余量 + 垫层(和导出一致)。
+          // 以前这里是 margin,位移被卡在余量内 → 预览永远不露黑边,
+          // 也就看不到成片里"画面在框内移动"的真实效果。
           final shifts = _onlineStab.shifts(
             wPx,
             hPx,
             fov,
             _stabStrength,
-            margin,
+            margin + kPadFrac,
           );
           _stabOffsetX = shifts[0];
           _stabOffsetY = shifts[1];
