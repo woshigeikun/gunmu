@@ -2165,6 +2165,7 @@ class _CameraPageState extends State<CameraPage> {
         fovDeg: stabFov,
         strength: stabStrength,
         camZoom: _recordZoom, // 放大倍数:等效焦距要跟着放大
+        padFrac: kPadFrac, // 允许黑边 → 分析阶段也要放宽位移上限
         curveStep: 1 / 60, // 60Hz 逐帧
         roll: stabStrength >= 1.6, // 「强」「激进」档启用地平线锁定(横滚校正)
       );
@@ -2228,6 +2229,7 @@ class _CameraPageState extends State<CameraPage> {
               curveStep: 1 / 60,
               roll: stabStrength >= 1.6,
               camZoom: _recordZoom * fit.scale,
+              padFrac: kPadFrac,
             );
             if (corrected.usable) plan = corrected;
           }
