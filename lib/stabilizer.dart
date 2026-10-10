@@ -125,10 +125,14 @@ class GyroStabilizer {
     // 录制时的相机放大倍数。放大后等效焦距按倍数增长,同样的抖动产生的
     // 像素位移也按倍数增长 —— 不乘这一项,补偿量就只剩应有值的一半。
     double camZoom = 1.0,
+    // 允许黑边时额外可移动的画幅比例。**必须在分析阶段也放宽上限**,
+    // 否则曲线在算出来时就被卡在裁切余量内,成片永远不露黑边 ——
+    // 而预览用的是放宽后的上限,于是出现"预览有黑边、成片没有"的不一致。
+    double padFrac = 0.0,
   }) {
     final m = (margin ?? marginFor(strength)).clamp(0.02, 0.16);
-    final maxShiftXPx = m * frameW;
-    final maxShiftYPx = m * frameH;
+    final maxShiftXPx = (m + padFrac) * frameW;
+    final maxShiftYPx = (m + padFrac) * frameH;
     final useRoll = roll;
     const maxRollRad = 3.0 * math.pi / 180;
 
