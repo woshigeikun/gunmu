@@ -1807,6 +1807,9 @@ class _CameraPageState extends State<CameraPage> {
   /// 生成圆形取景遮罩:圆内**透明**(露出画面),圆外纯黑。
   /// 半径按**宽度内切** —— 左右贴合画面边缘,上下留出黑带,
   /// 这样无论竖屏还是横屏,圆形都能完整落在画面里。
+  /// 注:当前圆形档改用桶形畸变拉伸填充(见 stabPrefix 处),此方法暂时不用,
+  /// 保留是为了将来想要"硬边圆形 + 纯黑外围"时可以直接启用。
+  // ignore: unused_element
   Future<String> _writeCircularMask(
     Directory workDir,
     int stamp,
@@ -2399,7 +2402,11 @@ class _CameraPageState extends State<CameraPage> {
         // 是叠加的 UI,不该跟着一起弯。用桶形(k1 为负)让边缘向外鼓,
         // 配合圆形遮罩就呈现鱼眼式取景。
         if (_circularView) {
-          const lens = 'lenscorrection=cx=0.5:cy=0.5:k1=-0.20:k2=0.05,';
+          // k1 取负 = 桶形:把中心内容向外**拉伸**去填满边缘。
+          // 实测(本机 ffmpeg):负 k1 能把原本纯黑的角落填上内容(亮度 0 → 75),
+          // 中心保持清晰,边缘被拉长变虚 —— 正是"拉伸填充、变虚没关系"。
+          // 所以这一档**不再叠加圆形遮罩**(遮罩会把边缘重新涂黑)。
+          const lens = 'lenscorrection=cx=0.5:cy=0.5:k1=-0.42:k2=0.12,';
           stabPrefix = '$stabPrefix$lens';
           if (stabPrefixExpr.isNotEmpty) {
             stabPrefixExpr = '$stabPrefixExpr$lens';
@@ -2520,10 +2527,9 @@ class _CameraPageState extends State<CameraPage> {
       ..stage = '合成中…'
       ..progress = 0.40;
     final outPath = '${workDir.path}/$stamp.mp4';
-    // 圆形取景需要一张遮罩图(圆内透明、圆外纯黑),作为最后一路输入叠加
-    final String? maskPath = _circularView
-        ? await _writeCircularMask(workDir, stamp, width, height)
-        : null;
+    // 圆形取景靠**桶形畸变**把边缘拉伸填满,不再叠加遮罩
+    // (遮罩会把刚被拉伸填上的边缘又涂黑)。
+    const String? maskPath = null;
 
     // 提速要点:
     //   * 全局多线程:scale/transpose/overlay 都支持切片并行,-filter_threads
@@ -3521,7 +3527,7 @@ class _CameraPageState extends State<CameraPage> {
                           ),
                           subtitle: Text(
                             _circularView
-                                ? '成片:画面呈圆形,圆外纯黑,边缘做桶形畸变'
+                                ? '成片:桶形畸变,边缘被拉伸填满(不露黑),中心保持清晰'
                                 : '成片:矩形画面(带黑边补偿)',
                             style: const TextStyle(
                               color: Colors.white38,
