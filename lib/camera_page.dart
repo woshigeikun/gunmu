@@ -257,6 +257,11 @@ class _CameraPageState extends State<CameraPage> {
   double _minZoom = 1.0;
   double _maxZoom = 1.0;
   double _zoomAtGestureStart = 1.0;
+
+  /// 本次手势当前的手指数。Flutter 的缩放手势在**手指数变化时会重置基线**
+  /// (d.scale 回到 1.0),我们必须跟着把 _zoomAtGestureStart 重新记一次,
+  /// 否则"两指拉大 → 抬起一根 → 基线重置"会算出 1.0×旧基线 = 弹回原样。
+  int _gesturePointers = 0;
   Size _previewSize = Size.zero; // 当前预览显示区尺寸(用于计算可移动余量)
 
   @override
@@ -2406,7 +2411,7 @@ class _CameraPageState extends State<CameraPage> {
           // 实测(本机 ffmpeg):负 k1 能把原本纯黑的角落填上内容(亮度 0 → 75),
           // 中心保持清晰,边缘被拉长变虚 —— 正是"拉伸填充、变虚没关系"。
           // 所以这一档**不再叠加圆形遮罩**(遮罩会把边缘重新涂黑)。
-          const lens = 'lenscorrection=cx=0.5:cy=0.5:k1=-0.42:k2=0.12,';
+          const lens = 'lenscorrection=cx=0.5:cy=0.5:k1=-0.30:k2=0.08,';
           stabPrefix = '$stabPrefix$lens';
           if (stabPrefixExpr.isNotEmpty) {
             stabPrefixExpr = '$stabPrefixExpr$lens';
@@ -4184,6 +4189,7 @@ class _CameraPageState extends State<CameraPage> {
                         !_busy &&
                         (_stabilizeEnabled || _lockEnabled))
                     ? (d) {
+                        _gesturePointers = d.pointerCount;
                         if (d.pointerCount >= 2) {
                           _dragging = false;
                           _zoomAtGestureStart = _zoom;
@@ -4205,6 +4211,16 @@ class _CameraPageState extends State<CameraPage> {
                           return;
                         }
                         if (!_stabilizeEnabled) return;
+                        // 单指不参与缩放
+                        if (d.pointerCount < 2) return;
+                        // 手指数变化 = Flutter 重置了缩放基线(d.scale 归 1),
+                        // 此时必须把基线重新记一次再返回,否则会用"旧基线 × 1.0"
+                        // 算出旧倍率,画面就"拉大后弹回去"。
+                        if (d.pointerCount != _gesturePointers) {
+                          _gesturePointers = d.pointerCount;
+                          _zoomAtGestureStart = _zoom;
+                          return;
+                        }
                         final camNow = _cam;
                         if (camNow == null) return;
                         final z = (_zoomAtGestureStart * d.scale).clamp(
