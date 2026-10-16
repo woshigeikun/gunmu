@@ -130,7 +130,16 @@ class GyroStabilizer {
     // 而预览用的是放宽后的上限,于是出现"预览有黑边、成片没有"的不一致。
     double padFrac = 0.0,
   }) {
-    final m = (margin ?? marginFor(strength)).clamp(0.02, 0.16);
+    final mStrength = (margin ?? marginFor(strength)).clamp(0.02, 0.16);
+    // ── 相机放大倍数 → 裁切余量 ──
+    // 用户故意放大镜头,不是为了拍特写,而是主动让出视野当"活动余量"
+    // (专业稳定器的标准做法:先裁掉一圈才有地方挪)。
+    // 放大 z 倍 = 让出 1 - 1/z 的视野,左右各半 ⇒ 可用余量 = (1 - 1/z)/2。
+    // 不做这个换算,放大倍数就只作用在焦距修正上,用户让出的视野白白浪费 ——
+    // 表现就是"放大之后一摇就露黑边"。
+    final zc = camZoom.clamp(1.0, 8.0);
+    final mZoom = zc <= 1.0001 ? 0.0 : (1 - 1 / zc) / 2;
+    final m = math.max(mStrength, mZoom).clamp(0.02, 0.30);
     final maxShiftXPx = (m + padFrac) * frameW;
     final maxShiftYPx = (m + padFrac) * frameH;
     final useRoll = roll;
