@@ -1365,9 +1365,7 @@ class _CameraPageState extends State<CameraPage> {
       _onlineStab.reset();
       _stabOffsetX = 0;
       _stabOffsetY = 0;
-      _stabAutoZoom = GyroStabilizer.zoomForMargin(
-        GyroStabilizer.marginFor(_stabStrength),
-      );
+      _stabAutoZoom = GyroStabilizer.zoomForMargin(_effMargin);
       _stabCorrDeg = 0;
       _stabLog.clear();
       _stabLast = DateTime.now();
@@ -3331,9 +3329,7 @@ class _CameraPageState extends State<CameraPage> {
     // 已经在稳定中:立刻把固定裁切放大就位,别等第一个样本
     if (_stabRunning && mounted) {
       setState(() {
-        _stabAutoZoom = GyroStabilizer.zoomForMargin(
-          GyroStabilizer.marginFor(_stabStrength),
-        );
+        _stabAutoZoom = GyroStabilizer.zoomForMargin(_effMargin);
       });
     }
     _gyroSub = gyroscopeEventStream(samplingPeriod: SensorInterval.gameInterval)
@@ -3368,7 +3364,7 @@ class _CameraPageState extends State<CameraPage> {
           final fov = _stabFov;
           final wPx = _previewSize.width <= 0 ? 1080.0 : _previewSize.width;
           final hPx = _previewSize.height <= 0 ? 1920.0 : _previewSize.height;
-          final margin = GyroStabilizer.marginFor(_stabStrength);
+          final margin = _effMargin;
           // 预览的位移上限 = 裁切余量 + 垫层(和导出一致)。
           // 以前这里是 margin,位移被卡在余量内 → 预览永远不露黑边,
           // 也就看不到成片里"画面在框内移动"的真实效果。
@@ -3732,10 +3728,12 @@ class _CameraPageState extends State<CameraPage> {
                             onChanged: (v) =>
                                 setSheetState(() => _stabStrength = v),
                           ),
+                          // 显示的是**实际**裁切倍率:它包含"相机放大让出的视野"
+                          // 转换来的余量,所以放大镜头后这个数字会变大
                           Text(
                             '裁切 '
-                            '${GyroStabilizer.zoomForMargin(GyroStabilizer.marginFor(_stabStrength)).toStringAsFixed(2)}x'
-                            '${_stabStrength >= 1.6 ? ' · 含地平线锁定' : ''}',
+                            '${GyroStabilizer.zoomForMargin(_effMargin).toStringAsFixed(2)}x'
+                            ' · 余量 ±${(_effMargin * 100).round()}%',
                             style: const TextStyle(
                               color: Colors.white38,
                               fontSize: 10,
@@ -3811,7 +3809,7 @@ class _CameraPageState extends State<CameraPage> {
                                   // 立刻生效:裁切放大这一帧就位,不等第一个陀螺仪样本
                                   // (否则会先空等几秒才看到画面被裁切)
                                   _stabAutoZoom = GyroStabilizer.zoomForMargin(
-                                    GyroStabilizer.marginFor(_stabStrength),
+                                    _effMargin,
                                   );
                                   _stabCorrDeg = 0;
                                   _stabLog.clear();
@@ -4822,6 +4820,16 @@ class _CameraPageState extends State<CameraPage> {
         ],
       ),
     );
+  }
+
+  /// 有效裁切余量:取"强度滑块给的余量"与"相机放大让出的视野"中的较大者。
+  /// 必须与 stabilizer.dart 里 analyze 的算法一致,否则预览和成片对不上。
+  double get _effMargin {
+    final z = _zoom <= 1.0001 ? 1.0 : _zoom;
+    final ms = GyroStabilizer.marginFor(_stabStrength);
+    final mz = (1 - 1 / z) / 2;
+    final m = ms > mz ? ms : mz;
+    return m.clamp(0.02, 0.30);
   }
 
   /// 稳定强度的档位名(滑块位置 → 直观说法)
