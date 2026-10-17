@@ -140,10 +140,17 @@ class GyroStabilizer {
     final zc = camZoom.clamp(1.0, 8.0);
     final mZoom = zc <= 1.0001 ? 0.0 : (1 - 1 / zc) / 2;
     final m = math.max(mStrength, mZoom).clamp(0.02, 0.30);
-    final maxShiftXPx = (m + padFrac) * frameW;
-    final maxShiftYPx = (m + padFrac) * frameH;
+    // ── 位移**不做**限幅 ──
+    // 限幅会削掉峰值信息:偏转超出上限时被削平,转回来那段信息就永久丢了,
+    // 于是映射不再是 1:1,画面回不到原位。真正该受限的是**裁切窗口的位置**
+    // (几何限位、可逆,见 camera_page 里 sendcmd 的 clamp 0..垫层)。
+    // 这里给一个足够大的安全值,只为防止数值爆炸(极端数据),不是功能上限。
+    final maxShiftXPx = 50.0 * frameW;
+    final maxShiftYPx = 50.0 * frameH;
     final useRoll = roll;
-    const maxRollRad = 3.0 * math.pi / 180;
+    // 横滚也只设一个安全阀(15°),不做功能限幅 —— 同样是为了不削掉信息。
+    // 允许黑边之后,转出去的部分是黑的,不需要限幅来避免黑角。
+    const maxRollRad = 15.0 * math.pi / 180;
 
     // 1) 积分姿态(取旋转向量的 x=pitch、y=yaw、z=横滚)
     final ts = <double>[];
@@ -244,9 +251,9 @@ class GyroStabilizer {
       if (useRoll) rollCurve.add(<double>[ts.last, rls.last]);
     }
 
-    // 5) 裁切倍率 = 位移余量 × 横滚覆盖(旋转会切掉四角,必须额外放大盖住)
-    final zoom = (zoomForMargin(m) * rollCoverage(maxR, frameW, frameH) * 1.005)
-        .clamp(1.0, 1.6);
+    // 5) 裁切倍率 = 位移余量(横滚的覆盖放大只在"不许黑边"时才需要;
+    //    现在允许黑边,转出去的部分就是黑的,不必再为了盖住四角多裁视野)
+    final zoom = zoomForMargin(m).clamp(1.0, 1.6);
 
     return StabPlan(
       dx: dxCurve,
