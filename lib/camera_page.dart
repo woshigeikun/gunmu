@@ -201,6 +201,41 @@ class _CameraPageState extends State<CameraPage> {
 
   /// 圆形取景:圆内显示画面、圆外纯黑,并把边缘做桶形(鱼眼式)畸变
   bool _circularView = false; // ignore: prefer_final_fields
+
+  /// 直播模式:只显示心率数字与曲线,其余 UI(含锁定框/候选框/按钮/提示)全部隐藏。
+  /// 进入与退出都是"双指同时按住 3 秒"。
+  bool _liveMode = false;
+  int _pointerCount = 0;
+  Timer? _liveToggleTimer;
+  bool _liveToggleArmed = false;
+
+  /// 双指按住 3 秒 → 切换直播模式。
+  /// Flutter 没有现成的"双指长按",只能用 Listener 自己数指针 + 定时器。
+  /// Listener 只观察、不消费事件,所以不会干扰已有的缩放/画框手势。
+  void _onPointerDown(PointerDownEvent e) {
+    _pointerCount++;
+    if (_pointerCount < 2 || _liveToggleArmed) return;
+    _liveToggleArmed = true;
+    _liveToggleTimer?.cancel();
+    _liveToggleTimer = Timer(const Duration(seconds: 3), () {
+      if (!mounted) return;
+      setState(() {
+        _liveMode = !_liveMode;
+        _hint = _liveMode ? '' : '已退出直播模式';
+      });
+    });
+  }
+
+  void _onPointerUp(PointerEvent e) {
+    if (_pointerCount > 0) _pointerCount--;
+    if (_pointerCount == 0) {
+      // 手指全部离开:取消计时,并允许下次重新触发
+      _liveToggleTimer?.cancel();
+      _liveToggleTimer = null;
+      _liveToggleArmed = false;
+    }
+  }
+
   // 用户画的框,归一化到"预览里显示的那幅图"的坐标(0~1)。
   // 该图与成片是同一幅画面(同比例、同朝向),所以能直接映射到成片中。
   Rect? _lockBox;
@@ -4167,111 +4202,159 @@ class _CameraPageState extends State<CameraPage> {
 
     return Scaffold(
       backgroundColor: Colors.black,
-      body: Stack(
-        children: [
-          // ── 相机预览 ──
-          // iOS 相机插件会把输出画面随设备方向旋转,但 value.aspectRatio 始终返回
-          // 捕获格式的原始比例(横向)。故竖屏时纹理实际是竖向,必须用 1/aspectRatio。
-          // 运动稳定开启时:画面按自适应缩放放大形成余量,再按陀螺仪位移取景框。
-          if (cam != null && cam.value.isInitialized)
-            Positioned.fill(
-              child: GestureDetector(
-                // 单击 = 选中候选目标(自动识别出来的青色框);
-                // 单指拖拽 = 手动画框;双指 = 缩放画面留出余量。
-                onTapUp: (!_recording && !_busy && _lockEnabled)
-                    ? (d) => _tryPickCandidate(d.localPosition)
-                    : null,
-                // 注意:录像/处理中不接管手势,否则会抢走录像按钮的点击
-                onScaleStart:
-                    (!_recording &&
-                        !_busy &&
-                        (_stabilizeEnabled || _lockEnabled))
-                    ? (d) {
-                        _gesturePointers = d.pointerCount;
-                        if (d.pointerCount >= 2) {
-                          _dragging = false;
-                          _zoomAtGestureStart = _zoom;
-                        } else if (_lockEnabled) {
-                          _dragging = true;
-                          _dragFrom = d.localFocalPoint;
-                          _dragTo = d.localFocalPoint;
-                          setState(() {});
-                        }
-                      }
-                    : null,
-                onScaleUpdate:
-                    (!_recording &&
-                        !_busy &&
-                        (_stabilizeEnabled || _lockEnabled))
-                    ? (d) async {
-                        if (_dragging) {
-                          setState(() => _dragTo = d.localFocalPoint);
-                          return;
-                        }
-                        if (!_stabilizeEnabled) return;
-                        // 单指不参与缩放
-                        if (d.pointerCount < 2) return;
-                        // 手指数变化 = Flutter 重置了缩放基线(d.scale 归 1),
-                        // 此时必须把基线重新记一次再返回,否则会用"旧基线 × 1.0"
-                        // 算出旧倍率,画面就"拉大后弹回去"。
-                        if (d.pointerCount != _gesturePointers) {
+      body: Listener(
+        // 双指按住 3 秒 → 切换直播模式(只观察、不消费事件)
+        onPointerDown: _onPointerDown,
+        onPointerUp: _onPointerUp,
+        onPointerCancel: _onPointerUp,
+        child: Stack(
+          children: [
+            // ── 相机预览 ──
+            // iOS 相机插件会把输出画面随设备方向旋转,但 value.aspectRatio 始终返回
+            // 捕获格式的原始比例(横向)。故竖屏时纹理实际是竖向,必须用 1/aspectRatio。
+            // 运动稳定开启时:画面按自适应缩放放大形成余量,再按陀螺仪位移取景框。
+            if (cam != null && cam.value.isInitialized)
+              Positioned.fill(
+                child: GestureDetector(
+                  // 单击 = 选中候选目标(自动识别出来的青色框);
+                  // 单指拖拽 = 手动画框;双指 = 缩放画面留出余量。
+                  onTapUp: (!_recording && !_busy && _lockEnabled)
+                      ? (d) => _tryPickCandidate(d.localPosition)
+                      : null,
+                  // 注意:录像/处理中不接管手势,否则会抢走录像按钮的点击
+                  onScaleStart:
+                      (!_recording &&
+                          !_busy &&
+                          (_stabilizeEnabled || _lockEnabled))
+                      ? (d) {
                           _gesturePointers = d.pointerCount;
-                          _zoomAtGestureStart = _zoom;
-                          return;
+                          if (d.pointerCount >= 2) {
+                            _dragging = false;
+                            _zoomAtGestureStart = _zoom;
+                          } else if (_lockEnabled) {
+                            _dragging = true;
+                            _dragFrom = d.localFocalPoint;
+                            _dragTo = d.localFocalPoint;
+                            setState(() {});
+                          }
                         }
-                        final camNow = _cam;
-                        if (camNow == null) return;
-                        final z = (_zoomAtGestureStart * d.scale).clamp(
-                          _minZoom <= 0 ? 1.0 : _minZoom,
-                          _maxZoom <= 0 ? 1.0 : _maxZoom,
-                        );
-                        if ((z - _zoom).abs() < 0.01) return;
-                        try {
-                          await camNow.setZoomLevel(z);
-                        } catch (_) {}
-                        if (mounted) setState(() => _zoom = z);
-                      }
-                    : null,
-                onScaleEnd: (!_recording && !_busy && _lockEnabled)
-                    ? (_) {
-                        if (_dragging) {
-                          _dragging = false;
-                          _commitLockBox();
+                      : null,
+                  onScaleUpdate:
+                      (!_recording &&
+                          !_busy &&
+                          (_stabilizeEnabled || _lockEnabled))
+                      ? (d) async {
+                          if (_dragging) {
+                            setState(() => _dragTo = d.localFocalPoint);
+                            return;
+                          }
+                          if (!_stabilizeEnabled) return;
+                          // 单指不参与缩放
+                          if (d.pointerCount < 2) return;
+                          // 手指数变化 = Flutter 重置了缩放基线(d.scale 归 1),
+                          // 此时必须把基线重新记一次再返回,否则会用"旧基线 × 1.0"
+                          // 算出旧倍率,画面就"拉大后弹回去"。
+                          if (d.pointerCount != _gesturePointers) {
+                            _gesturePointers = d.pointerCount;
+                            _zoomAtGestureStart = _zoom;
+                            return;
+                          }
+                          final camNow = _cam;
+                          if (camNow == null) return;
+                          final z = (_zoomAtGestureStart * d.scale).clamp(
+                            _minZoom <= 0 ? 1.0 : _minZoom,
+                            _maxZoom <= 0 ? 1.0 : _maxZoom,
+                          );
+                          if ((z - _zoom).abs() < 0.01) return;
+                          try {
+                            await camNow.setZoomLevel(z);
+                          } catch (_) {}
+                          if (mounted) setState(() => _zoom = z);
                         }
-                      }
-                    : null,
-                child: LayoutBuilder(
-                  builder: (context, cons) {
-                    final sw = cons.maxWidth;
-                    final sh = cons.maxHeight;
-                    // 记录显示区尺寸(供计算稳定可移动范围)
-                    _previewSize = Size(sw, sh);
-                    final rawA = cam.value.aspectRatio <= 0
-                        ? 4.0 / 3.0
-                        : cam.value.aspectRatio;
-                    // 稳定运行中:按自适应缩放放大(留出余量),并做双轴补偿
-                    final over = _stabRunning ? _stabAutoZoom : 1.0;
-                    final dx = _stabRunning ? _stabOffsetX : 0.0;
-                    final dy = _stabRunning ? _stabOffsetY : 0.0;
+                      : null,
+                  onScaleEnd: (!_recording && !_busy && _lockEnabled)
+                      ? (_) {
+                          if (_dragging) {
+                            _dragging = false;
+                            _commitLockBox();
+                          }
+                        }
+                      : null,
+                  child: LayoutBuilder(
+                    builder: (context, cons) {
+                      final sw = cons.maxWidth;
+                      final sh = cons.maxHeight;
+                      // 记录显示区尺寸(供计算稳定可移动范围)
+                      _previewSize = Size(sw, sh);
+                      final rawA = cam.value.aspectRatio <= 0
+                          ? 4.0 / 3.0
+                          : cam.value.aspectRatio;
+                      // 稳定运行中:按自适应缩放放大(留出余量),并做双轴补偿
+                      final over = _stabRunning ? _stabAutoZoom : 1.0;
+                      final dx = _stabRunning ? _stabOffsetX : 0.0;
+                      final dy = _stabRunning ? _stabOffsetY : 0.0;
 
-                    // 竖屏:纹理已竖置 → 用竖比例 cover 铺满全屏
-                    if (!isLandscape) {
-                      final a = 1.0 / rawA;
-                      double iw, ih;
-                      if (a > sw / sh) {
-                        ih = sh;
-                        iw = ih * a;
+                      // 竖屏:纹理已竖置 → 用竖比例 cover 铺满全屏
+                      if (!isLandscape) {
+                        final a = 1.0 / rawA;
+                        double iw, ih;
+                        if (a > sw / sh) {
+                          ih = sh;
+                          iw = ih * a;
+                        } else {
+                          iw = sw;
+                          ih = iw / a;
+                        }
+                        iw *= over;
+                        ih *= over;
+                        _imgMap = [iw, ih, dx, dy];
+                        return Center(
+                          child: SizedBox(
+                            width: sw,
+                            height: sh,
+                            child: ClipRect(
+                              child: OverflowBox(
+                                alignment: Alignment.center,
+                                minWidth: iw,
+                                maxWidth: iw,
+                                minHeight: ih,
+                                maxHeight: ih,
+                                child: Transform.translate(
+                                  offset: Offset(dx, dy),
+                                  child: SizedBox(
+                                    width: iw,
+                                    height: ih,
+                                    child: CameraPreview(cam),
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ),
+                        );
+                      }
+
+                      // 横屏:4:3 取景框(纹理为横向,比例一致,不拉伸)
+                      const tA = 4.0 / 3.0;
+                      double tw, th;
+                      if (sw / sh > tA) {
+                        th = sh;
+                        tw = th * tA;
                       } else {
-                        iw = sw;
-                        ih = iw / a;
+                        tw = sw;
+                        th = tw / tA;
+                      }
+                      double iw = th * rawA, ih = th;
+                      if (iw < tw) {
+                        iw = tw;
+                        ih = tw / rawA;
                       }
                       iw *= over;
                       ih *= over;
                       _imgMap = [iw, ih, dx, dy];
                       return Center(
                         child: SizedBox(
-                          width: sw,
-                          height: sh,
+                          width: tw,
+                          height: th,
                           child: ClipRect(
                             child: OverflowBox(
                               alignment: Alignment.center,
@@ -4291,533 +4374,511 @@ class _CameraPageState extends State<CameraPage> {
                           ),
                         ),
                       );
-                    }
-
-                    // 横屏:4:3 取景框(纹理为横向,比例一致,不拉伸)
-                    const tA = 4.0 / 3.0;
-                    double tw, th;
-                    if (sw / sh > tA) {
-                      th = sh;
-                      tw = th * tA;
-                    } else {
-                      tw = sw;
-                      th = tw / tA;
-                    }
-                    double iw = th * rawA, ih = th;
-                    if (iw < tw) {
-                      iw = tw;
-                      ih = tw / rawA;
-                    }
-                    iw *= over;
-                    ih *= over;
-                    _imgMap = [iw, ih, dx, dy];
-                    return Center(
-                      child: SizedBox(
-                        width: tw,
-                        height: th,
-                        child: ClipRect(
-                          child: OverflowBox(
-                            alignment: Alignment.center,
-                            minWidth: iw,
-                            maxWidth: iw,
-                            minHeight: ih,
-                            maxHeight: ih,
-                            child: Transform.translate(
-                              offset: Offset(dx, dy),
-                              child: SizedBox(
-                                width: iw,
-                                height: ih,
-                                child: CameraPreview(cam),
-                              ),
-                            ),
-                          ),
-                        ),
+                    },
+                  ),
+                ),
+              )
+            else
+              GestureDetector(
+                onTap: _restoreCamera,
+                child: const Center(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      SizedBox(
+                        width: 32,
+                        height: 32,
+                        child: CircularProgressIndicator(strokeWidth: 2.5),
                       ),
-                    );
-                  },
+                      SizedBox(height: 12),
+                      Text(
+                        '相机未就绪,点击重试',
+                        style: TextStyle(color: Colors.white54, fontSize: 13),
+                      ),
+                    ],
+                  ),
                 ),
               ),
-            )
-          else
-            GestureDetector(
-              onTap: _restoreCamera,
-              child: const Center(
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
+
+            // ── 锁定框(画面识别目标)+ 候选目标 + 画面正中十字 ──
+            if (!_liveMode &&
+                cam != null &&
+                cam.value.isInitialized &&
+                _lockEnabled)
+              Positioned.fill(
+                child: IgnorePointer(
+                  child: Builder(
+                    builder: (_) {
+                      final r = _lockBoxScreen;
+                      final cands = <(Rect, String)>[];
+                      for (final c in _candidates) {
+                        cands.add((_imageRectToScreen(c.box), c.label));
+                      }
+                      return CustomPaint(
+                        painter: _LockBoxPainter(r, _stabRunning, cands),
+                        size: Size.infinite,
+                      );
+                    },
+                  ),
+                ),
+              ),
+
+            // ── 顶部控制排 ──
+            if (!_liveMode)
+              Positioned(
+                top: topPad,
+                left: isLandscape ? 24 : 16,
+                right: isLandscape ? 24 : 16,
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    SizedBox(
-                      width: 32,
-                      height: 32,
-                      child: CircularProgressIndicator(strokeWidth: 2.5),
-                    ),
-                    SizedBox(height: 12),
-                    Text(
-                      '相机未就绪,点击重试',
-                      style: TextStyle(color: Colors.white54, fontSize: 13),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-
-          // ── 锁定框(画面识别目标)+ 候选目标 + 画面正中十字 ──
-          if (cam != null && cam.value.isInitialized && _lockEnabled)
-            Positioned.fill(
-              child: IgnorePointer(
-                child: Builder(
-                  builder: (_) {
-                    final r = _lockBoxScreen;
-                    final cands = <(Rect, String)>[];
-                    for (final c in _candidates) {
-                      cands.add((_imageRectToScreen(c.box), c.label));
-                    }
-                    return CustomPaint(
-                      painter: _LockBoxPainter(r, _stabRunning, cands),
-                      size: Size.infinite,
-                    );
-                  },
-                ),
-              ),
-            ),
-
-          // ── 顶部控制排 ──
-          Positioned(
-            top: topPad,
-            left: isLandscape ? 24 : 16,
-            right: isLandscape ? 24 : 16,
-            child: Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                // 左侧:镜头 + 设置按钮(纯黑圆底)
-                Row(
-                  crossAxisAlignment: CrossAxisAlignment.center,
-                  children: [
-                    IconButton(
-                      onPressed: (_recording || _busy) ? null : _showLensSheet,
-                      icon: const Icon(
-                        Icons.camera_alt,
-                        color: Colors.white,
-                        size: 26,
-                      ),
-                      style: IconButton.styleFrom(
-                        backgroundColor: Colors.black,
-                        disabledBackgroundColor: Colors.black26,
-                      ),
-                    ),
-                    IconButton(
-                      onPressed: (_recording || _busy)
-                          ? null
-                          : _showSettingsSheet,
-                      icon: const Icon(
-                        Icons.settings,
-                        color: Colors.white,
-                        size: 22,
-                      ),
-                      style: IconButton.styleFrom(
-                        backgroundColor: Colors.black,
-                        disabledBackgroundColor: Colors.black26,
-                      ),
-                    ),
-                    // 作品(已导出视频)入口
-                    Stack(
-                      clipBehavior: Clip.none,
+                    // 左侧:镜头 + 设置按钮(纯黑圆底)
+                    Row(
+                      crossAxisAlignment: CrossAxisAlignment.center,
                       children: [
                         IconButton(
-                          tooltip: '作品',
-                          onPressed: _showExportsSheet,
+                          onPressed: (_recording || _busy)
+                              ? null
+                              : _showLensSheet,
                           icon: const Icon(
-                            Icons.folder,
+                            Icons.camera_alt,
                             color: Colors.white,
-                            size: 24,
+                            size: 26,
                           ),
                           style: IconButton.styleFrom(
                             backgroundColor: Colors.black,
+                            disabledBackgroundColor: Colors.black26,
                           ),
                         ),
-                        if (_exports.isNotEmpty)
-                          Positioned(
-                            right: 2,
-                            top: 2,
-                            child: Container(
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 5,
-                                vertical: 1,
+                        IconButton(
+                          onPressed: (_recording || _busy)
+                              ? null
+                              : _showSettingsSheet,
+                          icon: const Icon(
+                            Icons.settings,
+                            color: Colors.white,
+                            size: 22,
+                          ),
+                          style: IconButton.styleFrom(
+                            backgroundColor: Colors.black,
+                            disabledBackgroundColor: Colors.black26,
+                          ),
+                        ),
+                        // 作品(已导出视频)入口
+                        Stack(
+                          clipBehavior: Clip.none,
+                          children: [
+                            IconButton(
+                              tooltip: '作品',
+                              onPressed: _showExportsSheet,
+                              icon: const Icon(
+                                Icons.folder,
+                                color: Colors.white,
+                                size: 24,
                               ),
-                              decoration: BoxDecoration(
-                                color: Colors.redAccent,
-                                borderRadius: BorderRadius.circular(8),
+                              style: IconButton.styleFrom(
+                                backgroundColor: Colors.black,
                               ),
-                              child: Text(
-                                '${_exports.length}',
-                                style: const TextStyle(
-                                  color: Colors.white,
-                                  fontSize: 9,
-                                  fontWeight: FontWeight.bold,
+                            ),
+                            if (_exports.isNotEmpty)
+                              Positioned(
+                                right: 2,
+                                top: 2,
+                                child: Container(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 5,
+                                    vertical: 1,
+                                  ),
+                                  decoration: BoxDecoration(
+                                    color: Colors.redAccent,
+                                    borderRadius: BorderRadius.circular(8),
+                                  ),
+                                  child: Text(
+                                    '${_exports.length}',
+                                    style: const TextStyle(
+                                      color: Colors.white,
+                                      fontSize: 9,
+                                      fontWeight: FontWeight.bold,
+                                    ),
+                                  ),
                                 ),
                               ),
-                            ),
-                          ),
-                      ],
-                    ),
-                    // 当前等效焦距 + 画质/帧率
-                    Padding(
-                      padding: const EdgeInsets.only(left: 4),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(
-                            '${(_zoom * 26).round()}mm',
-                            style: const TextStyle(
-                              color: Colors.white70,
-                              fontSize: 11,
-                              backgroundColor: Colors.black,
-                            ),
-                          ),
-                          Text(
-                            '$_qualityLabel  $_fps fps',
-                            style: const TextStyle(
-                              color: Colors.white70,
-                              fontSize: 11,
-                              backgroundColor: Colors.black,
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                  ],
-                ),
-
-                // 右侧:未连接(或本段无心率)→蓝牙按钮;已连接→实时心率胶囊
-                if (!(_recording ? _recordHadBle : widget.ble.isConnected) ||
-                    !widget.ble.isConnected)
-                  IconButton(
-                    onPressed: _showBleSheet,
-                    icon: const Icon(
-                      Icons.bluetooth_disabled,
-                      color: Colors.white,
-                      size: 24,
-                    ),
-                    style: IconButton.styleFrom(backgroundColor: Colors.black),
-                  )
-                else
-                  StreamBuilder<int>(
-                    stream: widget.ble.bpmStream,
-                    initialData: bpmNow,
-                    builder: (context, snap) {
-                      final bpm = snap.data ?? 0;
-                      return GestureDetector(
-                        onTap: _showBleSheet,
-                        child: Container(
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 14,
-                            vertical: 8,
-                          ),
-                          decoration: BoxDecoration(
-                            color: Colors.black,
-                            borderRadius: BorderRadius.circular(24),
-                            border: Border.all(color: Colors.white12),
-                          ),
-                          child: Row(
-                            mainAxisSize: MainAxisSize.min,
+                          ],
+                        ),
+                        // 当前等效焦距 + 画质/帧率
+                        Padding(
+                          padding: const EdgeInsets.only(left: 4),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
                             children: [
-                              const Icon(
-                                Icons.favorite,
-                                color: Colors.red,
-                                size: 22,
-                              ),
-                              const SizedBox(width: 8),
                               Text(
-                                '$bpm',
+                                '${(_zoom * 26).round()}mm',
                                 style: const TextStyle(
-                                  color: Colors.white,
-                                  fontSize: 28,
-                                  fontWeight: FontWeight.bold,
+                                  color: Colors.white70,
+                                  fontSize: 11,
+                                  backgroundColor: Colors.black,
                                 ),
                               ),
-                              const Text(
-                                ' bpm',
-                                style: TextStyle(color: Colors.white70),
+                              Text(
+                                '$_qualityLabel  $_fps fps',
+                                style: const TextStyle(
+                                  color: Colors.white70,
+                                  fontSize: 11,
+                                  backgroundColor: Colors.black,
+                                ),
                               ),
                             ],
                           ),
                         ),
-                      );
-                    },
-                  ),
-              ],
-            ),
-          ),
-
-          // 状态/错误提示(顶部控制排下方)
-          if (_hint.isNotEmpty)
-            Positioned(
-              top: topPad + (isLandscape ? 66 : 92),
-              left: 20,
-              right: 20,
-              child: Text(
-                _hint,
-                textAlign: TextAlign.center,
-                style: const TextStyle(
-                  color: Colors.yellowAccent,
-                  fontSize: 12,
-                  backgroundColor: Colors.black45,
-                ),
-              ),
-            ),
-
-          // ── 后台渲染进度条(点一下可重新打开进度窗)──
-          if (_job != null && _renderBackground)
-            Positioned(
-              top: topPad + (isLandscape ? 66 : 120),
-              left: 20,
-              right: 20,
-              child: GestureDetector(
-                onTap: _reopenRenderDialog,
-                child: ListenableBuilder(
-                  listenable: _job!,
-                  builder: (context2, _) {
-                    final job = _job!;
-                    final pct = (job.progress * 100).round();
-                    return Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 12,
-                        vertical: 8,
-                      ),
-                      decoration: BoxDecoration(
-                        color: Colors.black.withValues(alpha: 0.72),
-                        borderRadius: BorderRadius.circular(10),
-                      ),
-                      child: Row(
-                        children: [
-                          SizedBox(
-                            width: 18,
-                            height: 18,
-                            child: CircularProgressIndicator(
-                              value: job.progress,
-                              strokeWidth: 2.5,
-                              backgroundColor: Colors.white12,
-                              valueColor: const AlwaysStoppedAnimation(
-                                Colors.redAccent,
-                              ),
-                            ),
-                          ),
-                          const SizedBox(width: 10),
-                          Expanded(
-                            child: Text(
-                              job.done
-                                  ? '导出完成,可在"作品"中查看'
-                                  : '后台渲染中 $pct%  ${job.stage}',
-                              style: const TextStyle(
-                                color: Colors.white70,
-                                fontSize: 12,
-                              ),
-                            ),
-                          ),
-                          const Icon(
-                            Icons.open_in_full,
-                            size: 14,
-                            color: Colors.white38,
-                          ),
-                        ],
-                      ),
-                    );
-                  },
-                ),
-              ),
-            ),
-
-          // ── 实时心率曲线(仅本段有心率数据时显示)──
-          if (_recording &&
-              _recordHadBle &&
-              widget.ble.isConnected &&
-              _history.length >= 2)
-            Positioned(
-              left: isLandscape ? 90 : 12,
-              right: isLandscape ? 90 : 12,
-              bottom: 150,
-              height: 90,
-              child: Container(
-                decoration: BoxDecoration(
-                  color: Colors.black38,
-                  borderRadius: BorderRadius.circular(12),
-                ),
-                padding: const EdgeInsets.all(8),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Row(
-                      children: [
-                        const Icon(Icons.favorite, color: Colors.red, size: 14),
-                        const SizedBox(width: 4),
-                        Text(
-                          '心率曲线  $bpmNow bpm',
-                          style: const TextStyle(
-                            color: Colors.white70,
-                            fontSize: 11,
-                          ),
-                        ),
                       ],
                     ),
-                    const SizedBox(height: 4),
-                    Expanded(
-                      child: CustomPaint(
-                        painter: _HrCurvePainter(_history),
-                        size: Size.infinite,
+
+                    // 右侧:未连接(或本段无心率)→蓝牙按钮;已连接→实时心率胶囊
+                    if (!(_recording
+                            ? _recordHadBle
+                            : widget.ble.isConnected) ||
+                        !widget.ble.isConnected)
+                      IconButton(
+                        onPressed: _showBleSheet,
+                        icon: const Icon(
+                          Icons.bluetooth_disabled,
+                          color: Colors.white,
+                          size: 24,
+                        ),
+                        style: IconButton.styleFrom(
+                          backgroundColor: Colors.black,
+                        ),
+                      )
+                    else
+                      StreamBuilder<int>(
+                        stream: widget.ble.bpmStream,
+                        initialData: bpmNow,
+                        builder: (context, snap) {
+                          final bpm = snap.data ?? 0;
+                          return GestureDetector(
+                            onTap: _showBleSheet,
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 14,
+                                vertical: 8,
+                              ),
+                              decoration: BoxDecoration(
+                                color: Colors.black,
+                                borderRadius: BorderRadius.circular(24),
+                                border: Border.all(color: Colors.white12),
+                              ),
+                              child: Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  const Icon(
+                                    Icons.favorite,
+                                    color: Colors.red,
+                                    size: 22,
+                                  ),
+                                  const SizedBox(width: 8),
+                                  Text(
+                                    '$bpm',
+                                    style: const TextStyle(
+                                      color: Colors.white,
+                                      fontSize: 28,
+                                      fontWeight: FontWeight.bold,
+                                    ),
+                                  ),
+                                  const Text(
+                                    ' bpm',
+                                    style: TextStyle(color: Colors.white70),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          );
+                        },
                       ),
-                    ),
                   ],
                 ),
               ),
-            ),
 
-          // ── 运动稳定按钮(录像按钮左侧)──
-          Positioned(
-            bottom: 56,
-            left: isLandscape ? 40 : 28,
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Container(
-                  decoration: BoxDecoration(
-                    shape: BoxShape.circle,
-                    color: _stabRunning
-                        ? Colors.redAccent
-                        : Colors.black.withValues(alpha: 0.55),
-                    border: Border.all(
-                      color: _stabilizeEnabled
-                          ? Colors.redAccent
-                          : Colors.white24,
-                      width: 1.5,
-                    ),
-                  ),
-                  child: IconButton(
-                    tooltip: '运动稳定',
-                    // 始终可点:录制/处理中的限制在弹窗内用提示表达,避免"点了没反应"
-                    onPressed: _showStabilizeSheet,
-                    icon: Icon(
-                      Icons.screen_rotation,
-                      size: 22,
-                      color: _stabRunning
-                          ? Colors.white
-                          : (_stabilizeEnabled
-                                ? Colors.redAccent
-                                : Colors.white70),
-                    ),
+            // 状态/错误提示(顶部控制排下方)
+            if (!_liveMode && _hint.isNotEmpty)
+              Positioned(
+                top: topPad + (isLandscape ? 66 : 92),
+                left: 20,
+                right: 20,
+                child: Text(
+                  _hint,
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(
+                    color: Colors.yellowAccent,
+                    fontSize: 12,
+                    backgroundColor: Colors.black45,
                   ),
                 ),
-                const SizedBox(height: 4),
-                Text(
-                  _stabRunning ? '稳定中' : (_stabilizeEnabled ? '已开启' : '运动稳定'),
-                  style: TextStyle(
-                    color: _stabRunning ? Colors.redAccent : Colors.white54,
-                    fontSize: 10,
-                  ),
-                ),
-              ],
-            ),
-          ),
+              ),
 
-          // ── 稳定运行中的状态提示(点一下可调整)──
-          if (_stabRunning)
-            Positioned(
-              bottom: 150,
-              left: 16,
-              child: GestureDetector(
-                onTap: _showStabilizeSheet,
-                child: Container(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 10,
-                    vertical: 6,
-                  ),
-                  decoration: BoxDecoration(
-                    color: Colors.black.withValues(alpha: 0.6),
-                    borderRadius: BorderRadius.circular(8),
-                    border: Border.all(color: Colors.redAccent, width: 0.8),
-                  ),
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      const Icon(
-                        Icons.screen_rotation,
-                        color: Colors.redAccent,
-                        size: 14,
-                      ),
-                      const SizedBox(width: 6),
-                      Text(
-                        '稳定中 角修正 ${_stabCorrDeg.toStringAsFixed(1)}° · '
-                        '位移 ${_stabOffsetX.toStringAsFixed(0)},'
-                        '${_stabOffsetY.toStringAsFixed(0)}px · '
-                        '${_stabAutoZoom.toStringAsFixed(2)}x',
-                        style: const TextStyle(
-                          color: Colors.white70,
-                          fontSize: 11,
+            // ── 后台渲染进度条(点一下可重新打开进度窗)──
+            if (_job != null && _renderBackground)
+              Positioned(
+                top: topPad + (isLandscape ? 66 : 120),
+                left: 20,
+                right: 20,
+                child: GestureDetector(
+                  onTap: _reopenRenderDialog,
+                  child: ListenableBuilder(
+                    listenable: _job!,
+                    builder: (context2, _) {
+                      final job = _job!;
+                      final pct = (job.progress * 100).round();
+                      return Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 12,
+                          vertical: 8,
                         ),
+                        decoration: BoxDecoration(
+                          color: Colors.black.withValues(alpha: 0.72),
+                          borderRadius: BorderRadius.circular(10),
+                        ),
+                        child: Row(
+                          children: [
+                            SizedBox(
+                              width: 18,
+                              height: 18,
+                              child: CircularProgressIndicator(
+                                value: job.progress,
+                                strokeWidth: 2.5,
+                                backgroundColor: Colors.white12,
+                                valueColor: const AlwaysStoppedAnimation(
+                                  Colors.redAccent,
+                                ),
+                              ),
+                            ),
+                            const SizedBox(width: 10),
+                            Expanded(
+                              child: Text(
+                                job.done
+                                    ? '导出完成,可在"作品"中查看'
+                                    : '后台渲染中 $pct%  ${job.stage}',
+                                style: const TextStyle(
+                                  color: Colors.white70,
+                                  fontSize: 12,
+                                ),
+                              ),
+                            ),
+                            const Icon(
+                              Icons.open_in_full,
+                              size: 14,
+                              color: Colors.white38,
+                            ),
+                          ],
+                        ),
+                      );
+                    },
+                  ),
+                ),
+              ),
+
+            // ── 实时心率曲线(仅本段有心率数据时显示)──
+            if (_recording &&
+                _recordHadBle &&
+                widget.ble.isConnected &&
+                _history.length >= 2)
+              Positioned(
+                left: isLandscape ? 90 : 12,
+                right: isLandscape ? 90 : 12,
+                bottom: 150,
+                height: 90,
+                child: Container(
+                  decoration: BoxDecoration(
+                    color: Colors.black38,
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  padding: const EdgeInsets.all(8),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        children: [
+                          const Icon(
+                            Icons.favorite,
+                            color: Colors.red,
+                            size: 14,
+                          ),
+                          const SizedBox(width: 4),
+                          Text(
+                            '心率曲线  $bpmNow bpm',
+                            style: const TextStyle(
+                              color: Colors.white70,
+                              fontSize: 11,
+                            ),
+                          ),
+                        ],
                       ),
-                      const SizedBox(width: 8),
-                      Text(
-                        _gyroCount == 0
-                            ? '陀螺仪无数据'
-                            : '${_gyroHz.toStringAsFixed(0)}Hz',
-                        style: TextStyle(
-                          color: _gyroCount == 0
-                              ? Colors.redAccent
-                              : Colors.greenAccent,
-                          fontSize: 10,
+                      const SizedBox(height: 4),
+                      Expanded(
+                        child: CustomPaint(
+                          painter: _HrCurvePainter(_history),
+                          size: Size.infinite,
                         ),
                       ),
                     ],
                   ),
                 ),
               ),
-            ),
 
-          // ── 录像按钮(底部中央)──
-          Positioned(
-            bottom: 40,
-            left: 0,
-            right: 0,
-            child: Center(
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Text(
-                    _busy
-                        ? '处理中…'
-                        : (_recording
-                              ? '● ${_timer.elapsed.inSeconds}s 点此停止'
-                              : '点击开始录像'),
-                    style: const TextStyle(color: Colors.white70),
-                  ),
-                  const SizedBox(height: 8),
-                  // 拍摄按钮:白圆环包裹内部红圆(录制中:红圆环+内部白圆)
-                  GestureDetector(
-                    onTap: _toggleRecord,
-                    child: Container(
-                      width: 76,
-                      height: 76,
+            // ── 运动稳定按钮(录像按钮左侧)──
+            if (!_liveMode)
+              Positioned(
+                bottom: 56,
+                left: isLandscape ? 40 : 28,
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Container(
                       decoration: BoxDecoration(
                         shape: BoxShape.circle,
-                        color: _recording ? Colors.redAccent : Colors.white,
-                        border: Border.all(color: Colors.white, width: 5),
+                        color: _stabRunning
+                            ? Colors.redAccent
+                            : Colors.black.withValues(alpha: 0.55),
+                        border: Border.all(
+                          color: _stabilizeEnabled
+                              ? Colors.redAccent
+                              : Colors.white24,
+                          width: 1.5,
+                        ),
                       ),
-                      child: Center(
-                        child: Container(
-                          width: 54,
-                          height: 54,
-                          decoration: BoxDecoration(
-                            shape: BoxShape.circle,
-                            color: _recording ? Colors.white : Colors.redAccent,
-                          ),
+                      child: IconButton(
+                        tooltip: '运动稳定',
+                        // 始终可点:录制/处理中的限制在弹窗内用提示表达,避免"点了没反应"
+                        onPressed: _showStabilizeSheet,
+                        icon: Icon(
+                          Icons.screen_rotation,
+                          size: 22,
+                          color: _stabRunning
+                              ? Colors.white
+                              : (_stabilizeEnabled
+                                    ? Colors.redAccent
+                                    : Colors.white70),
                         ),
                       ),
                     ),
-                  ),
-                ],
+                    const SizedBox(height: 4),
+                    Text(
+                      _stabRunning
+                          ? '稳定中'
+                          : (_stabilizeEnabled ? '已开启' : '运动稳定'),
+                      style: TextStyle(
+                        color: _stabRunning ? Colors.redAccent : Colors.white54,
+                        fontSize: 10,
+                      ),
+                    ),
+                  ],
+                ),
               ),
-            ),
-          ),
-        ],
+
+            // ── 稳定运行中的状态提示(点一下可调整)──
+            if (_stabRunning)
+              Positioned(
+                bottom: 150,
+                left: 16,
+                child: GestureDetector(
+                  onTap: _showStabilizeSheet,
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 10,
+                      vertical: 6,
+                    ),
+                    decoration: BoxDecoration(
+                      color: Colors.black.withValues(alpha: 0.6),
+                      borderRadius: BorderRadius.circular(8),
+                      border: Border.all(color: Colors.redAccent, width: 0.8),
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        const Icon(
+                          Icons.screen_rotation,
+                          color: Colors.redAccent,
+                          size: 14,
+                        ),
+                        const SizedBox(width: 6),
+                        Text(
+                          '稳定中 角修正 ${_stabCorrDeg.toStringAsFixed(1)}° · '
+                          '位移 ${_stabOffsetX.toStringAsFixed(0)},'
+                          '${_stabOffsetY.toStringAsFixed(0)}px · '
+                          '${_stabAutoZoom.toStringAsFixed(2)}x',
+                          style: const TextStyle(
+                            color: Colors.white70,
+                            fontSize: 11,
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        Text(
+                          _gyroCount == 0
+                              ? '陀螺仪无数据'
+                              : '${_gyroHz.toStringAsFixed(0)}Hz',
+                          style: TextStyle(
+                            color: _gyroCount == 0
+                                ? Colors.redAccent
+                                : Colors.greenAccent,
+                            fontSize: 10,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+
+            // ── 录像按钮(底部中央)──
+            if (!_liveMode)
+              Positioned(
+                bottom: 40,
+                left: 0,
+                right: 0,
+                child: Center(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(
+                        _busy
+                            ? '处理中…'
+                            : (_recording
+                                  ? '● ${_timer.elapsed.inSeconds}s 点此停止'
+                                  : '点击开始录像'),
+                        style: const TextStyle(color: Colors.white70),
+                      ),
+                      const SizedBox(height: 8),
+                      // 拍摄按钮:白圆环包裹内部红圆(录制中:红圆环+内部白圆)
+                      GestureDetector(
+                        onTap: _toggleRecord,
+                        child: Container(
+                          width: 76,
+                          height: 76,
+                          decoration: BoxDecoration(
+                            shape: BoxShape.circle,
+                            color: _recording ? Colors.redAccent : Colors.white,
+                            border: Border.all(color: Colors.white, width: 5),
+                          ),
+                          child: Center(
+                            child: Container(
+                              width: 54,
+                              height: 54,
+                              decoration: BoxDecoration(
+                                shape: BoxShape.circle,
+                                color: _recording
+                                    ? Colors.white
+                                    : Colors.redAccent,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+          ],
+        ),
       ),
     );
   }
