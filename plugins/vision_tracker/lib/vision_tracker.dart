@@ -19,6 +19,23 @@ class VisionTracker {
 
   static bool get isSupported => Platform.isIOS;
 
+  /// 抓屏可行性探针:用 ReplayKit 抓一帧,返回整帧与中心区域的平均亮度。
+  /// 目的:验证 iOS 能否通过抓屏拿到**相机预览画面**。
+  /// (某些机型上预览层是硬件合成的,抓出来可能是纯黑 → 这条路不通)
+  /// 返回 {'w','h','mean','center'};平台不支持或失败返回 null。
+  static Future<Map<String, double>?> probeReplay() async {
+    if (!isSupported) return null;
+    try {
+      final raw = await _ch.invokeMethod<Map<dynamic, dynamic>>('probeReplay');
+      if (raw == null) return null;
+      return raw.map((k, v) => MapEntry(k.toString(), (v as num).toDouble()));
+    } on PlatformException {
+      return null;
+    } on MissingPluginException {
+      return null;
+    }
+  }
+
   /// 在一帧灰度图里找候选目标(文字/数字、醒目区域、矩形)。
   /// [bytes] 是 w*h 的灰度数据;[rotationQuarterTurns] 是顺时针 90° 的圈数,
   /// 用于把传感器方向的画面转成和预览一致的朝向(返回的坐标也随之生效)。
