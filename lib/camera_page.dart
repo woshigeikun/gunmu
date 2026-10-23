@@ -3578,6 +3578,42 @@ class _CameraPageState extends State<CameraPage> {
                             setSheetState(() {});
                           },
                         ),
+                        // 抓屏可行性探针:验证 iOS 能否用 ReplayKit 拿到
+                        // 相机预览画面 —— 拿得到才能做"录像时实时跟踪"。
+                        ListTile(
+                          contentPadding: EdgeInsets.zero,
+                          leading: const Icon(
+                            Icons.screen_share,
+                            color: Colors.white70,
+                          ),
+                          title: const Text(
+                            '检测抓屏能力(ReplayKit 探针)',
+                            style: TextStyle(color: Colors.white, fontSize: 15),
+                          ),
+                          subtitle: const Text(
+                            '抓一帧屏幕并显示平均亮度:有数值=能抓到预览画面,'
+                            '≈0=预览层是黑的(这条路不通)',
+                            style: TextStyle(
+                              color: Colors.white38,
+                              fontSize: 11,
+                            ),
+                          ),
+                          onTap: () async {
+                            Navigator.pop(ctx);
+                            setState(() => _hint = '正在抓屏检测…');
+                            final r = await VisionTracker.probeReplay();
+                            if (!mounted) return;
+                            final center = r?['center'] ?? 0;
+                            setState(
+                              () => _hint = r == null
+                                  ? '抓屏不可用(平台不支持或启动失败)'
+                                  : '抓屏 ${r['w']?.toInt()}×${r['h']?.toInt()}'
+                                        ' · 全屏亮度 ${(r['mean'] ?? 0).toStringAsFixed(1)}'
+                                        ' · 中心亮度 ${center.toStringAsFixed(1)}'
+                                        '${center > 8 ? " → 成功,能抓到画面" : " → 中心是黑的,不通"}',
+                            );
+                          },
+                        ),
                         SwitchListTile(
                           contentPadding: EdgeInsets.zero,
                           value: _materialExport,
