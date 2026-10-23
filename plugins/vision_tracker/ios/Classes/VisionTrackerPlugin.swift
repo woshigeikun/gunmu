@@ -2,6 +2,8 @@ import Flutter
 import UIKit
 import Vision
 import CoreGraphics
+import CoreMedia
+import ReplayKit
 
 /// 用 iOS Vision 框架跟踪一个框选目标。
 ///
@@ -25,8 +27,69 @@ public class VisionTrackerPlugin: NSObject, FlutterPlugin {
       handleTrack(call, result: result)
     case "detectTargets":
       handleDetect(call, result: result)
+    case "probeReplay":
+      handleProbeReplay(result: result)
     default:
       result(FlutterMethodNotImplemented)
+    }
+  }
+
+  // ─────────────── 抓屏可行性探针 ───────────────
+
+  /// 用 ReplayKit 抓一帧屏幕,统计整帧与中心区域的平均亮度。
+  /// 目的:验证"相机预览层能不能被 ReplayKit 抓到" —— 某些机型/系统上
+  /// 预览层是硬件合成的,抓出来可能是纯黑,那就说明这条路不通。
+  private func handleProbeReplay(result: @escaping FlutterResult) {
+    let rec = RPScreenRecorder.shared()
+    guard rec.isAvailable else {
+      result(FlutterError(code: "unavailable", message: "ReplayKit 不可用", details: nil))
+      return
+    }
+    var finished = false
+    rec.isMicrophoneEnabled = false
+    rec.startCapture { sample, type, _ in
+      guard !finished, type == .video, let buf = sample,
+        let px = CMSampleBufferGetImageBuffer(buf)
+      else { return }
+      finished = true
+      CVPixelBufferLockBaseAddress(px, .readOnly)
+      let w = CVPixelBufferGetWidth(px)
+      let h = CVPixelBufferGetHeight(px)
+      let stride = CVPixelBufferGetBytesPerRow(px)
+      var sum = 0.0, cnt = 0.0, csum = 0.0, ccnt = 0.0
+      if let base = CVPixelBufferGetBaseAddress(px) {
+        let p = base.assumingMemoryBound(to: UInt8.self)
+        var y = 0
+        while y < h {
+          var x = 0
+          while x < w {
+            let o = y * stride + x * 4
+            let b = Double(p[o]), g = Double(p[o + 1]), r = Double(p[o + 2])
+            let l = 0.299 * r + 0.587 * g + 0.114 * b
+            sum += l
+            cnt += 1
+            if x > w / 4 && x < w * 3 / 4 && y > h / 4 && y < h * 3 / 4 {
+              csum += l
+              ccnt += 1
+            }
+            x += 8
+          }
+          y += 8
+        }
+      }
+      CVPixelBufferUnlockBaseAddress(px, .readOnly)
+      rec.stopCapture { _ in }
+      DispatchQueue.main.async {
+        result([
+          "w": w, "h": h,
+          "mean": cnt > 0 ? sum / cnt : 0.0,
+          "center": ccnt > 0 ? csum / ccnt : 0.0,
+        ])
+      }
+    } completionHandler: { err in
+      if let e = err {
+        result(FlutterError(code: "start_failed", message: e.localizedDescription, details: nil))
+      }
     }
   }
 
