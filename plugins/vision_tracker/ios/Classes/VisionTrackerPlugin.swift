@@ -48,8 +48,8 @@ public class VisionTrackerPlugin: NSObject, FlutterPlugin {
     var finished = false
     rec.isMicrophoneEnabled = false
     rec.startCapture { sample, type, _ in
-      guard !finished, type == .video, let buf = sample,
-        let px = CMSampleBufferGetImageBuffer(buf)
+      guard !finished, type == .video,
+        let px = CMSampleBufferGetImageBuffer(sample)
       else { return }
       finished = true
       CVPixelBufferLockBaseAddress(px, .readOnly)
