@@ -1,4 +1,4 @@
-import 'dart:async';
+﻿import 'dart:async';
 import 'dart:io';
 import 'dart:isolate';
 import 'dart:math' as math;
@@ -27,7 +27,7 @@ import 'target_tracker.dart';
 /// 画面锁定的跟踪帧宽度。
 /// iOS 走系统 Vision(算力不在 Dart 侧),可以用更大分辨率换精度;
 /// 其他平台退回 Dart 的 SAD 块匹配,小一点才跑得动。
-const int kTrackWidthVision = 320;
+const int kTrackWidthVision = 448;
 const int kTrackWidthSad = 128;
 int get kTrackWidth =>
     VisionTracker.isSupported ? kTrackWidthVision : kTrackWidthSad;
