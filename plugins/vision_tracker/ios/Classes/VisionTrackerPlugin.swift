@@ -1,4 +1,4 @@
-import Flutter
+﻿import Flutter
 import UIKit
 import Vision
 import CoreGraphics
@@ -150,7 +150,7 @@ public class VisionTrackerPlugin: NSObject, FlutterPlugin {
       cgImage: img, orientation: cgOrientation(rotation), options: [:])
 
     let textReq = VNRecognizeTextRequest()
-    textReq.recognitionLevel = .fast
+    textReq.recognitionLevel = .accurate
     textReq.usesLanguageCorrection = false
 
     let salReq = VNGenerateAttentionBasedSaliencyImageRequest()
