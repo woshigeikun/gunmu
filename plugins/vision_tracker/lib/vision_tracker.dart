@@ -19,6 +19,61 @@ class VisionTracker {
 
   static bool get isSupported => Platform.isIOS;
 
+  /// 实时跟踪事件通道:每帧推回 {'x','y','w','h','c'}(相对预览的 0~1 归一化)
+  static const EventChannel _liveCh = EventChannel('vision_tracker/live');
+  static Stream<Map<String, double>> get liveStream => _liveCh
+      .receiveBroadcastStream()
+      .where((e) => e is Map)
+      .map(
+        (e) => (e as Map).map(
+          (k, v) => MapEntry(k.toString(), (v as num).toDouble()),
+        ),
+      );
+
+  /// 开始"录制中实时跟踪"(ReplayKit 抓屏 + Vision 逐帧跟踪,只回传框坐标)。
+  /// [box]:用户框,相对**预览**的 0~1 归一化;
+  /// [region]:预览画面在**整屏**里的 0~1 位置 —— 抓屏抓的是整屏,
+  ///          需要它才能把框换算过去。
+  static Future<bool> startLive({
+    required Rect box,
+    required Rect region,
+  }) async {
+    if (!isSupported) return false;
+    try {
+      await _ch.invokeMethod<void>('startLiveTracking', {
+        'box': {'x': box.left, 'y': box.top, 'w': box.width, 'h': box.height},
+        'region': {
+          'x': region.left,
+          'y': region.top,
+          'w': region.width,
+          'h': region.height,
+        },
+      });
+      return true;
+    } on PlatformException {
+      return false;
+    } on MissingPluginException {
+      return false;
+    }
+  }
+
+  /// 换目标(重新画框)时更新跟踪器的初始观测
+  static Future<void> updateLiveBox(Rect box) async {
+    if (!isSupported) return;
+    try {
+      await _ch.invokeMethod<void>('updateLiveBox', {
+        'box': {'x': box.left, 'y': box.top, 'w': box.width, 'h': box.height},
+      });
+    } catch (_) {}
+  }
+
+  static Future<void> stopLive() async {
+    if (!isSupported) return;
+    try {
+      await _ch.invokeMethod<void>('stopLiveTracking');
+    } catch (_) {}
+  }
+
   /// 抓屏可行性探针:用 ReplayKit 抓一帧,返回整帧与中心区域的平均亮度。
   /// 目的:验证 iOS 能否通过抓屏拿到**相机预览画面**。
   /// (某些机型上预览层是硬件合成的,抓出来可能是纯黑 → 这条路不通)
