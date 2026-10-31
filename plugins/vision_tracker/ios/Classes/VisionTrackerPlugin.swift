@@ -1,4 +1,4 @@
-﻿import Flutter
+import Flutter
 import UIKit
 import Vision
 import CoreGraphics
@@ -13,12 +13,17 @@ import ReplayKit
 ///
 /// 坐标系注意:Vision 的 boundingBox 是**归一化且原点在左下角**,
 /// 而入参给出的框是"跟踪帧像素、原点左上角",两边要互相换算。
-public class VisionTrackerPlugin: NSObject, FlutterPlugin {
-  public static func register(with registrar: FlutterPluginRegistrar) {
+public class VisionTrackerPlugin: NSObject, FlutterPlugin {  public static func register(with registrar: FlutterPluginRegistrar) {
     let channel = FlutterMethodChannel(
       name: "vision_tracker", binaryMessenger: registrar.messenger())
     let instance = VisionTrackerPlugin()
     registrar.addMethodCallDelegate(instance, channel: channel)
+
+    // 实时跟踪的事件通道:只回传**框坐标**(每帧 4~5 个数),
+    // 不传图像 —— 抓屏一帧 1170×2532 约 3MB,传图像平台通道撑不住。
+    let live = FlutterEventChannel(
+      name: "vision_tracker/live", binaryMessenger: registrar.messenger())
+    live.setStreamHandler(LiveTrackerStreamHandler(plugin: instance))
   }
 
   public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
@@ -29,8 +34,143 @@ public class VisionTrackerPlugin: NSObject, FlutterPlugin {
       handleDetect(call, result: result)
     case "probeReplay":
       handleProbeReplay(result: result)
+    case "startLiveTracking":
+      handleStartLive(call, result: result)
+    case "stopLiveTracking":
+      stopLive()
+      result(nil)
+    case "updateLiveBox":
+      handleUpdateLiveBox(call, result: result)
     default:
       result(FlutterMethodNotImplemented)
+    }
+  }
+
+  // ─────────────── 录制中实时跟踪(ReplayKit 抓屏)───────────────
+
+  var liveSink: FlutterEventSink?
+  private var liveHandler: VNSequenceRequestHandler?
+  private var liveRequest: VNTrackObjectRequest?
+  /// 预览区域在**整屏**里的归一化位置(0~1);把用户画的框换算到整屏坐标要用它
+  private var liveRegion = CGRect(x: 0, y: 0, width: 1, height: 1)
+  private var liveLastTick: CFAbsoluteTime = 0
+
+  /// 用户框(相对预览,0~1、左上原点) → Vision 框(相对整屏,0~1、左下原点)
+  private func toScreenVision(_ b: CGRect) -> CGRect {
+    let sx = liveRegion.minX + b.minX * liveRegion.width
+    let syTop = liveRegion.minY + b.minY * liveRegion.height
+    let sw = b.width * liveRegion.width
+    let sh = b.height * liveRegion.height
+    return CGRect(x: sx, y: 1 - (syTop + sh), width: sw, height: sh)
+  }
+
+  /// Vision 框(整屏) → 用户框(相对预览,左上原点),Dart 侧直接拿去画
+  private func fromScreenVision(_ v: CGRect) -> [String: Any] {
+    let x = (v.minX - liveRegion.minX) / max(liveRegion.width, 1e-6)
+    let y = (1 - v.maxY - liveRegion.minY) / max(liveRegion.height, 1e-6)
+    let w = v.width / max(liveRegion.width, 1e-6)
+    let h = v.height / max(liveRegion.height, 1e-6)
+    return ["x": x, "y": y, "w": w, "h": h]
+  }
+
+  private func handleStartLive(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+    let a = call.arguments as? [String: Any] ?? [:]
+    guard let bm = a["box"] as? [String: Any],
+      let rm = a["region"] as? [String: Any]
+    else {
+      result(FlutterError(code: "bad_args", message: "缺少 box / region", details: nil))
+      return
+    }
+    func num(_ m: [String: Any], _ k: String) -> Double {
+      (m[k] as? NSNumber)?.doubleValue ?? 0
+    }
+    liveRegion = CGRect(
+      x: num(rm, "x"), y: num(rm, "y"),
+      width: num(rm, "w"), height: num(rm, "h"))
+    let userBox = CGRect(
+      x: num(bm, "x"), y: num(bm, "y"),
+      width: num(bm, "w"), height: num(bm, "h"))
+    liveHandler = VNSequenceRequestHandler()
+    let req = VNTrackObjectRequest(
+      detectedObjectObservation: VNDetectedObjectObservation(
+        boundingBox: toScreenVision(userBox)))
+    req.trackingLevel = .fast
+    liveRequest = req
+    liveLastTick = 0
+
+    let rec = RPScreenRecorder.shared()
+    guard rec.isAvailable else {
+      result(FlutterError(code: "unavailable", message: "ReplayKit 不可用", details: nil))
+      return
+    }
+    if rec.isRecording {
+      result(nil)
+      return
+    }
+    rec.isMicrophoneEnabled = false
+    rec.startCapture(
+      handler: { [weak self] sample, type, _ in
+        guard let self, type == .video,
+          let px = CMSampleBufferGetImageBuffer(sample)
+        else { return }
+        self.tickLive(px)
+      },
+      completionHandler: { [weak self] err in
+        if let e = err {
+          DispatchQueue.main.async {
+            self?.liveSink?(
+              FlutterError(code: "start_failed", message: e.localizedDescription, details: nil))
+          }
+        }
+      })
+    result(nil)
+  }
+
+  private func handleUpdateLiveBox(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+    let a = call.arguments as? [String: Any] ?? [:]
+    guard let bm = a["box"] as? [String: Any] else {
+      result(nil)
+      return
+    }
+    func num(_ m: [String: Any], _ k: String) -> Double {
+      (m[k] as? NSNumber)?.doubleValue ?? 0
+    }
+    let userBox = CGRect(
+      x: num(bm, "x"), y: num(bm, "y"),
+      width: num(bm, "w"), height: num(bm, "h"))
+    let req = VNTrackObjectRequest(
+      detectedObjectObservation: VNDetectedObjectObservation(
+        boundingBox: toScreenVision(userBox)))
+    req.trackingLevel = .fast
+    liveRequest = req
+    result(nil)
+  }
+
+  private func stopLive() {
+    guard RPScreenRecorder.shared().isRecording else { return }
+    RPScreenRecorder.shared().stopCapture { _ in }
+  }
+
+  /// 每帧回调:节流到约 15fps,只跑跟踪,把结果回传
+  private func tickLive(_ px: CVPixelBuffer) {
+    guard let req = liveRequest, let handler = liveHandler else { return }
+    let now = CFAbsoluteTimeGetCurrent()
+    if now - liveLastTick < 0.06 { return }
+    liveLastTick = now
+    do {
+      try handler.perform([req], on: px)
+    } catch {
+      return
+    }
+    guard let obs = req.results?.first as? VNDetectedObjectObservation else { return }
+    // 置信度够才更新观测;不够就保持上一次,避免跟踪器被噪声带跑
+    if obs.confidence > 0.3 {
+      req.inputObservation = obs
+    }
+    var payload = fromScreenVision(obs.boundingBox)
+    payload["c"] = obs.confidence
+    DispatchQueue.main.async { [weak self] in
+      self?.liveSink?(payload)
     }
   }
 
@@ -357,5 +497,23 @@ public class VisionTrackerPlugin: NSObject, FlutterPlugin {
       bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue),
       provider: provider, decode: nil, shouldInterpolate: false,
       intent: .defaultIntent)
+  }
+}
+
+/// 事件通道的 StreamHandler:把 sink 交给插件,让每帧跟踪结果能推给 Dart
+public class LiveTrackerStreamHandler: NSObject, FlutterStreamHandler {
+  private weak var plugin: VisionTrackerPlugin?
+  init(plugin: VisionTrackerPlugin) {
+    self.plugin = plugin
+  }
+  public func onListen(
+    withArguments arguments: Any?, eventSink events: @escaping FlutterEventSink
+  ) -> FlutterError? {
+    plugin?.liveSink = events
+    return nil
+  }
+  public func onCancel(withArguments arguments: Any?) -> FlutterError? {
+    plugin?.liveSink = nil
+    return nil
   }
 }
