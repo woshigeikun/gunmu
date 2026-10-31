@@ -1,4 +1,4 @@
-﻿import 'dart:async';
+import 'dart:async';
 import 'dart:io';
 import 'dart:isolate';
 import 'dart:math' as math;
@@ -1496,6 +1496,77 @@ class _CameraPageState extends State<CameraPage> {
     }
   }
 
+  // ────────── 录制中实时抓屏跟踪 ──────────
+  /// 预览画面在屏幕上的位置(用来把"相对预览的框"换算到整屏;抓屏抓的是整屏)
+  final GlobalKey _previewKey = GlobalKey();
+  StreamSubscription<Map<String, double>>? _liveSub;
+
+  /// 实时跟踪得到的框(预览控件坐标),用于录制中画框
+  Rect? _liveBoxScreen;
+
+  /// 实时轨迹日志:[时间秒, 目标中心x, 目标中心y],给导出复用
+  final List<List<double>> _liveLog = [];
+  double _liveLogStart = 0;
+
+  void _startLiveTracking() {
+    final box = _lockBox;
+    if (!VisionTracker.isSupported) return;
+    if (!_lockEnabled || box == null) return;
+    final ctx = _previewKey.currentContext;
+    final rb = ctx?.findRenderObject() as RenderBox?;
+    if (rb == null || !rb.hasSize) return;
+    final mq = MediaQuery.of(context);
+    if (mq.size.width <= 0 || mq.size.height <= 0) return;
+    final origin = rb.localToGlobal(Offset.zero);
+    final region = Rect.fromLTWH(
+      origin.dx / mq.size.width,
+      origin.dy / mq.size.height,
+      rb.size.width / mq.size.width,
+      rb.size.height / mq.size.height,
+    );
+    _liveLog.clear();
+    _liveLogStart = DateTime.now().millisecondsSinceEpoch / 1000.0;
+    // 用户框存的是"图像归一化"坐标,而抓屏区域是**预览控件**的矩形 ——
+    // 两者在 cover 裁切下并不等价,必须先换算到控件坐标再归一化,
+    // 否则跟踪器一开始就瞄错位置。
+    final sr = _imageRectToScreen(box);
+    final ctrlBox = Rect.fromLTWH(
+      sr.left / rb.size.width,
+      sr.top / rb.size.height,
+      sr.width / rb.size.width,
+      sr.height / rb.size.height,
+    );
+    _liveSub?.cancel();
+    _liveSub = VisionTracker.liveStream.listen((m) {
+      if (!mounted) return;
+      final t = DateTime.now().millisecondsSinceEpoch / 1000.0 - _liveLogStart;
+      _liveLog.add([
+        t,
+        (m['x'] ?? 0) + (m['w'] ?? 0) / 2,
+        (m['y'] ?? 0) + (m['h'] ?? 0) / 2,
+      ]);
+      // 回传的是**控件归一化**坐标,直接乘以预览尺寸就是屏幕坐标
+      setState(
+        () => _liveBoxScreen = Rect.fromLTWH(
+          (m['x'] ?? 0) * _previewSize.width,
+          (m['y'] ?? 0) * _previewSize.height,
+          (m['w'] ?? 0) * _previewSize.width,
+          (m['h'] ?? 0) * _previewSize.height,
+        ),
+      );
+    });
+    unawaited(VisionTracker.startLive(box: ctrlBox, region: region));
+  }
+
+  Future<void> _stopLiveTracking() async {
+    await _liveSub?.cancel();
+    _liveSub = null;
+    await VisionTracker.stopLive();
+    if (_liveBoxScreen != null && mounted) {
+      setState(() => _liveBoxScreen = null);
+    }
+  }
+
   Future<void> _toggleRecord() async {
     final cam = _cam;
     // 相机未就绪(如刚渲染完、恢复失败):先尝试恢复,不要静默无反应
@@ -1550,6 +1621,9 @@ class _CameraPageState extends State<CameraPage> {
             _hint = '';
           });
         }
+        // 录制中实时抓屏跟踪:录像时 iOS 不能取图像流,但 ReplayKit 能抓屏,
+        // 屏里就有相机预览 → 用它做实时画框和跟随稳定。
+        _startLiveTracking();
       } else {
         // ── 停止录像 ──
         _ticker?.cancel();
@@ -1569,6 +1643,8 @@ class _CameraPageState extends State<CameraPage> {
 
         final XFile file = await cam.stopVideoRecording();
         if (mounted) setState(() => _recording = false);
+        // 停掉录制中的抓屏跟踪(必须在快照日志之前,保证数据完整)
+        await _stopLiveTracking();
         // 录像结束,恢复实时识别
         if (_liveDetect) unawaited(_resumeLive());
         // 快照本段数据:后台渲染期间可以继续拍摄,不能被下一段覆盖
@@ -4251,6 +4327,7 @@ class _CameraPageState extends State<CameraPage> {
             // 运动稳定开启时:画面按自适应缩放放大形成余量,再按陀螺仪位移取景框。
             if (cam != null && cam.value.isInitialized)
               Positioned.fill(
+                key: _previewKey,
                 child: GestureDetector(
                   // 单击 = 选中候选目标(自动识别出来的青色框);
                   // 单指拖拽 = 手动画框;双指 = 缩放画面留出余量。
@@ -4455,6 +4532,23 @@ class _CameraPageState extends State<CameraPage> {
                         size: Size.infinite,
                       );
                     },
+                  ),
+                ),
+              ),
+
+            // ── 录制中实时跟踪框(ReplayKit 抓屏 + Vision)──
+            if (!_liveMode && _liveBoxScreen != null)
+              Positioned(
+                left: _liveBoxScreen!.left,
+                top: _liveBoxScreen!.top,
+                width: _liveBoxScreen!.width,
+                height: _liveBoxScreen!.height,
+                child: IgnorePointer(
+                  child: Container(
+                    decoration: BoxDecoration(
+                      border: Border.all(color: Colors.cyanAccent, width: 2),
+                      borderRadius: BorderRadius.circular(4),
+                    ),
                   ),
                 ),
               ),
