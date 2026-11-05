@@ -1539,6 +1539,10 @@ class _CameraPageState extends State<CameraPage> {
     _liveSub?.cancel();
     _liveSub = VisionTracker.liveStream.listen((m) {
       if (!mounted) return;
+      // 跟丢时(lost)继续显示上一次的框,不要清空 ——
+      // "框闪一下就消失"就是清空造成的:现在框由跟踪器逐帧驱动,
+      // 跟丢只是标记,不是消失。
+      if (m['lost'] == 1) return;
       final t = DateTime.now().millisecondsSinceEpoch / 1000.0 - _liveLogStart;
       // 回传的是"预览控件归一化"坐标,而导出需要的是**成片帧归一化**坐标。
       // 两者之间隔着 cover 裁切和稳定放大,必须走 _screenToImage 换算 ——
