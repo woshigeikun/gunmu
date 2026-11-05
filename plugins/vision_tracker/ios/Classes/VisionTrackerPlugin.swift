@@ -55,6 +55,12 @@ public class VisionTrackerPlugin: NSObject, FlutterPlugin {  public static func 
   /// 预览区域在**整屏**里的归一化位置(0~1);把用户画的框换算到整屏坐标要用它
   private var liveRegion = CGRect(x: 0, y: 0, width: 1, height: 1)
   private var liveLastTick: CFAbsoluteTime = 0
+  /// 连续跟丢的帧数;超过阈值就重新捕获
+  private var liveLostStreak = 0
+  /// 上次主动校正的时刻(每 0.4 秒校正一次,防止慢慢漂走)
+  private var liveLastDetect: CFAbsoluteTime = 0
+  /// 跟踪器的当前框(跟丢时也用它回传,保证框不消失)
+  private var liveRequestBBox = CGRect(x: 0, y: 0, width: 0.05, height: 0.05)
 
   /// 用户框(相对预览,0~1、左上原点) → Vision 框(相对整屏,0~1、左下原点)
   private func toScreenVision(_ b: CGRect) -> CGRect {
@@ -97,6 +103,9 @@ public class VisionTrackerPlugin: NSObject, FlutterPlugin {  public static func 
         boundingBox: toScreenVision(userBox)))
     req.trackingLevel = .fast
     liveRequest = req
+    liveRequestBBox = req.inputObservation?.boundingBox ?? liveRequestBBox
+    liveLostStreak = 0
+    liveLastDetect = 0
     liveLastTick = 0
 
     let rec = RPScreenRecorder.shared()
@@ -144,6 +153,8 @@ public class VisionTrackerPlugin: NSObject, FlutterPlugin {  public static func 
         boundingBox: toScreenVision(userBox)))
     req.trackingLevel = .fast
     liveRequest = req
+    liveRequestBBox = req.inputObservation?.boundingBox ?? liveRequestBBox
+    liveLostStreak = 0
     result(nil)
   }
 
@@ -152,27 +163,95 @@ public class VisionTrackerPlugin: NSObject, FlutterPlugin {  public static func 
     RPScreenRecorder.shared().stopCapture { _ in }
   }
 
-  /// 每帧回调:节流到约 15fps,只跑跟踪,把结果回传
+  /// 每帧回调:逐帧跟踪 + 周期性重新捕获,并把当前框**每帧**回传。
+  ///   * 跟踪器每帧跑一次(便宜),框由它驱动 → 框不会"闪一下就没"
+  ///   * 跟丢或到时间点,就用"文字区域检测"在附近重新捕获并重置跟踪器
+  ///   * 画面先缩到 480 宽再跟踪:整帧 1170×2532 直接跟踪跟不上 60fps,
+  ///     而框的位置根本不需要那个分辨率(归一化坐标不受缩放影响)
   private func tickLive(_ px: CVPixelBuffer) {
     guard let req = liveRequest, let handler = liveHandler else { return }
     let now = CFAbsoluteTimeGetCurrent()
-    if now - liveLastTick < 0.06 { return }
-    liveLastTick = now
+    guard let cg = downscaled(px, targetW: 480) else { return }
+
     do {
-      try handler.perform([req], on: px)
+      try handler.perform([req], on: cg)
     } catch {
       return
     }
-    guard let obs = req.results?.first as? VNDetectedObjectObservation else { return }
-    // 置信度够才更新观测;不够就保持上一次,避免跟踪器被噪声带跑
-    if obs.confidence > 0.3 {
-      req.inputObservation = obs
+    var box = req.inputObservation?.boundingBox ?? liveRequestBBox
+    var conf = 0.0
+    if let obs = req.results?.first as? VNDetectedObjectObservation {
+      conf = Double(obs.confidence)
+      if conf > 0.25 {
+        req.inputObservation = obs
+        box = obs.boundingBox
+        liveLostStreak = 0
+      } else {
+        liveLostStreak += 1
+      }
     }
-    var payload = fromScreenVision(obs.boundingBox)
-    payload["c"] = obs.confidence
+
+    // 重新捕获:连续跟丢,或每隔 0.4 秒主动校正一次(防止慢慢漂走)
+    if liveLostStreak >= 3 || now - liveLastDetect > 0.4 {
+      liveLastDetect = now
+      if let nb = redetectText(near: box, in: cg) {
+        let fresh = VNTrackObjectRequest(
+          detectedObjectObservation: VNDetectedObjectObservation(boundingBox: nb))
+        fresh.trackingLevel = .fast
+        liveRequest = fresh
+        box = nb
+        liveLostStreak = 0
+      }
+    }
+
+    var payload = fromScreenVision(box)
+    payload["c"] = conf
+    // 必须回传**数字**而不是 Bool:通道过来后 Dart 侧统一按 num 解析,
+    // 混进一个 bool 会让整条流的映射抛错,框就再也不更新了。
+    payload["lost"] = (liveLostStreak > 5) ? 1.0 : 0.0
     DispatchQueue.main.async { [weak self] in
       self?.liveSink?(payload)
     }
+  }
+
+  /// 把屏幕帧等比缩到 targetW 宽(保持比例,归一化坐标因此仍然有效)
+  private func downscaled(_ px: CVPixelBuffer, targetW: CGFloat) -> CGImage? {
+    let ci = CIImage(cvPixelBuffer: px)
+    let w = ci.extent.width
+    if w <= 0 { return nil }
+    let s = min(1.0, targetW / w)
+    let out = ci.applyingFilter("CILanczosScaleTransform", parameters: [
+      kCIInputScaleKey: s, kCIInputAspectRatioKey: 1.0,
+    ])
+    return VisionTrackerPlugin.ciContext.createCGImage(out, from: out.extent)
+  }
+
+  /// 在上一帧框的附近做"文字区域"检测,用来重新捕获目标。
+  /// 只找区域、不识字 → 比完整 OCR 便宜一个数量级,足够撑起每 0.4 秒的校正。
+  private func redetectText(near box: CGRect, in img: CGImage) -> CGRect? {
+    let req = VNDetectTextRectanglesRequest()
+    req.reportCharacterBoxes = false
+    let h = VNImageRequestHandler(cgImage: img, orientation: .up, options: [:])
+    guard (try? h.perform([req])) != nil, let rs = req.results, !rs.isEmpty else {
+      return nil
+    }
+    // 取"离上一帧位置最近"的那块文字区域:相机基本是连续运动,
+    // 最近邻是最可靠的关联方式,比按面积/分数挑更稳。
+    var best: CGRect?
+    var bestD = Double.greatestFiniteMagnitude
+    for o in rs {
+      let b = o.boundingBox
+      let dx = Double(b.midX - box.midX)
+      let dy = Double(b.midY - box.midY)
+      let d = dx * dx + dy * dy
+      if d < bestD {
+        bestD = d
+        best = b
+      }
+    }
+    // 只在"附近"才接受(距中心不超过画面 1/3),否则宁可继续用跟踪结果
+    if bestD > 0.11 { return nil }
+    return best
   }
 
   // ─────────────── 抓屏可行性探针 ───────────────
