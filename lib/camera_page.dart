@@ -201,6 +201,10 @@ class _CameraPageState extends State<CameraPage> {
 
   /// 圆形取景:圆内显示画面、圆外纯黑,并把边缘做桶形(鱼眼式)畸变
   bool _circularView = false; // ignore: prefer_final_fields
+  /// 圆形取景的边缘拉伸强度(lenscorrection 的 k1,取正值存,应用时加负号)。
+  /// 越大 → 边缘被拉出去越多、黑边填得越满,但畸变越明显、边缘越糊。
+  /// 做成可调是因为"填满"和"不过分畸变"是同一根绳子的两端,只能由用户取舍。
+  double _lensFill = 0.30; // ignore: prefer_final_fields
 
   /// 直播模式:只显示心率数字与曲线,其余 UI(含锁定框/候选框/按钮/提示)全部隐藏。
   /// 进入与退出都是"双指同时按住 3 秒"。
@@ -2563,11 +2567,28 @@ class _CameraPageState extends State<CameraPage> {
         // 是叠加的 UI,不该跟着一起弯。用桶形(k1 为负)让边缘向外鼓,
         // 配合圆形遮罩就呈现鱼眼式取景。
         if (_circularView) {
-          // k1 取负 = 桶形:把中心内容向外**拉伸**去填满边缘。
-          // 实测(本机 ffmpeg):负 k1 能把原本纯黑的角落填上内容(亮度 0 → 75),
-          // 中心保持清晰,边缘被拉长变虚 —— 正是"拉伸填充、变虚没关系"。
-          // 所以这一档**不再叠加圆形遮罩**(遮罩会把边缘重新涂黑)。
-          const lens = 'lenscorrection=cx=0.5:cy=0.5:k1=-0.30:k2=0.08,';
+          // ① 先把垫层黑边填掉:用 fillborders 的**镜像**填充。
+          //    实测(本机 ffmpeg):smear 只能填左/上/下,右侧完全失效(亮度仍为 0);
+          //    mirror 四边都填 ✓,而且镜像比拉伸条纹更自然(不会出现糊边光带)。
+          //    注意必须插在 pad 之后、crop 之前 —— 这样位移窗口走到垫层任意
+          //    位置(包括侧边一整条黑带)看到的都是有内容的画面。
+          final fill =
+              'fillborders=left=$padX:right=$padX:'
+              'top=$padY:bottom=$padY:mode=mirror,';
+          final padPat = 'pad=$padW:$padH:$padX:$padY:black,';
+          stabPrefix = stabPrefix.replaceFirst(padPat, '$padPat$fill');
+          if (stabPrefixExpr.isNotEmpty) {
+            stabPrefixExpr = stabPrefixExpr.replaceFirst(
+              padPat,
+              '$padPat$fill',
+            );
+          }
+          // ② 再做桶形畸变,把边缘拉出鱼眼式的弧形观感
+          //    k1 取负 = 内容向外拉伸;强度由 _lensFill 控制。
+          //    它在 crop 之后(只作用于画面,不作用于心率的数字/曲线)。
+          final lens =
+              'lenscorrection=cx=0.5:cy=0.5:'
+              'k1=-${_lensFill.toStringAsFixed(2)}:k2=0.08,';
           stabPrefix = '$stabPrefix$lens';
           if (stabPrefixExpr.isNotEmpty) {
             stabPrefixExpr = '$stabPrefixExpr$lens';
