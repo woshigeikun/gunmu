@@ -2,6 +2,7 @@ import Flutter
 import UIKit
 import Vision
 import CoreGraphics
+import CoreImage
 import CoreMedia
 import ReplayKit
 
@@ -253,9 +254,40 @@ public class VisionTrackerPlugin: NSObject, FlutterPlugin {  public static func 
     }
   }
 
+  /// CIContext 创建开销大,全局复用一个
+  private static let ciContext = CIContext(options: [.useSoftwareRenderer: false])
+
+  /// OCR 前的图像增强:提对比度 + 轻度锐化。
+  /// 这是提升文字检出率最有效的一步:低对比度/背光/暗光/轻微运动模糊的文字,
+  /// 原图上 Vision 经常整段漏检,增强后就能稳定认出。
+  private func enhanceForOCR(_ img: CGImage) -> CGImage? {
+    let ci = CIImage(cgImage: img)
+    let out =
+      ci
+      .applyingFilter(
+        "CIColorControls",
+        parameters: [
+          kCIInputContrastKey: 1.45,
+          kCIInputBrightnessKey: 0.02,
+          kCIInputSaturationKey: 0,
+        ]
+      )
+      .applyingFilter(
+        "CISharpenLuminance", parameters: [kCIInputSharpnessKey: 0.5])
+    return VisionTrackerPlugin.ciContext.createCGImage(out, from: ci.extent)
+  }
+
+  /// 放大 2 倍(用 Lanczos,比直接插值锐利)。只在首轮没找到文字时用。
+  private func upscale2x(_ img: CGImage) -> CGImage? {
+    let ci = CIImage(cgImage: img)
+    let out = ci.applyingFilter(
+      "CILanczosScaleTransform",
+      parameters: [kCIInputScaleKey: 2.0, kCIInputAspectRatioKey: 1.0])
+    return VisionTrackerPlugin.ciContext.createCGImage(out, from: ci.extent)
+  }
+
   /// 旋转圈数 → Vision 图像方向(1 = 顺时针 90°,与转置录制一致)
-  private func cgOrientation(_ q: Int) -> CGImagePropertyOrientation {
-    switch ((q % 4) + 4) % 4 {
+  private func cgOrientation(_ q: Int) -> CGImagePropertyOrientation {    switch ((q % 4) + 4) % 4 {
     case 1: return .right
     case 2: return .down
     case 3: return .left
@@ -276,13 +308,18 @@ public class VisionTrackerPlugin: NSObject, FlutterPlugin {  public static func 
   ) -> [Double] {
     guard w > 8, h > 8, bytes.count >= w * h,
       let provider = CGDataProvider(data: bytes as CFData),
-      let img = CGImage(
+      let rawImg = CGImage(
         width: w, height: h, bitsPerComponent: 8, bitsPerPixel: 8, bytesPerRow: w,
         space: CGColorSpaceCreateDeviceGray(),
         bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue),
         provider: provider, decode: nil, shouldInterpolate: false,
         intent: .defaultIntent)
     else { return [] }
+
+    // OCR 前先做图像增强:提对比 + 轻微锐化。
+    // 实测这是提升文字检出率最有效的一步 —— 低对比度、背光、暗光、糊字
+    // 在原图上 Vision 往往整段漏掉,增强后就能认出来。
+    let img = enhanceForOCR(rawImg) ?? rawImg
 
     // 关键:把旋转交给 Vision(orientation),返回的坐标就自动落在"旋转后"的画面里,
     // 和 App 显示的竖屏预览一致,不需要 Dart 侧再换算。
@@ -291,7 +328,12 @@ public class VisionTrackerPlugin: NSObject, FlutterPlugin {  public static func 
 
     let textReq = VNRecognizeTextRequest()
     textReq.recognitionLevel = .accurate
+    // 关掉语言纠错:目标通常是数字,纠错会把"10"往单词上掰,反而降低准确率
     textReq.usesLanguageCorrection = false
+    // 限定英文:数字与拉丁字母都在这一套里,避免中英混识分散注意力
+    textReq.recognitionLanguages = ["en-US"]
+    // 允许很小的字(0.4% 画面高度),但不让噪点参与
+    textReq.minimumTextHeight = 0.004
 
     let salReq = VNGenerateAttentionBasedSaliencyImageRequest()
 
@@ -306,9 +348,25 @@ public class VisionTrackerPlugin: NSObject, FlutterPlugin {  public static func 
       return []
     }
 
+    var textObs: [VNRecognizedTextObservation] = textReq.results ?? []
+    // 兜底:首轮一个文字都没认出来时,把图放大 2 倍再试一次。
+    // 只在失败时才付这个代价,所以平均成本很小,但能救回一部分小字/糊字。
+    if textObs.isEmpty, let big = upscale2x(img) {
+      let h2 = VNImageRequestHandler(
+        cgImage: big, orientation: cgOrientation(rotation), options: [:])
+      let r2 = VNRecognizeTextRequest()
+      r2.recognitionLevel = .accurate
+      r2.usesLanguageCorrection = false
+      r2.recognitionLanguages = ["en-US"]
+      r2.minimumTextHeight = 0.002
+      if (try? h2.perform([r2])) != nil {
+        textObs = r2.results ?? []
+      }
+    }
+
     var cands: [(CGRect, Double, Int)] = []
 
-    for o in textReq.results ?? [] {
+    for o in textObs {
       cands.append((o.boundingBox, Double(o.confidence), 0))
     }
     if let sal = salReq.results?.first as? VNSaliencyImageObservation,
