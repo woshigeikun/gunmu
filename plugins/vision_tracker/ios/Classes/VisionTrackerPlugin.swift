@@ -1,4 +1,4 @@
-import Flutter
+﻿import Flutter
 import UIKit
 import Vision
 import CoreGraphics
@@ -101,9 +101,8 @@ public class VisionTrackerPlugin: NSObject, FlutterPlugin {  public static func 
     let req = VNTrackObjectRequest(
       detectedObjectObservation: VNDetectedObjectObservation(
         boundingBox: toScreenVision(userBox)))
-    req.trackingLevel = .fast
     liveRequest = req
-    liveRequestBBox = req.inputObservation?.boundingBox ?? liveRequestBBox
+    liveRequestBBox = req.inputObservation.boundingBox
     liveLostStreak = 0
     liveLastDetect = 0
     liveLastTick = 0
@@ -151,9 +150,8 @@ public class VisionTrackerPlugin: NSObject, FlutterPlugin {  public static func 
     let req = VNTrackObjectRequest(
       detectedObjectObservation: VNDetectedObjectObservation(
         boundingBox: toScreenVision(userBox)))
-    req.trackingLevel = .fast
     liveRequest = req
-    liveRequestBBox = req.inputObservation?.boundingBox ?? liveRequestBBox
+    liveRequestBBox = req.inputObservation.boundingBox
     liveLostStreak = 0
     result(nil)
   }
@@ -178,7 +176,7 @@ public class VisionTrackerPlugin: NSObject, FlutterPlugin {  public static func 
     } catch {
       return
     }
-    var box = req.inputObservation?.boundingBox ?? liveRequestBBox
+    var box = req.inputObservation.boundingBox
     var conf = 0.0
     if let obs = req.results?.first as? VNDetectedObjectObservation {
       conf = Double(obs.confidence)
@@ -197,7 +195,6 @@ public class VisionTrackerPlugin: NSObject, FlutterPlugin {  public static func 
       if let nb = redetectText(near: box, in: cg) {
         let fresh = VNTrackObjectRequest(
           detectedObjectObservation: VNDetectedObjectObservation(boundingBox: nb))
-        fresh.trackingLevel = .fast
         liveRequest = fresh
         box = nb
         liveLostStreak = 0
