@@ -1540,11 +1540,15 @@ class _CameraPageState extends State<CameraPage> {
     _liveSub = VisionTracker.liveStream.listen((m) {
       if (!mounted) return;
       final t = DateTime.now().millisecondsSinceEpoch / 1000.0 - _liveLogStart;
-      _liveLog.add([
-        t,
-        (m['x'] ?? 0) + (m['w'] ?? 0) / 2,
-        (m['y'] ?? 0) + (m['h'] ?? 0) / 2,
-      ]);
+      // 回传的是"预览控件归一化"坐标,而导出需要的是**成片帧归一化**坐标。
+      // 两者之间隔着 cover 裁切和稳定放大,必须走 _screenToImage 换算 ——
+      // 直接当帧坐标用,导出时目标会整体偏掉。
+      final cx = (m['x'] ?? 0) + (m['w'] ?? 0) / 2;
+      final cy = (m['y'] ?? 0) + (m['h'] ?? 0) / 2;
+      final img = _screenToImage(
+        Offset(cx * _previewSize.width, cy * _previewSize.height),
+      );
+      _liveLog.add([t, img.dx, img.dy]);
       // 回传的是**控件归一化**坐标,直接乘以预览尺寸就是屏幕坐标
       setState(
         () => _liveBoxScreen = Rect.fromLTWH(
@@ -1645,6 +1649,7 @@ class _CameraPageState extends State<CameraPage> {
         if (mounted) setState(() => _recording = false);
         // 停掉录制中的抓屏跟踪(必须在快照日志之前,保证数据完整)
         await _stopLiveTracking();
+        final liveTrackSnapshot = List<List<double>>.from(_liveLog);
         // 录像结束,恢复实时识别
         if (_liveDetect) unawaited(_resumeLive());
         // 快照本段数据:后台渲染期间可以继续拍摄,不能被下一段覆盖
@@ -1669,6 +1674,9 @@ class _CameraPageState extends State<CameraPage> {
             stabStrength: _stabStrength,
             stabFov: _stabFov,
             lockBox: _lockBoxSnapshot,
+            // 录制中实时抓屏得到的轨迹(/秒, 目标x, 目标y,成片帧归一化):
+            // 有它就不必再"后期找检查点",导出能省掉整段重识别与时空对齐
+            liveTrack: liveTrackSnapshot,
           ),
         );
       }
@@ -1699,6 +1707,7 @@ class _CameraPageState extends State<CameraPage> {
     double stabStrength = 1.0,
     double stabFov = 66,
     Rect? lockBox,
+    List<List<double>> liveTrack = const [],
   }) async {
     final job = RenderJob();
     setState(() {
@@ -1726,6 +1735,7 @@ class _CameraPageState extends State<CameraPage> {
         stabStrength: stabStrength,
         stabFov: stabFov,
         lockBox: lockBox,
+        liveTrack: liveTrack,
       );
       job
         ..progress = 1.0
@@ -2179,6 +2189,7 @@ class _CameraPageState extends State<CameraPage> {
     double stabStrength = 1.0,
     double stabFov = 66,
     Rect? lockBox,
+    List<List<double>> liveTrack = const [],
   }) async {
     final docs = await getApplicationDocumentsDirectory();
     final folder = Directory('${docs.path}/录像');
@@ -2289,10 +2300,13 @@ class _CameraPageState extends State<CameraPage> {
     }
 
     // 1.35) 多遍识别:检查点重新识别(每 10 秒一次)+ 用户没选时在 5 秒自动选目标
+    // 录制中实时抓屏已经拿到了完整轨迹(时间基准和陀螺仪同源、坐标已换算到
+    // 成片帧),那就完全不需要这一步 —— 省掉整段 OCR,导出明显变快。
+    final bool useLiveTrack = liveTrack.length >= 20 && lockBox != null;
     List<List<double>>? anchors;
     var effBox = lockBox;
-    var ckInfo = '';
-    if (plan != null && plan.usable) {
+    var ckInfo = useLiveTrack ? '实时抓屏轨迹 ${liveTrack.length} 点' : '';
+    if (!useLiveTrack && plan != null && plan.usable) {
       job
         ..stage = '检查点重新识别…'
         ..progress = 0.02;
@@ -2357,7 +2371,10 @@ class _CameraPageState extends State<CameraPage> {
     // 1.4) 画面锁定:跟踪出目标轨迹(必须在方向判定之后,因为抽帧要跟着转置;
     //      也必须在陀螺仪分析之后,因为要用它当先验)
     List<List<double>>? lockXY;
-    if (effBox != null && plan != null && plan.usable) {
+    if (useLiveTrack) {
+      // 直接用实时轨迹,跳过"后期跟踪 + 锚点重捕获"
+      lockXY = liveTrack.map((e) => <double>[e[0], e[1], e[2]]).toList();
+    } else if (effBox != null && plan != null && plan.usable) {
       job
         ..stage = '画面识别(目标锁定)…'
         ..progress = 0.02;
