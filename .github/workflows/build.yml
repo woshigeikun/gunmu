@@ -29,6 +29,13 @@ jobs:
           xcodebuild -version
 
       - run: flutter pub get
+      # SwiftPM 的 artifact 缓存偶发损坏,下一次构建会直接失败:
+      #   failed downloading ...libavutil.xcframework.zip
+      #   ... already exists in file system
+      # 与代码无关。每次构建前清掉;代价只是重新下载一次二进制依赖。
+      - name: 清理 SwiftPM 缓存
+        run: rm -rf ~/Library/Caches/org.swift.swiftpm
+
       - run: flutter build ios --release --no-codesign   # 先不打签名
       - name: 打包成 ipa
         run: |
