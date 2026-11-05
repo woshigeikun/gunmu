@@ -273,6 +273,12 @@ class _CameraPageState extends State<CameraPage> {
   final OnlineStabilizer _onlineStab = OnlineStabilizer();
   double _stabOffsetX = 0; // 画面横向补偿(像素,预览坐标)
   double _stabOffsetY = 0; // 画面纵向补偿(像素,预览坐标)
+  /// 跟随稳定:为了让目标停在画面正中而额外施加的位移(预览像素)。
+  /// 与陀螺仪补偿**相加**后一起作用在 Transform.translate 上,并且必须
+  /// 一并记进 _imgMap —— 否则坐标换算会把"跟随位移"当成场景运动,
+  /// 形成闭环反馈,框会越跑越偏。
+  double _followX = 0;
+  double _followY = 0;
   double _stabAutoZoom = 1.0; // 自适应缩放(保证裁切不出画面)
   double _stabStrength = 1.0; // 稳定强度(0.5 柔和 / 1.0 标准 / 1.6 强)
   final double _stabFov = 66; // 估算视场角(度),用于焦距换算
@@ -1549,6 +1555,19 @@ class _CameraPageState extends State<CameraPage> {
       // 直接当帧坐标用,导出时目标会整体偏掉。
       final cx = (m['x'] ?? 0) + (m['w'] ?? 0) / 2;
       final cy = (m['y'] ?? 0) + (m['h'] ?? 0) / 2;
+      // ── 跟随:把目标框平移到画面正中 ──
+      // 内容需要平移的量 = 画面中心 - 目标位置(符号约定:translate(+d) = 内容位移 +d)
+      final vw = _previewSize.width;
+      final vh = _previewSize.height;
+      if (vw > 0 && vh > 0) {
+        final bxPx = cx * vw;
+        final byPx = cy * vh;
+        final tx = (vw / 2 - bxPx).clamp(-vw * 0.35, vw * 0.35);
+        final ty = (vh / 2 - byPx).clamp(-vh * 0.35, vh * 0.35);
+        // 低通:每帧只走 18%,避免跟随抽动(约 130ms 时间常数)
+        _followX += (tx - _followX) * 0.18;
+        _followY += (ty - _followY) * 0.18;
+      }
       final img = _screenToImage(
         Offset(cx * _previewSize.width, cy * _previewSize.height),
       );
@@ -1571,7 +1590,14 @@ class _CameraPageState extends State<CameraPage> {
     _liveSub = null;
     await VisionTracker.stopLive();
     if (_liveBoxScreen != null && mounted) {
-      setState(() => _liveBoxScreen = null);
+      setState(() {
+        _liveBoxScreen = null;
+        _followX = 0;
+        _followY = 0;
+      });
+    } else {
+      _followX = 0;
+      _followY = 0;
     }
   }
 
@@ -4425,8 +4451,9 @@ class _CameraPageState extends State<CameraPage> {
                           : cam.value.aspectRatio;
                       // 稳定运行中:按自适应缩放放大(留出余量),并做双轴补偿
                       final over = _stabRunning ? _stabAutoZoom : 1.0;
-                      final dx = _stabRunning ? _stabOffsetX : 0.0;
-                      final dy = _stabRunning ? _stabOffsetY : 0.0;
+                      // 跟随位移与陀螺仪补偿相加;两者都记进 _imgMap(见下)
+                      final dx = (_stabRunning ? _stabOffsetX : 0.0) + _followX;
+                      final dy = (_stabRunning ? _stabOffsetY : 0.0) + _followY;
 
                       // 竖屏:纹理已竖置 → 用竖比例 cover 铺满全屏
                       if (!isLandscape) {
