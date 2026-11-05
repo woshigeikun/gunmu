@@ -349,8 +349,21 @@ public class VisionTrackerPlugin: NSObject, FlutterPlugin {  public static func 
     }
 
     var textObs: [VNRecognizedTextObservation] = textReq.results ?? []
-    // 兜底:首轮一个文字都没认出来时,把图放大 2 倍再试一次。
-    // 只在失败时才付这个代价,所以平均成本很小,但能救回一部分小字/糊字。
+    // 便宜的第一道兜底:完整 OCR 一个字都没认出来时,先用"只找文字区域、
+    // 不做识别"的检测器补候选 —— 它比完整 OCR 快 5~10 倍。
+    // 对我们"只要框的位置"的用途来说,这一步的召回率常常就够了,不必等到
+    // 放大 2 倍那一步(那一步更贵)。
+    var textRectFill: [CGRect] = []
+    if textObs.isEmpty {
+      let rr = VNDetectTextRectanglesRequest()
+      rr.reportCharacterBoxes = false
+      if (try? handler.perform([rr])) != nil {
+        for o in rr.results ?? [] {
+          textRectFill.append(o.boundingBox)
+        }
+      }
+    }
+    // 第二道兜底:放大 2 倍再 OCR(只在前面都没拿到时付这个代价)
     if textObs.isEmpty, let big = upscale2x(img) {
       let h2 = VNImageRequestHandler(
         cgImage: big, orientation: cgOrientation(rotation), options: [:])
@@ -368,6 +381,11 @@ public class VisionTrackerPlugin: NSObject, FlutterPlugin {  public static func 
 
     for o in textObs {
       cands.append((o.boundingBox, Double(o.confidence), 0))
+    }
+    // 文字"区域"检测的结果:没有识别分数,给一个中等可信度,
+    // 让它们排在 OCR 命中之后,但比醒目区域/矩形更靠前。
+    for bb in textRectFill {
+      cands.append((bb, 0.62, 0))
     }
     if let sal = salReq.results?.first as? VNSaliencyImageObservation,
       let objs = sal.salientObjects
