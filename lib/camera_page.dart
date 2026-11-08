@@ -4471,7 +4471,17 @@ class _CameraPageState extends State<CameraPage> {
                           ? 4.0 / 3.0
                           : cam.value.aspectRatio;
                       // 稳定运行中:按自适应缩放放大(留出余量),并做双轴补偿
-                      final over = _stabRunning ? _stabAutoZoom : 1.0;
+                      // 跟随位移会把画面推开 → 预览必须**额外放大**才能盖住,
+                      // 否则边缘会露出黑边(导出侧用镜像填充解决,预览做不到,
+                      // 所以这里改用"多放大一点"来等效覆盖)。
+                      final fxAbs = _followX < 0 ? -_followX : _followX;
+                      final fyAbs = _followY < 0 ? -_followY : _followY;
+                      final fmax = (fxAbs / sw) > (fyAbs / sh)
+                          ? (fxAbs / sw)
+                          : (fyAbs / sh);
+                      final followCover = 1.0 + 2.0 * fmax;
+                      final over =
+                          (_stabRunning ? _stabAutoZoom : 1.0) * followCover;
                       // 跟随位移与陀螺仪补偿相加;两者都记进 _imgMap(见下)
                       final dx = (_stabRunning ? _stabOffsetX : 0.0) + _followX;
                       final dy = (_stabRunning ? _stabOffsetY : 0.0) + _followY;
