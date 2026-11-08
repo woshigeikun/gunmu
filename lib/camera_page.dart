@@ -205,6 +205,8 @@ class _CameraPageState extends State<CameraPage> {
   /// 越大 → 边缘被拉出去越多、黑边填得越满,但畸变越明显、边缘越糊。
   /// 做成可调是因为"填满"和"不过分畸变"是同一根绳子的两端,只能由用户取舍。
   double _lensFill = 0.30; // ignore: prefer_final_fields
+  /// 诊断用:本次导出黑边填充是否真的插进了滤镜链(显示在进度窗里)
+  String _fillDiag = '';
 
   /// 直播模式:只显示心率数字与曲线,其余 UI(含锁定框/候选框/按钮/提示)全部隐藏。
   /// 进入与退出都是"双指同时按住 3 秒"。
@@ -963,13 +965,26 @@ class _CameraPageState extends State<CameraPage> {
                   mainAxisSize: MainAxisSize.min,
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    const Text(
-                      '录制设置',
-                      style: TextStyle(
-                        color: Colors.white,
-                        fontSize: 18,
-                        fontWeight: FontWeight.bold,
-                      ),
+                    Row(
+                      children: [
+                        const Text(
+                          '录制设置',
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontSize: 18,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                        const Spacer(),
+                        // 版本号:放在设置界面右上角,方便确认"装的是哪一版"
+                        Text(
+                          kBuildTag,
+                          style: const TextStyle(
+                            color: Colors.white54,
+                            fontSize: 12,
+                          ),
+                        ),
+                      ],
                     ),
                     const SizedBox(height: 16),
                     const Text(
@@ -2460,7 +2475,11 @@ class _CameraPageState extends State<CameraPage> {
         // 垫层**,裁切窗口可以在垫层里移动 —— 小幅抖动仍被放大倍率吃掉(没有
         // 黑边),只有大幅晃动才会在边缘露出黑边,而补偿范围直接放大到 ±padFrac。
         // 这是用"允许黑边"换"补偿范围"的交易。
-        const padFrac = kPadFrac; // 每个方向可移动 ±25% 的画幅
+        // 圆形取景:保留垫层(它带来大补偿范围),由 fillborders 把垫层
+        // 用**四周拉伸**填满 —— 用户要的就是"黑边的形状不变、但里面是拉伸
+        // 出来的画面"。注意:手机上 ffmpeg 6.x 的 smear 行为与本机 4.3 不同,
+        // 所以下面把是否插入填充写进诊断信息,便于确认它到底有没有进链路。
+        final padFrac = kPadFrac;
         final padX = (width * padFrac).round();
         final padY = (height * padFrac).round();
         final padW = scaledW + padX * 2;
@@ -2567,16 +2586,21 @@ class _CameraPageState extends State<CameraPage> {
         // 是叠加的 UI,不该跟着一起弯。用桶形(k1 为负)让边缘向外鼓,
         // 配合圆形遮罩就呈现鱼眼式取景。
         if (_circularView) {
-          // ① 先把垫层黑边填掉:用 fillborders 的**镜像**填充。
-          //    实测(本机 ffmpeg):smear 只能填左/上/下,右侧完全失效(亮度仍为 0);
-          //    mirror 四边都填 ✓,而且镜像比拉伸条纹更自然(不会出现糊边光带)。
-          //    注意必须插在 pad 之后、crop 之前 —— 这样位移窗口走到垫层任意
-          //    位置(包括侧边一整条黑带)看到的都是有内容的画面。
+          // ① 把垫层黑区用**四周拉伸**填满(smear = 边缘像素向外拉伸)。
+          //    位置必须在 pad 之后、crop 之前:这样位移窗口走到垫层任何位置
+          //    (包括侧边一整条黑带)看到的都是拉伸出来的内容,而不是黑。
+          //    黑区的形状因此和原来**完全一样**,只是里面填满了画面。
           final fill =
               'fillborders=left=$padX:right=$padX:'
-              'top=$padY:bottom=$padY:mode=mirror,';
+              'top=$padY:bottom=$padY:mode=smear,';
           final padPat = 'pad=$padW:$padH:$padX:$padY:black,';
+          final before = stabPrefix;
           stabPrefix = stabPrefix.replaceFirst(padPat, '$padPat$fill');
+          // 把"填充到底有没有插进滤镜链"写进诊断。没有这一行就无法区分
+          // 「没插进去」和「插了但手机上不生效」—— 两者修法完全不同。
+          _fillDiag = stabPrefix == before
+              ? '填充未插入'
+              : '填充 smear(${padX}x$padY)px';
           if (stabPrefixExpr.isNotEmpty) {
             stabPrefixExpr = stabPrefixExpr.replaceFirst(
               padPat,
@@ -2599,6 +2623,7 @@ class _CameraPageState extends State<CameraPage> {
             '${plan.maxShiftX.toStringAsFixed(0)},'
             '${plan.maxShiftY.toStringAsFixed(0)}px · '
             '可移动 ±${(padFrac * 100).round()}%(允许黑边) · '
+            '${_fillDiag.isEmpty ? '' : '$_fillDiag · '}'
             '逐帧 60Hz($n 点) · '
             '陀螺仪 ${stabGyro.length} 条'
             '${lockX != null ? ' · $logTrack' : ''}'
