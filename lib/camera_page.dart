@@ -205,6 +205,12 @@ class _CameraPageState extends State<CameraPage> {
   /// 越大 → 边缘被拉出去越多、黑边填得越满,但畸变越明显、边缘越糊。
   /// 做成可调是因为"填满"和"不过分畸变"是同一根绳子的两端,只能由用户取舍。
   double _lensFill = 0.30; // ignore: prefer_final_fields
+  /// 陀螺仪轴向反向开关:不同机型/握持方向下,传感器轴与画面轴的对应会相反。
+  /// 旋转向量里 x = pitch(上下)、y = yaw(左右),所以:
+  ///   左右反向 → 取反 gyro.y;上下反向 → 取反 gyro.x
+  /// 在**采样入口**统一取反,预览和导出共用同一份数据,天然一致。
+  bool _gyroFlipX = true; // 左右(默认开:实测当前左右是反的)
+  bool _gyroFlipY = false; // 上下
   /// 诊断用:本次导出黑边填充是否真的插进了滤镜链(显示在进度窗里)
   String _fillDiag = '';
 
@@ -3555,14 +3561,20 @@ class _CameraPageState extends State<CameraPage> {
 
           if (dt <= 0 || dt > 0.2) return;
 
+          // 轴向取反必须在**采样入口**做:预览(在线稳定)与导出(离线分析)
+          // 都吃这份数据,入口取反一次即可全局一致。若只在其中一处取反,
+          // 就会出现"预览对了、成片还是反的"这种最难查的不一致。
+          final gx = _gyroFlipY ? -e.x : e.x;
+          final gy = _gyroFlipX ? -e.y : e.y;
+
           // 记录陀螺仪数据[t(epoch秒), gx, gy, gz]
-          _stabLog.add([now.millisecondsSinceEpoch / 1000.0, e.x, e.y, e.z]);
+          _stabLog.add([now.millisecondsSinceEpoch / 1000.0, gx, gy, e.z]);
           if (_stabLog.length > 60000) _stabLog.removeAt(0);
 
           if (!_stabRunning) return;
 
           // 四元数姿态积分 + EMA 平滑虚拟相机路径 → 角修正(Gyroflow 式)
-          _onlineStab.update(dt, e.x, e.y, e.z);
+          _onlineStab.update(dt, gx, gy, e.z);
 
           // 角修正 → 像素位移(按焦距换算),并硬限制在固定裁切余量内
           final fov = _stabFov;
@@ -3978,6 +3990,57 @@ class _CameraPageState extends State<CameraPage> {
                               color: Colors.white38,
                               fontSize: 10,
                             ),
+                          ),
+                          const Divider(color: Colors.white12, height: 18),
+                          // 轴向反向:不同机型/握持方向下传感器轴可能相反。
+                          // 改完**下一次录像生效**(数据在采样入口就取反了)。
+                          SwitchListTile(
+                            contentPadding: EdgeInsets.zero,
+                            dense: true,
+                            value: _gyroFlipX,
+                            activeThumbColor: Colors.redAccent,
+                            title: const Text(
+                              '陀螺仪左右反向',
+                              style: TextStyle(
+                                color: Colors.white,
+                                fontSize: 14,
+                              ),
+                            ),
+                            subtitle: const Text(
+                              '补偿方向左右相反时打开(下次录像生效)',
+                              style: TextStyle(
+                                color: Colors.white38,
+                                fontSize: 10,
+                              ),
+                            ),
+                            onChanged: (v) {
+                              setState(() => _gyroFlipX = v);
+                              setSheetState(() {});
+                            },
+                          ),
+                          SwitchListTile(
+                            contentPadding: EdgeInsets.zero,
+                            dense: true,
+                            value: _gyroFlipY,
+                            activeThumbColor: Colors.redAccent,
+                            title: const Text(
+                              '陀螺仪上下反向',
+                              style: TextStyle(
+                                color: Colors.white,
+                                fontSize: 14,
+                              ),
+                            ),
+                            subtitle: const Text(
+                              '补偿方向上下相反时打开(下次录像生效)',
+                              style: TextStyle(
+                                color: Colors.white38,
+                                fontSize: 10,
+                              ),
+                            ),
+                            onChanged: (v) {
+                              setState(() => _gyroFlipY = v);
+                              setSheetState(() {});
+                            },
                           ),
                           const SizedBox(height: 10),
                           SizedBox(
