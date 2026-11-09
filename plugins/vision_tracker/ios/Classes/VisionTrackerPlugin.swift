@@ -275,14 +275,15 @@ public class VisionTrackerPlugin: NSObject, FlutterPlugin {  public static func 
             let cand = img.cropping(to: px),
             let candPrint = featurePrint(cand)
           else { continue }
-          var d = Double.greatestFiniteMagnitude
+          // computeDistance 的出参是 Float(不是 Double) —— 按 SDK 签名来
+          var d: Float = .greatestFiniteMagnitude
           do {
             try refPrint.computeDistance(&d, to: candPrint)
           } catch {
             continue
           }
-          if d < bestD {
-            bestD = d
+          if Double(d) < bestD {
+            bestD = Double(d)
             bestBox = r
           }
         }
