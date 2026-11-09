@@ -60,7 +60,13 @@ public class VisionTrackerPlugin: NSObject, FlutterPlugin {  public static func 
   /// 上次主动校正的时刻(每 0.4 秒校正一次,防止慢慢漂走)
   private var liveLastDetect: CFAbsoluteTime = 0
   /// 跟踪器的当前框(跟丢时也用它回传,保证框不消失)
+  /// 跟踪器当前框的 Vision 坐标(左下原点)
   private var liveRequestBBox = CGRect(x: 0, y: 0, width: 0.05, height: 0.05)
+  /// 目标参考块:跟踪开始时自动从首帧截取,重捕获时用它做特征匹配。
+  /// 相比灰度 NCC,特征向量对尺度/光照/轻微旋转更稳,而且**不需要训练**。
+  private var liveRef: CGImage?
+  /// 参考块的特征向量(只算一次,重捕获时反复比较)
+  private var liveRefPrint: VNFeaturePrintObservation?
 
   /// 用户框(相对预览,0~1、左上原点) → Vision 框(相对整屏,0~1、左下原点)
   private func toScreenVision(_ b: CGRect) -> CGRect {
@@ -105,6 +111,8 @@ public class VisionTrackerPlugin: NSObject, FlutterPlugin {  public static func 
     liveRequestBBox = req.inputObservation.boundingBox
     liveLostStreak = 0
     liveLastDetect = 0
+    liveRef = nil
+    liveRefPrint = nil
     liveLastTick = 0
 
     let rec = RPScreenRecorder.shared()
@@ -153,6 +161,8 @@ public class VisionTrackerPlugin: NSObject, FlutterPlugin {  public static func 
     liveRequest = req
     liveRequestBBox = req.inputObservation.boundingBox
     liveLostStreak = 0
+    liveRef = nil
+    liveRefPrint = nil
     result(nil)
   }
 
@@ -189,10 +199,23 @@ public class VisionTrackerPlugin: NSObject, FlutterPlugin {  public static func 
       }
     }
 
+    // 首帧:把目标块存下来当"参考"(只做一次,之后重捕获都拿它比特征)
+    if liveRef == nil, box.width > 0.01, box.height > 0.01 {
+      let W = CGFloat(cg.width), H = CGFloat(cg.height)
+      let px = CGRect(
+        x: box.minX * W, y: (1 - box.maxY) * H,
+        width: box.width * W, height: box.height * H
+      ).integral
+      if px.width > 12, px.height > 12, let ref = cg.cropping(to: px) {
+        liveRef = ref
+        liveRefPrint = featurePrint(ref)
+      }
+    }
+
     // 重新捕获:连续跟丢,或每隔 0.4 秒主动校正一次(防止慢慢漂走)
     if liveLostStreak >= 3 || now - liveLastDetect > 0.4 {
       liveLastDetect = now
-      if let nb = redetectText(near: box, in: cg) {
+      if let nb = reacquire(near: box, in: cg) {
         let fresh = VNTrackObjectRequest(
           detectedObjectObservation: VNDetectedObjectObservation(boundingBox: nb))
         liveRequest = fresh
@@ -223,8 +246,84 @@ public class VisionTrackerPlugin: NSObject, FlutterPlugin {  public static func 
     return VisionTrackerPlugin.ciContext.createCGImage(out, from: out.extent)
   }
 
-  /// 在上一帧框的附近做"文字区域"检测,用来重新捕获目标。
-  /// 只找区域、不识字 → 比完整 OCR 便宜一个数量级,足够撑起每 0.4 秒的校正。
+  /// 在上一帧框的附近重新捕获目标。两条互补的手段:
+  ///   ① 特征向量匹配(VNGenerateImageFeaturePrintRequest):把首帧的目标块存下来,
+  ///      在附近做 3×3 网格搜索,比特征距离。**不需要训练**,抗尺度/光照变化 ——
+  ///      这是替代手写 NCC 的关键改进。
+  ///   ② 文字区域检测兜底:特征太糊(运动模糊)时,按"离上一帧最近"挑一块文字区域。
+  private func reacquire(near box: CGRect, in img: CGImage) -> CGRect? {
+    // ① 特征匹配
+    if let refPrint = liveRefPrint {
+      let W = CGFloat(img.width), H = CGFloat(img.height)
+      let bw = box.width, bh = box.height
+      // 搜索范围 ±6% 画面(相机运动连续,不需要全画面搜)
+      let span = 0.06
+      var bestBox: CGRect?
+      var bestD = Double.greatestFiniteMagnitude
+      for gy in -1...1 {
+        for gx in -1...1 {
+          let cx = box.midX + CGFloat(gx) * span
+          let cy = box.midY + CGFloat(gy) * span
+          let r = CGRect(
+            x: cx - bw / 2, y: cy - bh / 2, width: bw, height: bh)
+          // Vision 坐标(左下原点)→ CGImage 像素(左上原点)
+          let px = CGRect(
+            x: r.minX * W, y: (1 - r.maxY) * H,
+            width: r.width * W, height: r.height * H
+          ).integral
+          guard px.width > 8, px.height > 8,
+            let cand = img.cropping(to: px),
+            let candPrint = featurePrint(cand)
+          else { continue }
+          var d = Double.greatestFiniteMagnitude
+          do {
+            try refPrint.computeDistance(&d, to: candPrint)
+          } catch {
+            continue
+          }
+          if d < bestD {
+            bestD = d
+            bestBox = r
+          }
+        }
+      }
+      // 距离阈值:同一目标通常 < 0.6,不同内容明显更大
+      if let b = bestBox, bestD < 0.6 {
+        return b
+      }
+    }
+    // ② 文字区域兜底
+    let req = VNDetectTextRectanglesRequest()
+    req.reportCharacterBoxes = false
+    let h = VNImageRequestHandler(cgImage: img, orientation: .up, options: [:])
+    guard (try? h.perform([req])) != nil, let rs = req.results, !rs.isEmpty else {
+      return nil
+    }
+    var best: CGRect?
+    var bestDist = Double.greatestFiniteMagnitude
+    for o in rs {
+      let b = o.boundingBox
+      let dx = Double(b.midX - box.midX)
+      let dy = Double(b.midY - box.midY)
+      let dd = dx * dx + dy * dy
+      if dd < bestDist {
+        bestDist = dd
+        best = b
+      }
+    }
+    if bestDist > 0.11 { return nil }
+    return best
+  }
+
+  /// 计算一张图(整图)的特征向量
+  private func featurePrint(_ img: CGImage) -> VNFeaturePrintObservation? {
+    let req = VNGenerateImageFeaturePrintRequest()
+    let h = VNImageRequestHandler(cgImage: img, orientation: .up, options: [:])
+    guard (try? h.perform([req])) != nil else { return nil }
+    return req.results?.first as? VNFeaturePrintObservation
+  }
+
+  /// 旧的纯文字区域重捕获(保留给没有参考块的情况)
   private func redetectText(near box: CGRect, in img: CGImage) -> CGRect? {
     let req = VNDetectTextRectanglesRequest()
     req.reportCharacterBoxes = false
@@ -232,8 +331,6 @@ public class VisionTrackerPlugin: NSObject, FlutterPlugin {  public static func 
     guard (try? h.perform([req])) != nil, let rs = req.results, !rs.isEmpty else {
       return nil
     }
-    // 取"离上一帧位置最近"的那块文字区域:相机基本是连续运动,
-    // 最近邻是最可靠的关联方式,比按面积/分数挑更稳。
     var best: CGRect?
     var bestD = Double.greatestFiniteMagnitude
     for o in rs {
@@ -246,7 +343,6 @@ public class VisionTrackerPlugin: NSObject, FlutterPlugin {  public static func 
         best = b
       }
     }
-    // 只在"附近"才接受(距中心不超过画面 1/3),否则宁可继续用跟踪结果
     if bestD > 0.11 { return nil }
     return best
   }
