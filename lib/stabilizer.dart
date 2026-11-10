@@ -1,4 +1,4 @@
-import 'dart:math' as math;
+﻿import 'dart:math' as math;
 
 /// 四元数(姿态积分用)
 class Quat {
@@ -202,6 +202,35 @@ class GyroStabilizer {
       smZ[i] = n > 0 ? sumZ / n : rawZ[i];
     }
 
+    // 2.5) 饱和保持(关键):偏转过大时不要让虚拟相机路径继续适应。
+    // 对称平滑会让"你保持的那个角度"慢慢变成新基准,修正量随之归零 ——
+    // 表现就是"偏转很大之后画面自己转回中央",而这个回中过程会把
+    // 取景框里的目标带偏。正确行为是:
+    //   修正量超过可用范围 → **冻结**路径(画面停在黑边),
+    //   等姿态回到接近起点(修正量回落到阈值内)再恢复跟随。
+    // 阈值按"可移动范围换算成角度":超过它就意味着已经贴边。
+    final fHold = focalPx(frameW, frameH, fovDeg) * camZoom.clamp(1.0, 8.0);
+    final holdRad = math.atan((maxShiftXPx).clamp(1.0, 1e9) / fHold);
+    var freeze = false;
+    for (var i = 0; i < ts.length; i++) {
+      final corrPitch = (rawX[i] - smX[i]).abs();
+      final corrYaw = (rawY[i] - smY[i]).abs();
+      final saturated = corrPitch > holdRad || corrYaw > holdRad;
+      if (saturated) {
+        freeze = true;
+      } else if (freeze) {
+        // 回到起始姿态附近才解冻(0.6 倍迟滞,避免边界抖动)
+        if (corrPitch < holdRad * 0.6 && corrYaw < holdRad * 0.6) {
+          freeze = false;
+        }
+      }
+      if (freeze && i > 0) {
+        // 冻结:平滑路径保持上一帧的值 → 修正量维持在饱和值(停在黑边)
+        smX[i] = smX[i - 1];
+        smY[i] = smY[i - 1];
+      }
+    }
+
     // 3) 修正角 → 像素位移 / 横滚角,并硬限制在预算内
     // 焦距 × 放大倍数:放大 z 倍 ⇒ 等效焦距 z 倍 ⇒ 同样的角度产生 z 倍像素位移
     final f = focalPx(frameW, frameH, fovDeg) * camZoom.clamp(1.0, 8.0);
@@ -318,16 +347,41 @@ class OnlineStabilizer {
   }
 
   /// [dt] 秒;[gx]/[gy]/[gz] 为 rad/s;[tau] 为平滑时间常数(越大越稳、跟随越慢)
-  void update(double dt, double gx, double gy, double gz, {double tau = 0.9}) {
+  /// [holdRad]:修正角超过它 = 已经贴到黑边,此时**冻结**平滑路径。
+  /// 不冻结的话,你保持的那个偏转角会被 EMA 当成新基准,修正量慢慢归零,
+  /// 画面就自己转回中央 —— 这正是"大幅偏转后目标被带偏"的原因。
+  void update(
+    double dt,
+    double gx,
+    double gy,
+    double gz, {
+    double tau = 0.9,
+    double holdRad = 0,
+  }) {
     if (dt <= 0 || dt > 0.2) return;
     _q = (_q * Quat.fromRotVec(gx * dt, gy * dt, gz * dt)).normalized;
     final rv = _q.toRotVec();
-    final a = 1 - math.exp(-dt / tau);
-    _sx += (rv[0] - _sx) * a;
-    _sy += (rv[1] - _sy) * a;
+    final cp = (rv[0] - _sx).abs();
+    final cy = (rv[1] - _sy).abs();
+    final saturated = holdRad > 0 && (cp > holdRad || cy > holdRad);
+    if (saturated) {
+      _held = true;
+    } else if (_held && cp < holdRad * 0.6 && cy < holdRad * 0.6) {
+      // 回到起始姿态附近才解冻(0.6 倍迟滞,避免在边界上抖)
+      _held = false;
+    }
+    if (!_held) {
+      final a = 1 - math.exp(-dt / tau);
+      _sx += (rv[0] - _sx) * a;
+      _sy += (rv[1] - _sy) * a;
+    }
     corrX = rv[0] - _sx;
     corrY = rv[1] - _sy;
   }
+
+  /// 是否处于"饱和保持"状态(诊断用)
+  bool _held = false;
+  bool get held => _held;
 
   /// 角修正 → 像素位移,并按裁切余量硬限制(抖得再大也不会越界)
   List<double> shifts(
