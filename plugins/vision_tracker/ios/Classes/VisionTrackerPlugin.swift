@@ -67,6 +67,60 @@ public class VisionTrackerPlugin: NSObject, FlutterPlugin {  public static func 
   private var liveRef: CGImage?
   /// 参考块的特征向量(只算一次,重捕获时反复比较)
   private var liveRefPrint: VNFeaturePrintObservation?
+  /// 上一帧(480 宽),算背景光流用
+  private var livePrev: CGImage?
+
+  /// 用稠密光流估计**背景主运动**:取流场里出现最多的那个位移(众数)。
+  /// 为什么取众数而不是平均:画面里玩家的手和音符移动快、面积也不小,
+  /// 平均会被它们带跑;众数天然对应"占主导的静止背景"。
+  /// 返回 (dx, dy, 置信度):位移已按画面尺寸归一化,置信度 = 主峰占比。
+  private func dominantFlow(from a: CGImage, to b: CGImage) -> (Double, Double, Double) {
+    let req = VNGenerateOpticalFlowRequest(targetedCGImage: b, options: [:])
+    req.computationAccuracy = .low
+    let h = VNImageRequestHandler(cgImage: a, options: [:])
+    guard (try? h.perform([req])) != nil,
+      let obs = req.results?.first as? VNPixelBufferObservation
+    else { return (0, 0, 0) }
+    let buf = obs.pixelBuffer
+    CVPixelBufferLockBaseAddress(buf, .readOnly)
+    defer { CVPixelBufferUnlockBaseAddress(buf, .readOnly) }
+    let fw = CVPixelBufferGetWidth(buf)
+    let fh = CVPixelBufferGetHeight(buf)
+    let stride = CVPixelBufferGetBytesPerRow(buf)
+    guard fw > 8, fh > 8, let base = CVPixelBufferGetBaseAddress(buf) else {
+      return (0, 0, 0)
+    }
+    let p = base.assumingMemoryBound(to: Float.self)
+    // 量化成 2 像素的桶,统计每个桶的票数
+    var bins: [Int: Int] = [:]
+    var total = 0
+    var y = 0
+    while y < fh {
+      var x = 0
+      while x < fw {
+        let o = (y * stride / 4) + x * 2
+        let dx = Double(p[o])
+        let dy = Double(p[o + 1])
+        // 过滤 NaN/异常值
+        if dx.isFinite, dy.isFinite, abs(dx) < 400, abs(dy) < 400 {
+          let kx = max(-1023, min(1023, Int((dx / 2).rounded())))
+          let ky = max(-1023, min(1023, Int((dy / 2).rounded())))
+          bins[(kx + 1024) * 4096 + (ky + 1024), default: 0] += 1
+          total += 1
+        }
+        x += 8
+      }
+      y += 8
+    }
+    guard total > 0, let best = bins.max(by: { $0.value < $1.value }) else {
+      return (0, 0, 0)
+    }
+    let key = best.key
+    let kx = key / 4096 - 1024
+    let ky = key % 4096 - 1024
+    let conf = Double(best.value) / Double(total)
+    return (Double(kx) * 2 / Double(fw), Double(ky) * 2 / Double(fh), conf)
+  }
 
   /// 用户框(相对预览,0~1、左上原点) → Vision 框(相对整屏,0~1、左下原点)
   private func toScreenVision(_ b: CGRect) -> CGRect {
@@ -113,6 +167,7 @@ public class VisionTrackerPlugin: NSObject, FlutterPlugin {  public static func 
     liveLastDetect = 0
     liveRef = nil
     liveRefPrint = nil
+    livePrev = nil
     liveLastTick = 0
 
     let rec = RPScreenRecorder.shared()
@@ -163,6 +218,7 @@ public class VisionTrackerPlugin: NSObject, FlutterPlugin {  public static func 
     liveLostStreak = 0
     liveRef = nil
     liveRefPrint = nil
+    livePrev = nil
     result(nil)
   }
 
@@ -226,6 +282,18 @@ public class VisionTrackerPlugin: NSObject, FlutterPlugin {  public static func 
 
     var payload = fromScreenVision(box)
     payload["c"] = conf
+    // ── 背景光流:估算整幅画面的主运动(静止背景的主导位移) ──
+    // 这一路是给"没有判定线/环形判定"的音游(如舞萌DX)用的:
+    // 不认任何具体元素,只把"静止的东西"稳住。
+    // 每次抓屏都算,开销低(在 480 宽上做),结果连同置信度一起回传,
+    // 让 Dart 侧能直接看到"这一帧的光流可不可信"。
+    if let prev = livePrev {
+      let (fx, fy, fc) = dominantFlow(from: prev, to: cg)
+      payload["fx"] = fx
+      payload["fy"] = fy
+      payload["fc"] = fc
+    }
+    livePrev = cg
     // 必须回传**数字**而不是 Bool:通道过来后 Dart 侧统一按 num 解析,
     // 混进一个 bool 会让整条流的映射抛错,框就再也不更新了。
     payload["lost"] = (liveLostStreak > 5) ? 1.0 : 0.0
