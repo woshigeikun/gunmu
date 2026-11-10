@@ -3574,13 +3574,20 @@ class _CameraPageState extends State<CameraPage> {
           if (!_stabRunning) return;
 
           // 四元数姿态积分 + EMA 平滑虚拟相机路径 → 角修正(Gyroflow 式)
-          _onlineStab.update(dt, gx, gy, e.z);
-
-          // 角修正 → 像素位移(按焦距换算),并硬限制在固定裁切余量内
           final fov = _stabFov;
           final wPx = _previewSize.width <= 0 ? 1080.0 : _previewSize.width;
           final hPx = _previewSize.height <= 0 ? 1920.0 : _previewSize.height;
           final margin = _effMargin;
+
+          // holdRad = "已经贴到黑边"对应的角度。修正超过它就**冻结**平滑路径,
+          // 让画面停在黑边;等姿态回到起点附近才解冻。
+          // 不这么做的话,你保持的那个偏转角会被 EMA 当成新基准,修正量归零,
+          // 画面自己转回中央 —— 那就是"大幅偏转后跟踪目标被带偏"的原因。
+          final fNow = GyroStabilizer.focalPx(wPx, hPx, fov);
+          final holdRad = math.atan((margin + kPadFrac) * wPx / fNow);
+          _onlineStab.update(dt, gx, gy, e.z, holdRad: holdRad);
+
+          // 角修正 → 像素位移(按焦距换算),并硬限制在固定裁切余量内
           // 预览的位移上限 = 裁切余量 + 垫层(和导出一致)。
           // 以前这里是 margin,位移被卡在余量内 → 预览永远不露黑边,
           // 也就看不到成片里"画面在框内移动"的真实效果。
