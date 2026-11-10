@@ -1537,6 +1537,13 @@ class _CameraPageState extends State<CameraPage> {
 
   /// 实时轨迹日志:[时间秒, 目标中心x, 目标中心y],给导出复用
   final List<List<double>> _liveLog = [];
+
+  /// 背景光流日志:[时间秒, dx, dy, 置信度]。用于判断这类画面
+  /// (如舞萌DX 的黑色台面)上光流是否可用,以及后续接入稳定算法。
+  final List<List<double>> _flowLog = [];
+
+  /// 最近一帧的光流置信度(诊断显示用)
+  double _flowConf = 0;
   double _liveLogStart = 0;
 
   void _startLiveTracking() {
@@ -1597,6 +1604,14 @@ class _CameraPageState extends State<CameraPage> {
         Offset(cx * _previewSize.width, cy * _previewSize.height),
       );
       _liveLog.add([t, img.dx, img.dy]);
+      // 背景光流(iOS 侧在抓屏帧上算的"静止背景主运动"):
+      // 置信度 = 主运动在流场里的占比。舞萌那种黑色台面可能很低,
+      // 所以先把数值显示出来,用它判断这条路在这类画面上是否可用。
+      final fc = m['fc'] ?? 0;
+      if (fc > 0) {
+        _flowConf = fc;
+        _flowLog.add([t, m['fx'] ?? 0, m['fy'] ?? 0, fc]);
+      }
       // 回传的是**控件归一化**坐标,直接乘以预览尺寸就是屏幕坐标
       setState(
         () => _liveBoxScreen = Rect.fromLTWH(
@@ -1614,6 +1629,13 @@ class _CameraPageState extends State<CameraPage> {
     await _liveSub?.cancel();
     _liveSub = null;
     await VisionTracker.stopLive();
+    if (_flowConf > 0 && mounted) {
+      setState(
+        () => _hint =
+            '背景光流置信度 ${(_flowConf * 100).round()}%'
+            '${_flowConf < 0.4 ? "(偏低,这类画面光流信号弱)" : "(可用)"}',
+      );
+    }
     if (_liveBoxScreen != null && mounted) {
       setState(() {
         _liveBoxScreen = null;
