@@ -3,6 +3,7 @@ import UIKit
 import Vision
 import CoreGraphics
 import CoreImage
+import CoreML
 import CoreMedia
 import ReplayKit
 
@@ -42,9 +43,218 @@ public class VisionTrackerPlugin: NSObject, FlutterPlugin {  public static func 
       result(nil)
     case "updateLiveBox":
       handleUpdateLiveBox(call, result: result)
+    case "listYoloModels":
+      result(listYoloModels())
+    case "loadYoloModel":
+      result(loadYoloModel(call))
+    case "detectYolo":
+      handleDetectYolo(call, result: result)
     default:
       result(FlutterMethodNotImplemented)
     }
+  }
+
+  // ─────────────── YOLO(可导入模型)───────────────
+
+  private var yoloModel: VNCoreMLModel?
+  private var yoloInputW = 640
+  private var yoloInputH = 640
+  private var yoloModelName = ""
+
+  /// 列出 Documents 目录下可用的模型。支持:
+  ///   * xxx.mlmodelc(已编译的目录,推荐 —— 直接加载,不用等)
+  ///   * xxx.mlpackage / xxx.mlmodel(首次加载时现场编译)
+  private func listYoloModels() -> [[String: Any]] {
+    var out: [[String: Any]] = []
+    let dirs = [FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first]
+    for dir in dirs.compactMap({ $0 }) {
+      let items = (try? FileManager.default.contentsOfDirectory(
+        at: dir, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])) ?? []
+      for u in items {
+        let ext = u.pathExtension.lowercased()
+        if ext == "mlmodelc" || ext == "mlpackage" || ext == "mlmodel" {
+          out.append(["name": u.lastPathComponent, "path": u.path])
+        }
+      }
+    }
+    return out.sorted { ($0["name"] as? String ?? "") < ($1["name"] as? String ?? "") }
+  }
+
+  private func loadYoloModel(_ call: FlutterMethodCall) -> [String: Any] {
+    guard let args = call.arguments as? [String: Any],
+      let path = args["path"] as? String, !path.isEmpty
+    else {
+      yoloModel = nil
+      yoloModelName = ""
+      return ["ok": false, "message": "未指定模型"]
+    }
+    do {
+      let url = URL(fileURLWithPath: path)
+      var modelURL = url
+      if url.pathExtension.lowercased() != "mlmodelc" {
+        // .mlpackage/.mlmodel 必须先编译;编译产物放临时目录
+        modelURL = try MLModel.compileModel(at: url)
+      }
+      let cfg = MLModelConfiguration()
+      cfg.computeUnits = .all
+      let ml = try MLModel(contentsOf: modelURL, configuration: cfg)
+      let vn = try VNCoreMLModel(for: ml)
+      // 记录输入尺寸:解码输出时要把像素坐标归一化
+      if let d = ml.modelDescription.inputDescriptionsByName.values.first,
+        let ic = d.imageConstraint
+      {
+        yoloInputW = ic.pixelsWide > 0 ? ic.pixelsWide : 640
+        yoloInputH = ic.pixelsHigh > 0 ? ic.pixelsHigh : 640
+      }
+      yoloModel = vn
+      yoloModelName = url.lastPathComponent
+      return ["ok": true, "message": "已加载 \(url.lastPathComponent)", "input": "\(yoloInputW)x\(yoloInputH)"]
+    } catch {
+      yoloModel = nil
+      return ["ok": false, "message": "加载失败: \(error.localizedDescription)"]
+    }
+  }
+
+  /// 在一帧灰度图上跑 YOLO 推理,返回归一化检测框。
+  /// 交给 VNCoreMLRequest:缩放/归一化由系统处理,避免手写预处理出错。
+  private func handleDetectYolo(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+    guard let args = call.arguments as? [String: Any],
+      let typed = args["bytes"] as? FlutterStandardTypedData,
+      let w = args["w"] as? Int,
+      let h = args["h"] as? Int,
+      let vn = yoloModel
+    else {
+      result([])
+      return
+    }
+    let thr = (args["threshold"] as? NSNumber)?.doubleValue ?? 0.25
+    guard w > 8, h > 8, typed.data.count >= w * h,
+      let provider = CGDataProvider(data: typed.data as CFData),
+      let img = CGImage(
+        width: w, height: h, bitsPerComponent: 8, bitsPerPixel: 8, bytesPerRow: w,
+        space: CGColorSpaceCreateDeviceGray(),
+        bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue),
+        provider: provider, decode: nil, shouldInterpolate: false,
+        intent: .defaultIntent)
+    else {
+      result([])
+      return
+    }
+    let req = VNCoreMLRequest(model: vn)
+    req.imageCropAndScaleOption = .scaleFill
+    let handler = VNImageRequestHandler(cgImage: img, options: [:])
+    do {
+      try handler.perform([req])
+    } catch {
+      result([])
+      return
+    }
+    // ① 模型自带 NMS 的情况:Vision 直接给识别框
+    if let obs = req.results as? [VNRecognizedObjectObservation] {
+      var out: [Double] = []
+      for o in obs {
+        let b = o.boundingBox
+        out.append(contentsOf: [
+          Double(b.minX), Double(1.0 - b.maxY), Double(b.width), Double(b.height),
+          Double(o.labels.first?.confidence ?? 0), 0,
+        ])
+      }
+      result(out)
+      return
+    }
+    // ② 原始输出张量:自己解码 + NMS
+    guard let fv = req.results?.first as? VNCoreMLFeatureValueObservation,
+      let arr = fv.featureValue.multiArrayValue
+    else {
+      result([])
+      return
+    }
+    var flat: [Double] = []
+    for b in decodeYolo(arr, threshold: thr) {
+      flat.append(contentsOf: b)
+    }
+    result(flat)
+  }
+
+  /// 解码 Ultralytics 导出的原始输出。
+  /// 布局两种都支持:[1, 4+nc, N](通道优先,官方导出)与 [1, N, 4+nc]。
+  /// 坐标是**模型输入像素**下的 cx,cy,w,h,这里按输入尺寸归一化。
+  private func decodeYolo(_ arr: MLMultiArray, threshold: Double) -> [[Double]] {
+    let shape = arr.shape.map { $0.intValue }
+    guard shape.count == 3 else { return [] }
+    let s1 = shape[1], s2 = shape[2]
+    let channelMajor = s1 < s2
+    let ch = channelMajor ? s1 : s2
+    let n = channelMajor ? s2 : s1
+    guard ch >= 5, n > 0 else { return [] }
+    let stride1 = arr.strides[1].intValue
+    let stride2 = arr.strides[2].intValue
+    let inW = Double(yoloInputW), inH = Double(yoloInputH)
+    var cands: [[Double]] = []
+    if arr.dataType == .double {
+      let p = arr.dataPointer.bindMemory(to: Double.self, count: arr.count)
+      for i in 0..<n {
+        func val(_ c: Int) -> Double {
+          let idx = channelMajor ? (c * stride1 + i * stride2) : (i * stride1 + c * stride2)
+          return idx >= 0 && idx < arr.count ? p[idx] : 0
+        }
+        var best = 0.0
+        for c in 4..<ch {
+          let s = val(c)
+          if s > best { best = s }
+        }
+        if best < threshold { continue }
+        let cx = val(0) / inW
+        let cy = val(1) / inH
+        let bw = val(2) / inW
+        let bh = val(3) / inH
+        if bw <= 0 || bh <= 0 { continue }
+        cands.append([cx - bw / 2, cy - bh / 2, bw, bh, best, 0])
+      }
+    } else {
+      let p = arr.dataPointer.bindMemory(to: Float.self, count: arr.count)
+      for i in 0..<n {
+        func val(_ c: Int) -> Double {
+          let idx = channelMajor ? (c * stride1 + i * stride2) : (i * stride1 + c * stride2)
+          return idx >= 0 && idx < arr.count ? Double(p[idx]) : 0
+        }
+        var best = 0.0
+        for c in 4..<ch {
+          let s = val(c)
+          if s > best { best = s }
+        }
+        if best < threshold { continue }
+        let cx = val(0) / inW
+        let cy = val(1) / inH
+        let bw = val(2) / inW
+        let bh = val(3) / inH
+        if bw <= 0 || bh <= 0 { continue }
+        cands.append([cx - bw / 2, cy - bh / 2, bw, bh, best, 0])
+      }
+    }
+    // NMS(IoU > 0.45 抑制)
+    cands.sort { $0[4] > $1[4] }
+    var kept: [[Double]] = []
+    for c in cands {
+      var dup = false
+      for k in kept where iouNorm(k, c) > 0.45 {
+        dup = true
+        break
+      }
+      if !dup { kept.append(c) }
+      if kept.count >= 8 { break }
+    }
+    return kept
+  }
+
+  private func iouNorm(_ a: [Double], _ b: [Double]) -> Double {
+    let ax1 = a[0], ay1 = a[1], ax2 = a[0] + a[2], ay2 = a[1] + a[3]
+    let bx1 = b[0], by1 = b[1], bx2 = b[0] + b[2], by2 = b[1] + b[3]
+    let ix = max(0.0, min(ax2, bx2) - max(ax1, bx1))
+    let iy = max(0.0, min(ay2, by2) - max(ay1, by1))
+    let inter = ix * iy
+    let uni = a[2] * a[3] + b[2] * b[3] - inter
+    return uni <= 0 ? 0 : inter / uni
   }
 
   // ─────────────── 录制中实时跟踪(ReplayKit 抓屏)───────────────
