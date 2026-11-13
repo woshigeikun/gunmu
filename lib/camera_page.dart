@@ -1544,6 +1544,9 @@ class _CameraPageState extends State<CameraPage> {
 
   /// 最近一帧的光流置信度(诊断显示用)
   double _flowConf = 0;
+
+  /// YOLO 模型状态(显示在弹窗里)
+  String _yoloStatus = '未加载(可选)';
   double _liveLogStart = 0;
 
   void _startLiveTracking() {
@@ -3785,6 +3788,79 @@ class _CameraPageState extends State<CameraPage> {
                               _circularView = v;
                               _hint = v ? '已开启圆形取景:导出时画面为圆形,圆外纯黑' : '已切换为矩形取景';
                             });
+                            setSheetState(() {});
+                          },
+                        ),
+                        // ── YOLO 模型(可选,需要自己导入)──
+                        // 抓屏帧喂给导入的 Core ML 模型做检测;没有模型时
+                        // 这一步完全不参与,稳定仍走陀螺仪/文本/特征匹配。
+                        ListTile(
+                          contentPadding: EdgeInsets.zero,
+                          leading: const Icon(
+                            Icons.model_training,
+                            color: Colors.white70,
+                          ),
+                          title: const Text(
+                            'YOLO 模型(可选)',
+                            style: TextStyle(color: Colors.white, fontSize: 15),
+                          ),
+                          subtitle: Text(
+                            _yoloStatus,
+                            style: const TextStyle(
+                              color: Colors.white38,
+                              fontSize: 11,
+                            ),
+                          ),
+                          onTap: () async {
+                            setState(() => _yoloStatus = '正在读取模型目录…');
+                            setSheetState(() {});
+                            final models = await VisionTracker.listYoloModels();
+                            if (!mounted) return;
+                            if (models.isEmpty) {
+                              setState(
+                                () => _yoloStatus =
+                                    '未找到模型:把 .mlmodelc 放进「文件」App 里的「心率相机」目录',
+                              );
+                              setSheetState(() {});
+                              return;
+                            }
+                            final picked =
+                                await showDialog<Map<String, String>>(
+                                  context: context,
+                                  builder: (dctx) => SimpleDialog(
+                                    backgroundColor: const Color(0xFF1E1E1E),
+                                    title: const Text(
+                                      '选择模型',
+                                      style: TextStyle(color: Colors.white),
+                                    ),
+                                    children: models
+                                        .map(
+                                          (m) => SimpleDialogOption(
+                                            onPressed: () =>
+                                                Navigator.pop(dctx, m),
+                                            child: Text(
+                                              m['name'] ?? '',
+                                              style: const TextStyle(
+                                                color: Colors.white70,
+                                              ),
+                                            ),
+                                          ),
+                                        )
+                                        .toList(),
+                                  ),
+                                );
+                            if (picked == null || !mounted) return;
+                            setState(() => _yoloStatus = '正在加载…');
+                            setSheetState(() {});
+                            final r = await VisionTracker.loadYoloModel(
+                              picked['path'] ?? '',
+                            );
+                            if (!mounted) return;
+                            setState(
+                              () => _yoloStatus = r['ok'] == 'true'
+                                  ? '已加载 ${picked['name']} (输入 ${r['input'] ?? '?'})'
+                                  : (r['message'] ?? '加载失败'),
+                            );
                             setSheetState(() {});
                           },
                         ),
