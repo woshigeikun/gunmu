@@ -74,6 +74,59 @@ class VisionTracker {
     } catch (_) {}
   }
 
+  /// 列出 Documents 目录里可导入的 YOLO 模型(.mlmodelc / .mlpackage / .mlmodel)
+  static Future<List<Map<String, String>>> listYoloModels() async {
+    if (!isSupported) return const [];
+    try {
+      final raw = await _ch.invokeMethod<List<dynamic>>('listYoloModels');
+      return (raw ?? const [])
+          .whereType<Map>()
+          .map((m) => m.map((k, v) => MapEntry(k.toString(), v.toString())))
+          .toList();
+    } catch (_) {
+      return const [];
+    }
+  }
+
+  /// 加载模型;返回 {'ok':bool,'message':String}
+  static Future<Map<String, String>> loadYoloModel(String path) async {
+    if (!isSupported) return {'ok': 'false', 'message': '仅 iOS 支持'};
+    try {
+      final raw = await _ch.invokeMethod<Map<dynamic, dynamic>>(
+        'loadYoloModel',
+        {'path': path},
+      );
+      if (raw == null) return {'ok': 'false', 'message': '空返回'};
+      return raw.map((k, v) => MapEntry(k.toString(), v.toString()));
+    } on PlatformException catch (e) {
+      return {'ok': 'false', 'message': e.message ?? '加载失败'};
+    } catch (e) {
+      return {'ok': 'false', 'message': '$e'};
+    }
+  }
+
+  /// 在一帧灰度图上跑 YOLO。返回扁平数组,每 6 个值一组:
+  /// [x, y, w, h, score, class](归一化,原点左上)。
+  static Future<List<double>> detectYolo({
+    required Uint8List bytes,
+    required int w,
+    required int h,
+    double threshold = 0.25,
+  }) async {
+    if (!isSupported) return const [];
+    try {
+      final raw = await _ch.invokeMethod<List<dynamic>>('detectYolo', {
+        'bytes': bytes,
+        'w': w,
+        'h': h,
+        'threshold': threshold,
+      });
+      return (raw ?? const []).map((e) => (e as num).toDouble()).toList();
+    } catch (_) {
+      return const [];
+    }
+  }
+
   /// 抓屏可行性探针:用 ReplayKit 抓一帧,返回整帧与中心区域的平均亮度。
   /// 目的:验证 iOS 能否通过抓屏拿到**相机预览画面**。
   /// (某些机型上预览层是硬件合成的,抓出来可能是纯黑 → 这条路不通)
