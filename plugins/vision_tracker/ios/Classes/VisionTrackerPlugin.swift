@@ -192,7 +192,7 @@ public class VisionTrackerPlugin: NSObject, FlutterPlugin {  public static func 
     let inW = Double(yoloInputW), inH = Double(yoloInputH)
     var cands: [[Double]] = []
     if arr.dataType == .double {
-      let p = arr.dataPointer.bindMemory(to: Double.self, count: arr.count)
+      let p = arr.dataPointer.bindMemory(to: Double.self, capacity: arr.count)
       for i in 0..<n {
         func val(_ c: Int) -> Double {
           let idx = channelMajor ? (c * stride1 + i * stride2) : (i * stride1 + c * stride2)
@@ -212,7 +212,7 @@ public class VisionTrackerPlugin: NSObject, FlutterPlugin {  public static func 
         cands.append([cx - bw / 2, cy - bh / 2, bw, bh, best, 0])
       }
     } else {
-      let p = arr.dataPointer.bindMemory(to: Float.self, count: arr.count)
+      let p = arr.dataPointer.bindMemory(to: Float.self, capacity: arr.count)
       for i in 0..<n {
         func val(_ c: Int) -> Double {
           let idx = channelMajor ? (c * stride1 + i * stride2) : (i * stride1 + c * stride2)
