@@ -1,4 +1,9 @@
-﻿import 'dart:math' as math;
+import 'dart:math' as math;
+
+/// 超出可用余量持续多久后判定为"用户真的转向了"并重设基准(秒)。
+/// 调小 → 极端角度(yaw -90°)下更快恢复稳定,但正常拍摄里被误判为
+/// "转向"的概率略增(误判的后果是画面轻微回中一次)。
+const double kHoldSec = 0.5;
 
 /// 四元数(姿态积分用)
 class Quat {
@@ -175,61 +180,52 @@ class GyroStabilizer {
     }
     if (ts.length < 4) return StabPlan.empty;
 
-    // 2) 对称移动平均平滑(离线用对称窗,不会引入滞后)
+    // 2) 基准姿态(参考系)—— 用"锁定起始姿态"替代原来的移动平均。
+    //
+    // 为什么换成锁定:
+    //   * 移动平均会把"你转到的角度"慢慢吸收成新基准 → 修正量归零 →
+    //     画面自己回中,而且转回原角度时要经过一段过渡才回来。
+    //   * 锁定起始姿态则保证:**只要偏差在可用余量内,转回原角度就精确回到原位**。
+    //
+    // 但锁死在极端角度是有代价的:yaw 到 -90° 时 tan 趋于无穷,所需位移远超
+    // 任何余量 → 补偿饱和 → 没有任何空间再稳定。所以加一条"超时重基准":
+    // 偏差持续超出可用范围超过 holdSec 秒,就判定为"用户真的转向了",
+    // 缓慢把基准移到当前姿态,让稳定重新获得余量。
     final smX = List<double>.filled(ts.length, 0);
     final smY = List<double>.filled(ts.length, 0);
     final smZ = List<double>.filled(ts.length, 0);
-    var lo = 0, hi = 0;
-    var sumX = 0.0, sumY = 0.0, sumZ = 0.0;
+    final fPx = focalPx(frameW, frameH, fovDeg) * camZoom.clamp(1.0, 8.0);
+    // 可用余量换算成角度:超出它就等于已经顶到边缘
+    final rangeRadX = math.atan((m + padFrac) * frameW / fPx);
+    final rangeRadY = math.atan((m + padFrac) * frameH / fPx);
+    var refX = rawX.isNotEmpty ? rawX[0] : 0.0;
+    var refY = rawY.isNotEmpty ? rawY[0] : 0.0;
+    const refZ = 0.0;
+    var satSec = 0.0;
     for (var i = 0; i < ts.length; i++) {
-      final tLo = ts[i] - smoothSec / 2;
-      final tHi = ts[i] + smoothSec / 2;
-      while (hi < ts.length && ts[hi] <= tHi) {
-        sumX += rawX[hi];
-        sumY += rawY[hi];
-        sumZ += rawZ[hi];
-        hi++;
+      final dt = i == 0 ? 0.0 : (ts[i] - ts[i - 1]).clamp(0.0, 0.2);
+      final dX = (rawX[i] - refX).abs();
+      final dY = (rawY[i] - refY).abs();
+      final saturated = dX > rangeRadX || dY > rangeRadY;
+      satSec = saturated ? satSec + dt : 0.0;
+      if (satSec > kHoldSec) {
+        // 重基准:约 0.6 秒时间常数,画面平滑过渡,不会跳
+        final a = 1 - math.exp(-dt / 0.6);
+        refX += (rawX[i] - refX) * a;
+        refY += (rawY[i] - refY) * a;
       }
-      while (lo < hi && ts[lo] < tLo) {
-        sumX -= rawX[lo];
-        sumY -= rawY[lo];
-        sumZ -= rawZ[lo];
-        lo++;
-      }
-      final n = hi - lo;
-      smX[i] = n > 0 ? sumX / n : rawX[i];
-      smY[i] = n > 0 ? sumY / n : rawY[i];
-      smZ[i] = n > 0 ? sumZ / n : rawZ[i];
+      smX[i] = refX;
+      smY[i] = refY;
+      smZ[i] = refZ;
     }
 
-    // 2.5) 饱和保持(关键):偏转过大时不要让虚拟相机路径继续适应。
-    // 对称平滑会让"你保持的那个角度"慢慢变成新基准,修正量随之归零 ——
-    // 表现就是"偏转很大之后画面自己转回中央",而这个回中过程会把
-    // 取景框里的目标带偏。正确行为是:
-    //   修正量超过可用范围 → **冻结**路径(画面停在黑边),
-    //   等姿态回到接近起点(修正量回落到阈值内)再恢复跟随。
-    // 阈值按"可移动范围换算成角度":超过它就意味着已经贴边。
-    final fHold = focalPx(frameW, frameH, fovDeg) * camZoom.clamp(1.0, 8.0);
-    final holdRad = math.atan((maxShiftXPx).clamp(1.0, 1e9) / fHold);
-    var freeze = false;
-    for (var i = 0; i < ts.length; i++) {
-      final corrPitch = (rawX[i] - smX[i]).abs();
-      final corrYaw = (rawY[i] - smY[i]).abs();
-      final saturated = corrPitch > holdRad || corrYaw > holdRad;
-      if (saturated) {
-        freeze = true;
-      } else if (freeze) {
-        // 回到起始姿态附近才解冻(0.6 倍迟滞,避免边界抖动)
-        if (corrPitch < holdRad * 0.6 && corrYaw < holdRad * 0.6) {
-          freeze = false;
-        }
-      }
-      if (freeze && i > 0) {
-        // 冻结:平滑路径保持上一帧的值 → 修正量维持在饱和值(停在黑边)
-        smX[i] = smX[i - 1];
-        smY[i] = smY[i - 1];
-      }
-    }
+    // 2.5) 为什么这里**不做**"饱和冻结":
+    // 曾经试过"修正量超过可用范围就冻结平滑路径,让画面停在黑边",
+    // 结果实测是错的 —— 修正量顶到垫层边缘时余量已经用完,冻结等于
+    // 系统没有任何空间再补偿,大角度(如 -90°)时彻底失去稳定能力。
+    // 正确行为是让它**继续适应**:姿态被吸收成新基准 → 修正量回落 →
+    // 重新获得活动余量 → 稳定恢复工作。代价是"大幅转动后画面会回中",
+    // 这是几何上无法两全的取舍(要么回中,要么没余量可补)。
 
     // 3) 修正角 → 像素位移 / 横滚角,并硬限制在预算内
     // 焦距 × 放大倍数:放大 z 倍 ⇒ 等效焦距 z 倍 ⇒ 同样的角度产生 z 倍像素位移
@@ -334,22 +330,27 @@ class GyroStabilizer {
 /// 在线稳定器(预览用):实时积分为姿态,EMA 平滑出低频路径,得到角修正
 class OnlineStabilizer {
   Quat _q = Quat.identity;
-  double _sx = 0, _sy = 0;
+  double _refX = 0, _refY = 0;
+  double _satSec = 0;
   double corrX = 0; // pitch 修正(弧度)
   double corrY = 0; // yaw 修正(弧度)
 
   void reset() {
     _q = Quat.identity;
-    _sx = 0;
-    _sy = 0;
+    _refX = 0;
+    _refY = 0;
+    _satSec = 0;
     corrX = 0;
     corrY = 0;
   }
 
-  /// [dt] 秒;[gx]/[gy]/[gz] 为 rad/s;[tau] 为平滑时间常数(越大越稳、跟随越慢)
-  /// [holdRad]:修正角超过它 = 已经贴到黑边,此时**冻结**平滑路径。
-  /// 不冻结的话,你保持的那个偏转角会被 EMA 当成新基准,修正量慢慢归零,
-  /// 画面就自己转回中央 —— 这正是"大幅偏转后目标被带偏"的原因。
+  /// [dt] 秒;[gx]/[gy]/[gz] 为 rad/s。
+  /// [holdRad]:可用余量对应的角度,超出它 = 已经顶到边缘。
+  ///
+  /// 基准策略(与离线 analyze 完全一致):
+  ///   * 偏差在余量内 → **锁定起始姿态**,转回原角度精确回到原位
+  ///   * 偏差超出余量持续 0.5 秒 → 判定为"真的转向了",重设基准让稳定恢复
+  ///     (yaw 到 -90° 时 tan 趋于无穷,不解锁就完全没有补偿空间)
   void update(
     double dt,
     double gx,
@@ -361,27 +362,18 @@ class OnlineStabilizer {
     if (dt <= 0 || dt > 0.2) return;
     _q = (_q * Quat.fromRotVec(gx * dt, gy * dt, gz * dt)).normalized;
     final rv = _q.toRotVec();
-    final cp = (rv[0] - _sx).abs();
-    final cy = (rv[1] - _sy).abs();
-    final saturated = holdRad > 0 && (cp > holdRad || cy > holdRad);
-    if (saturated) {
-      _held = true;
-    } else if (_held && cp < holdRad * 0.6 && cy < holdRad * 0.6) {
-      // 回到起始姿态附近才解冻(0.6 倍迟滞,避免在边界上抖)
-      _held = false;
+    final dX = rv[0] - _refX;
+    final dY = rv[1] - _refY;
+    final saturated = holdRad > 0 && (dX.abs() > holdRad || dY.abs() > holdRad);
+    _satSec = saturated ? _satSec + dt : 0.0;
+    if (_satSec > kHoldSec) {
+      final ab = 1 - math.exp(-dt / 0.6);
+      _refX += dX * ab;
+      _refY += dY * ab;
     }
-    if (!_held) {
-      final a = 1 - math.exp(-dt / tau);
-      _sx += (rv[0] - _sx) * a;
-      _sy += (rv[1] - _sy) * a;
-    }
-    corrX = rv[0] - _sx;
-    corrY = rv[1] - _sy;
+    corrX = rv[0] - _refX;
+    corrY = rv[1] - _refY;
   }
-
-  /// 是否处于"饱和保持"状态(诊断用)
-  bool _held = false;
-  bool get held => _held;
 
   /// 角修正 → 像素位移,并按裁切余量硬限制(抖得再大也不会越界)
   List<double> shifts(
