@@ -1530,7 +1530,13 @@ class _CameraPageState extends State<CameraPage> {
   // ────────── 录制中实时抓屏跟踪 ──────────
   /// 预览画面在屏幕上的位置(用来把"相对预览的框"换算到整屏;抓屏抓的是整屏)
   final GlobalKey _previewKey = GlobalKey();
-  StreamSubscription<Map<String, double>>? _liveSub;
+  StreamSubscription<Map<String, dynamic>>? _liveSub;
+
+  /// YOLO 实时检出的框(预览控件像素坐标 + 分数 + 类别)
+  List<(Rect, double, int)> _yoloBoxes = const [];
+
+  /// 最近一次检出的最高分数(诊断显示用)
+  double _yoloBest = 0; // ignore: unused_field
 
   /// 实时跟踪得到的框(预览控件坐标),用于录制中画框
   Rect? _liveBoxScreen;
@@ -1550,9 +1556,11 @@ class _CameraPageState extends State<CameraPage> {
   double _liveLogStart = 0;
 
   void _startLiveTracking() {
-    final box = _lockBox;
     if (!VisionTracker.isSupported) return;
-    if (!_lockEnabled || box == null) return;
+    // 两种启动条件:画了框(Vision 跟踪)或已加载 YOLO 模型(纯检测模式)
+    final yoloOn = _yoloStatus.startsWith('已加载');
+    final box = _lockEnabled ? _lockBox : null;
+    if (box == null && !yoloOn) return;
     final ctx = _previewKey.currentContext;
     final rb = ctx?.findRenderObject() as RenderBox?;
     if (rb == null || !rb.hasSize) return;
@@ -1570,26 +1578,64 @@ class _CameraPageState extends State<CameraPage> {
     // 用户框存的是"图像归一化"坐标,而抓屏区域是**预览控件**的矩形 ——
     // 两者在 cover 裁切下并不等价,必须先换算到控件坐标再归一化,
     // 否则跟踪器一开始就瞄错位置。
-    final sr = _imageRectToScreen(box);
-    final ctrlBox = Rect.fromLTWH(
-      sr.left / rb.size.width,
-      sr.top / rb.size.height,
-      sr.width / rb.size.width,
-      sr.height / rb.size.height,
-    );
+    Rect ctrlBox = Rect.zero;
+    if (box != null) {
+      final sr = _imageRectToScreen(box);
+      ctrlBox = Rect.fromLTWH(
+        sr.left / rb.size.width,
+        sr.top / rb.size.height,
+        sr.width / rb.size.width,
+        sr.height / rb.size.height,
+      );
+    }
     _liveSub?.cancel();
     _liveSub = VisionTracker.liveStream.listen((m) {
       if (!mounted) return;
+      // 值可能是数字也可能是数组(ydet),统一在这里安全取值
+      double n(String k) => m[k] is num ? (m[k] as num).toDouble() : 0.0;
       // 跟丢时(lost)继续显示上一次的框,不要清空 ——
       // "框闪一下就消失"就是清空造成的:现在框由跟踪器逐帧驱动,
       // 跟丢只是标记,不是消失。
+      // YOLO 检出框:每 6 个值一组[x,y,w,h,score,cls],相对**整屏**归一化
+      final yd = m['ydet'];
+      if (yd is List && yd.isNotEmpty) {
+        final list = <(Rect, double, int)>[];
+        for (var i = 0; i + 5 < yd.length; i += 6) {
+          final x = (yd[i] as num).toDouble();
+          final y = (yd[i + 1] as num).toDouble();
+          final w = (yd[i + 2] as num).toDouble();
+          final h = (yd[i + 3] as num).toDouble();
+          final sc = (yd[i + 4] as num).toDouble();
+          final cl = (yd[i + 5] as num).toInt();
+          // 整屏归一化 → 预览控件归一化 → 屏幕像素
+          final nx = (x - region.left) / region.width;
+          final ny = (y - region.top) / region.height;
+          final nw = w / region.width;
+          final nh = h / region.height;
+          list.add((
+            Rect.fromLTWH(
+              nx * _previewSize.width,
+              ny * _previewSize.height,
+              nw * _previewSize.width,
+              nh * _previewSize.height,
+            ),
+            sc,
+            cl,
+          ));
+        }
+        // 只留分数最高的几个,避免画面被框糊住
+        list.sort((a, b) => b.$2.compareTo(a.$2));
+        _yoloBoxes = list.take(4).toList();
+        _yoloBest = list.isEmpty ? 0 : list.first.$2;
+        setState(() {});
+      }
       if (m['lost'] == 1) return;
       final t = DateTime.now().millisecondsSinceEpoch / 1000.0 - _liveLogStart;
       // 回传的是"预览控件归一化"坐标,而导出需要的是**成片帧归一化**坐标。
       // 两者之间隔着 cover 裁切和稳定放大,必须走 _screenToImage 换算 ——
       // 直接当帧坐标用,导出时目标会整体偏掉。
-      final cx = (m['x'] ?? 0) + (m['w'] ?? 0) / 2;
-      final cy = (m['y'] ?? 0) + (m['h'] ?? 0) / 2;
+      final cx = n('x') + n('w') / 2;
+      final cy = n('y') + n('h') / 2;
       // ── 跟随:把目标框平移到画面正中 ──
       // 内容需要平移的量 = 画面中心 - 目标位置(符号约定:translate(+d) = 内容位移 +d)
       final vw = _previewSize.width;
@@ -4808,6 +4854,17 @@ class _CameraPageState extends State<CameraPage> {
                 ),
               ),
 
+            // ── YOLO 实时检出框(类别 0=bound 1=screen,按类别上色)──
+            if (!_liveMode && _yoloBoxes.isNotEmpty)
+              Positioned.fill(
+                child: IgnorePointer(
+                  child: CustomPaint(
+                    painter: _YoloBoxPainter(_yoloBoxes),
+                    size: Size.infinite,
+                  ),
+                ),
+              ),
+
             // ── 录制中实时跟踪框(ReplayKit 抓屏 + Vision)──
             if (!_liveMode && _liveBoxScreen != null)
               Positioned(
@@ -5344,6 +5401,37 @@ class _CameraPageState extends State<CameraPage> {
     _cam?.dispose();
     super.dispose();
   }
+}
+
+/// YOLO 检出框画笔:按类别上色并标出分数。
+/// 类别 0 用黄色(bound),类别 1 用青色(screen);同类别多框时按分数高低
+/// 微调透明度,便于看出主次。
+class _YoloBoxPainter extends CustomPainter {
+  final List<(Rect, double, int)> boxes;
+  _YoloBoxPainter(this.boxes);
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final p = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 2.5;
+    final tp = TextPainter(textDirection: TextDirection.ltr);
+    for (final (r, sc, cls) in boxes) {
+      final c = cls == 1 ? const Color(0xFF00E5FF) : const Color(0xFFFFD54F);
+      p.color = c.withValues(alpha: (0.55 + 0.45 * sc).clamp(0.0, 1.0));
+      canvas.drawRect(r, p);
+      tp
+        ..text = TextSpan(
+          text: '${cls == 1 ? 'screen' : 'bound'} ${sc.toStringAsFixed(2)}',
+          style: TextStyle(color: c, fontSize: 11, fontWeight: FontWeight.bold),
+        )
+        ..layout();
+      tp.paint(canvas, Offset(r.left, (r.top - 13).clamp(0.0, size.height)));
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _YoloBoxPainter old) => true;
 }
 
 /// 锁定框画笔:四角括线 + 画面正中十字。
