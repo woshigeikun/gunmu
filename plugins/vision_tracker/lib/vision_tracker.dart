@@ -19,16 +19,14 @@ class VisionTracker {
 
   static bool get isSupported => Platform.isIOS;
 
-  /// 实时跟踪事件通道:每帧推回 {'x','y','w','h','c'}(相对预览的 0~1 归一化)
+  /// 实时跟踪事件通道。值类型是动态的:既有数字(框坐标/光流),也有
+  /// 数组(ydet = YOLO 检出列表)。**不能**统一映射成 double ——
+  /// 那样遇到数组会在映射阶段抛错,整条流从此失效。
   static const EventChannel _liveCh = EventChannel('vision_tracker/live');
-  static Stream<Map<String, double>> get liveStream => _liveCh
+  static Stream<Map<String, dynamic>> get liveStream => _liveCh
       .receiveBroadcastStream()
       .where((e) => e is Map)
-      .map(
-        (e) => (e as Map).map(
-          (k, v) => MapEntry(k.toString(), (v as num).toDouble()),
-        ),
-      );
+      .map((e) => Map<String, dynamic>.from(e as Map));
 
   /// 开始"录制中实时跟踪"(ReplayKit 抓屏 + Vision 逐帧跟踪,只回传框坐标)。
   /// [box]:用户框,相对**预览**的 0~1 归一化;
