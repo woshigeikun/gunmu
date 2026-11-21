@@ -1,4 +1,4 @@
-﻿import Flutter
+import Flutter
 import UIKit
 import Vision
 import CoreGraphics
@@ -352,12 +352,12 @@ public class VisionTrackerPlugin: NSObject, FlutterPlugin {  public static func 
 
   private func handleStartLive(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
     let a = call.arguments as? [String: Any] ?? [:]
-    guard let bm = a["box"] as? [String: Any],
-      let rm = a["region"] as? [String: Any]
-    else {
-      result(FlutterError(code: "bad_args", message: "缺少 box / region", details: nil))
+    // box 允许缺省:纯 YOLO 模式下用户不必画框,只要有 region 就能启动抓屏。
+    guard let rm = a["region"] as? [String: Any] else {
+      result(FlutterError(code: "bad_args", message: "缺少 region", details: nil))
       return
     }
+    let bm = a["box"] as? [String: Any]
     func num(_ m: [String: Any], _ k: String) -> Double {
       (m[k] as? NSNumber)?.doubleValue ?? 0
     }
