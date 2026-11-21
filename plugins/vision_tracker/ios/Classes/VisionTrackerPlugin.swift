@@ -6,7 +6,9 @@ import CoreImage
 import CoreML
 import CoreMedia
 import ReplayKit
+#if canImport(onnxruntime_objc)
 import onnxruntime_objc
+#endif
 
 /// 用 iOS Vision 框架跟踪一个框选目标。
 ///
@@ -59,8 +61,9 @@ public class VisionTrackerPlugin: NSObject, FlutterPlugin {  public static func 
 
   private var yoloModel: VNCoreMLModel?
   /// ONNX Runtime 路径(同一份 .onnx 也能在 iOS 上用,与安卓共用模型)
-  private var ortEnv: ORTEnv?
-  private var ortSession: ORTSession?
+  // 用 AnyObject 存,避免在没装 ONNX Runtime 时引用其类型导致编译失败
+  private var ortEnv: AnyObject?
+  private var ortSession: AnyObject?
   private var ortInputName = ""
   private var ortOutputName = ""
   private var yoloInputW = 640
@@ -98,6 +101,7 @@ public class VisionTrackerPlugin: NSObject, FlutterPlugin {  public static func 
       let url = URL(fileURLWithPath: path)
       // .onnx 走 ONNX Runtime(与安卓共用同一份模型)
       if url.pathExtension.lowercased() == "onnx" {
+#if canImport(onnxruntime_objc)
         let env = try ORTEnv(loggingLevel: .warning)
         let opts = try ORTSessionOptions()
         let session = try ORTSession(
@@ -121,6 +125,12 @@ public class VisionTrackerPlugin: NSObject, FlutterPlugin {  public static func 
           "message": "已加载(ONNX) \(url.lastPathComponent)",
           "input": "640x640",
         ]
+#else
+        return [
+          "ok": false,
+          "message": "本构建未包含 ONNX Runtime,请改用 .mlmodelc 模型",
+        ]
+#endif
       }
       var modelURL = url
       if url.pathExtension.lowercased() != "mlmodelc" {
@@ -582,6 +592,7 @@ public class VisionTrackerPlugin: NSObject, FlutterPlugin {  public static func 
   /// 把 CGImage 转成 ONNX 输入张量:拉伸到 640×640、RGB、/255、NCHW。
   /// 用"拉伸"而不是 letterbox,是为了和 Core ML 路径(.scaleFill)行为一致 ——
   /// 两条后端的框坐标才能用同一套归一化,不会出现"换后端框就偏"的问题。
+#if canImport(onnxruntime_objc)
   private func ortInput(from img: CGImage) -> ORTValue? {
     let W = yoloInputW, H = yoloInputH
     let ci = CIImage(cgImage: img)
@@ -613,6 +624,8 @@ public class VisionTrackerPlugin: NSObject, FlutterPlugin {  public static func 
       tensorData: data, elementType: .float,
       shape: [1, 3, NSNumber(value: W), NSNumber(value: H)])
   }
+
+#endif
 
   /// 通用 YOLO 解码:输入是**扁平化的 Float 缓冲** + 形状,布局自动判断。
   /// Core ML 与 ONNX 两条后端共用同一套解码,保证结果一致。
@@ -665,7 +678,8 @@ public class VisionTrackerPlugin: NSObject, FlutterPlugin {  public static func 
   /// 两条后端:ONNX Runtime(.onnx,与安卓共用模型)或 Core ML(.mlmodelc)。
   private func runYolo(on img: CGImage) -> [(box: CGRect, score: Double, cls: Int)] {
     // ① ONNX 路径
-    if let session = ortSession {
+#if canImport(onnxruntime_objc)
+    if let session = ortSession as? ORTSession {
       guard let input = ortInput(from: img) else { return [] }
       var outputs: [String: ORTValue] = [:]
       do {
@@ -691,6 +705,7 @@ public class VisionTrackerPlugin: NSObject, FlutterPlugin {  public static func 
       }
       return out_
     }
+#endif
     // ② Core ML 路径
     guard let vn = yoloModel else { return [] }
     let req = VNCoreMLRequest(model: vn)
