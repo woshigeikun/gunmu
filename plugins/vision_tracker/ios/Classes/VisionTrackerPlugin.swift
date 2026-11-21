@@ -364,20 +364,26 @@ public class VisionTrackerPlugin: NSObject, FlutterPlugin {  public static func 
     liveRegion = CGRect(
       x: num(rm, "x"), y: num(rm, "y"),
       width: num(rm, "w"), height: num(rm, "h"))
-    let userBox = CGRect(
-      x: num(bm, "x"), y: num(bm, "y"),
-      width: num(bm, "w"), height: num(bm, "h"))
     liveHandler = VNSequenceRequestHandler()
-    let req = VNTrackObjectRequest(
-      detectedObjectObservation: VNDetectedObjectObservation(
-        boundingBox: toScreenVision(userBox)))
-    liveRequest = req
-    liveRequestBBox = req.inputObservation.boundingBox
     liveLostStreak = 0
     liveLastDetect = 0
     liveRef = nil
     liveRefPrint = nil
     livePrev = nil
+    liveRequest = nil
+    // 画了框才建跟踪请求;没画框(Pure YOLO 模式)只跑 YOLO + 光流
+    if let bmx = bm {
+      let userBox = CGRect(
+        x: num(bmx, "x"), y: num(bmx, "y"),
+        width: num(bmx, "w"), height: num(bmx, "h"))
+      if userBox.width > 0.005 && userBox.height > 0.005 {
+        let req = VNTrackObjectRequest(
+          detectedObjectObservation: VNDetectedObjectObservation(
+            boundingBox: toScreenVision(userBox)))
+        liveRequest = req
+        liveRequestBBox = req.inputObservation.boundingBox
+      }
+    }
     liveLastTick = 0
 
     let rec = RPScreenRecorder.shared()
@@ -443,50 +449,58 @@ public class VisionTrackerPlugin: NSObject, FlutterPlugin {  public static func 
   ///   * 画面先缩到 480 宽再跟踪:整帧 1170×2532 直接跟踪跟不上 60fps,
   ///     而框的位置根本不需要那个分辨率(归一化坐标不受缩放影响)
   private func tickLive(_ px: CVPixelBuffer) {
-    guard let req = liveRequest, let handler = liveHandler else { return }
     let now = CFAbsoluteTimeGetCurrent()
     guard let cg = downscaled(px, targetW: 480) else { return }
 
-    do {
-      try handler.perform([req], on: cg)
-    } catch {
-      return
-    }
-    var box = req.inputObservation.boundingBox
+    var box = liveRequestBBox
     var conf = 0.0
-    if let obs = req.results?.first as? VNDetectedObjectObservation {
-      conf = Double(obs.confidence)
-      if conf > 0.25 {
-        req.inputObservation = obs
-        box = obs.boundingBox
-        liveLostStreak = 0
-      } else {
-        liveLostStreak += 1
-      }
-    }
+    var trackingRan = false
 
-    // 首帧:把目标块存下来当"参考"(只做一次,之后重捕获都拿它比特征)
-    if liveRef == nil, box.width > 0.01, box.height > 0.01 {
-      let W = CGFloat(cg.width), H = CGFloat(cg.height)
-      let px = CGRect(
-        x: box.minX * W, y: (1 - box.maxY) * H,
-        width: box.width * W, height: box.height * H
-      ).integral
-      if px.width > 12, px.height > 12, let ref = cg.cropping(to: px) {
-        liveRef = ref
-        liveRefPrint = featurePrint(ref)
+    // ── ① 手画框的 Vision 跟踪(没有画框时整段跳过,YOLO 仍可独立工作)──
+    if let req = liveRequest, let handler = liveHandler {
+      trackingRan = true
+      do {
+        try handler.perform([req], on: cg)
+      } catch {
+        trackingRan = false
       }
-    }
+      if trackingRan {
+        box = req.inputObservation.boundingBox
+        if let obs = req.results?.first as? VNDetectedObjectObservation {
+          conf = Double(obs.confidence)
+          if conf > 0.25 {
+            req.inputObservation = obs
+            box = obs.boundingBox
+            liveLostStreak = 0
+          } else {
+            liveLostStreak += 1
+          }
+        }
 
-    // 重新捕获:连续跟丢,或每隔 0.4 秒主动校正一次(防止慢慢漂走)
-    if liveLostStreak >= 3 || now - liveLastDetect > 0.4 {
-      liveLastDetect = now
-      if let nb = reacquire(near: box, in: cg) {
-        let fresh = VNTrackObjectRequest(
-          detectedObjectObservation: VNDetectedObjectObservation(boundingBox: nb))
-        liveRequest = fresh
-        box = nb
-        liveLostStreak = 0
+        // 首帧:把目标块存下来当"参考"(只做一次,重捕获都拿它比特征)
+        if liveRef == nil, box.width > 0.01, box.height > 0.01 {
+          let W = CGFloat(cg.width), H = CGFloat(cg.height)
+          let pxR = CGRect(
+            x: box.minX * W, y: (1 - box.maxY) * H,
+            width: box.width * W, height: box.height * H
+          ).integral
+          if pxR.width > 12, pxR.height > 12, let ref = cg.cropping(to: pxR) {
+            liveRef = ref
+            liveRefPrint = featurePrint(ref)
+          }
+        }
+
+        // 重新捕获:连续跟丢,或每隔 0.4 秒主动校正一次(防止慢慢漂走)
+        if liveLostStreak >= 3 || now - liveLastDetect > 0.4 {
+          liveLastDetect = now
+          if let nb = reacquire(near: box, in: cg) {
+            let fresh = VNTrackObjectRequest(
+              detectedObjectObservation: VNDetectedObjectObservation(boundingBox: nb))
+            liveRequest = fresh
+            box = nb
+            liveLostStreak = 0
+          }
+        }
       }
     }
 
@@ -504,12 +518,66 @@ public class VisionTrackerPlugin: NSObject, FlutterPlugin {  public static func 
       payload["fc"] = fc
     }
     livePrev = cg
-    // 必须回传**数字**而不是 Bool:通道过来后 Dart 侧统一按 num 解析,
-    // 混进一个 bool 会让整条流的映射抛错,框就再也不更新了。
-    payload["lost"] = (liveLostStreak > 5) ? 1.0 : 0.0
+    // Must send numbers, not Bool: the Dart side parses every value as num,
+    // so a stray bool would throw on the whole stream mapping and the box
+    // would stop updating forever.
+    payload["lost"] = (trackingRan && liveLostStreak > 5) ? 1.0 : 0.0
+
+    // ── ② YOLO:加载了模型就在抓屏帧上跑检测,把框推给 Dart 实时绘制 ──
+    // 节流到每 2 帧一次(约 30fps 抓屏 → 15fps 检测),省电且够用;
+    // 检测坐标是"相对整屏"的归一化值,Dart 侧再换算到预览控件坐标。
+    if yoloModel != nil, now - yoloLastRun > 0.06 {
+      yoloLastRun = now
+      let dets = runYolo(on: cg)
+      var flat: [Double] = []
+      for d in dets {
+        flat.append(contentsOf: [
+          Double(d.box.minX), Double(d.box.minY),
+          Double(d.box.width), Double(d.box.height),
+          d.score, Double(d.cls),
+        ])
+      }
+      payload["ydet"] = flat
+    }
     DispatchQueue.main.async { [weak self] in
       self?.liveSink?(payload)
     }
+  }
+
+  private var yoloLastRun: CFAbsoluteTime = 0
+
+  /// 在抓屏帧(整屏缩略图)上跑 YOLO,返回"相对整屏、左上原点"的归一化框。
+  /// 与 detectYolo 方法共用同一套解码逻辑,但输入直接是 CGImage,省掉
+  /// 灰度字节在通道上来回搬运。
+  private func runYolo(on img: CGImage) -> [(box: CGRect, score: Double, cls: Int)] {
+    guard let vn = yoloModel else { return [] }
+    let req = VNCoreMLRequest(model: vn)
+    req.imageCropAndScaleOption = .scaleFill
+    let handler = VNImageRequestHandler(cgImage: img, options: [:])
+    do {
+      try handler.perform([req])
+    } catch {
+      return []
+    }
+    var out: [(box: CGRect, score: Double, cls: Int)] = []
+    if let obs = req.results as? [VNRecognizedObjectObservation] {
+      for o in obs {
+        let b = o.boundingBox
+        out.append((
+          CGRect(x: b.minX, y: 1 - b.maxY, width: b.width, height: b.height),
+          Double(o.labels.first?.confidence ?? 0), 0))
+      }
+      return out
+    }
+    guard let fv = req.results?.first as? VNCoreMLFeatureValueObservation,
+      let arr = fv.featureValue.multiArrayValue
+    else { return [] }
+    // decodeYolo 输出的 y 已经是"左上原点"归一化坐标(直接来自张量)
+    for d in decodeYolo(arr, threshold: 0.3) {
+      out.append((
+        CGRect(x: d[0], y: d[1], width: d[2], height: d[3]), d[4], Int(d[5])))
+    }
+    return out
   }
 
   /// 把屏幕帧等比缩到 targetW 宽(保持比例,归一化坐标因此仍然有效)
