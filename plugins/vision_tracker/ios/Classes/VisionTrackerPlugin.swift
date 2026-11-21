@@ -1,4 +1,4 @@
-import Flutter
+﻿import Flutter
 import UIKit
 import Vision
 import CoreGraphics
@@ -6,6 +6,7 @@ import CoreImage
 import CoreML
 import CoreMedia
 import ReplayKit
+import onnxruntime_objc
 
 /// 用 iOS Vision 框架跟踪一个框选目标。
 ///
@@ -57,6 +58,11 @@ public class VisionTrackerPlugin: NSObject, FlutterPlugin {  public static func 
   // ─────────────── YOLO(可导入模型)───────────────
 
   private var yoloModel: VNCoreMLModel?
+  /// ONNX Runtime 路径(同一份 .onnx 也能在 iOS 上用,与安卓共用模型)
+  private var ortEnv: ORTEnv?
+  private var ortSession: ORTSession?
+  private var ortInputName = ""
+  private var ortOutputName = ""
   private var yoloInputW = 640
   private var yoloInputH = 640
   private var yoloModelName = ""
@@ -72,7 +78,7 @@ public class VisionTrackerPlugin: NSObject, FlutterPlugin {  public static func 
         at: dir, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])) ?? []
       for u in items {
         let ext = u.pathExtension.lowercased()
-        if ext == "mlmodelc" || ext == "mlpackage" || ext == "mlmodel" {
+        if ext == "mlmodelc" || ext == "mlpackage" || ext == "mlmodel" || ext == "onnx" {
           out.append(["name": u.lastPathComponent, "path": u.path])
         }
       }
@@ -90,6 +96,32 @@ public class VisionTrackerPlugin: NSObject, FlutterPlugin {  public static func 
     }
     do {
       let url = URL(fileURLWithPath: path)
+      // .onnx 走 ONNX Runtime(与安卓共用同一份模型)
+      if url.pathExtension.lowercased() == "onnx" {
+        let env = try ORTEnv(loggingLevel: .warning)
+        let opts = try ORTSessionOptions()
+        let session = try ORTSession(
+          env: env, modelPath: path, sessionOptions: opts)
+        guard let inName = session.inputNames.first,
+          let outName = session.outputNames.first
+        else {
+          return ["ok": false, "message": "ONNX 模型缺少输入/输出"]
+        }
+        ortEnv = env
+        ortSession = session
+        ortInputName = inName
+        ortOutputName = outName
+        yoloModel = nil // 切到 ORT 路径
+        yoloModelName = url.lastPathComponent
+        // YOLO 导出默认是 640×640;这里按导出约定固定,预处理用它做 letterbox
+        yoloInputW = 640
+        yoloInputH = 640
+        return [
+          "ok": true,
+          "message": "已加载(ONNX) \(url.lastPathComponent)",
+          "input": "640x640",
+        ]
+      }
       var modelURL = url
       if url.pathExtension.lowercased() != "mlmodelc" {
         // .mlpackage/.mlmodel 必须先编译;编译产物放临时目录
@@ -107,6 +139,7 @@ public class VisionTrackerPlugin: NSObject, FlutterPlugin {  public static func 
         yoloInputH = ic.pixelsHigh > 0 ? ic.pixelsHigh : 640
       }
       yoloModel = vn
+      ortSession = nil // 切回 Core ML 路径
       yoloModelName = url.lastPathComponent
       return ["ok": true, "message": "已加载 \(url.lastPathComponent)", "input": "\(yoloInputW)x\(yoloInputH)"]
     } catch {
@@ -546,10 +579,119 @@ public class VisionTrackerPlugin: NSObject, FlutterPlugin {  public static func 
 
   private var yoloLastRun: CFAbsoluteTime = 0
 
+  /// 把 CGImage 转成 ONNX 输入张量:拉伸到 640×640、RGB、/255、NCHW。
+  /// 用"拉伸"而不是 letterbox,是为了和 Core ML 路径(.scaleFill)行为一致 ——
+  /// 两条后端的框坐标才能用同一套归一化,不会出现"换后端框就偏"的问题。
+  private func ortInput(from img: CGImage) -> ORTValue? {
+    let W = yoloInputW, H = yoloInputH
+    let ci = CIImage(cgImage: img)
+    let sx = CGFloat(W) / ci.extent.width
+    let sy = CGFloat(H) / ci.extent.height
+    let scaled = ci.transformed(by: CGAffineTransform(scaleX: sx, y: sy))
+    guard let cg = VisionTrackerPlugin.ciContext.createCGImage(scaled, from: scaled.extent)
+    else { return nil }
+    // 统一成 RGBA8
+    let bytesPerRow = W * 4
+    var buf = [UInt8](repeating: 0, count: bytesPerRow * H)
+    guard let ctx = CGContext(
+      data: &buf, width: W, height: H, bitsPerComponent: 8, bytesPerRow: bytesPerRow,
+      space: CGColorSpaceCreateDeviceRGB(),
+      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+    else { return nil }
+    ctx.draw(cg, in: CGRect(x: 0, y: 0, width: W, height: H))
+    // NCHW:三个平面依次是 R/G/B,值域 0~1
+    let plane = W * H
+    var f = [Float](repeating: 0, count: plane * 3)
+    for i in 0..<plane {
+      let o = i * 4
+      f[i] = Float(buf[o]) / 255.0
+      f[plane + i] = Float(buf[o + 1]) / 255.0
+      f[plane * 2 + i] = Float(buf[o + 2]) / 255.0
+    }
+    let data = NSMutableData(bytes: f, length: plane * 3 * MemoryLayout<Float>.size)
+    return try? ORTValue(
+      tensorData: data, elementType: .float,
+      shape: [1, 3, NSNumber(value: W), NSNumber(value: H)])
+  }
+
+  /// 通用 YOLO 解码:输入是**扁平化的 Float 缓冲** + 形状,布局自动判断。
+  /// Core ML 与 ONNX 两条后端共用同一套解码,保证结果一致。
+  private func decodeYoloRaw(
+    _ p: UnsafePointer<Float>, count: Int, shape: [Int], threshold: Double
+  ) -> [[Double]] {
+    guard shape.count == 3 else { return [] }
+    let s1 = shape[1], s2 = shape[2]
+    let channelMajor = s1 < s2
+    let ch = channelMajor ? s1 : s2
+    let n = channelMajor ? s2 : s1
+    guard ch >= 5, n > 0 else { return [] }
+    let stride1 = channelMajor ? n : ch
+    let stride2 = 1
+    let inW = Double(yoloInputW), inH = Double(yoloInputH)
+    var cands: [[Double]] = []
+    for i in 0..<n {
+      func val(_ c: Int) -> Double {
+        let idx = channelMajor ? (c * stride1 + i * stride2) : (i * stride1 + c * stride2)
+        return idx >= 0 && idx < count ? Double(p[idx]) : 0
+      }
+      var best = 0.0
+      for c in 4..<ch {
+        let s = val(c)
+        if s > best { best = s }
+      }
+      if best < threshold { continue }
+      let cx = val(0) / inW
+      let cy = val(1) / inH
+      let bw = val(2) / inW
+      let bh = val(3) / inH
+      if bw <= 0 || bh <= 0 { continue }
+      cands.append([cx - bw / 2, cy - bh / 2, bw, bh, best, 0])
+    }
+    cands.sort { $0[4] > $1[4] }
+    var kept: [[Double]] = []
+    for c in cands {
+      var dup = false
+      for k in kept where iouNorm(k, c) > 0.45 {
+        dup = true
+        break
+      }
+      if !dup { kept.append(c) }
+      if kept.count >= 8 { break }
+    }
+    return kept
+  }
+
   /// 在抓屏帧(整屏缩略图)上跑 YOLO,返回"相对整屏、左上原点"的归一化框。
-  /// 与 detectYolo 方法共用同一套解码逻辑,但输入直接是 CGImage,省掉
-  /// 灰度字节在通道上来回搬运。
+  /// 两条后端:ONNX Runtime(.onnx,与安卓共用模型)或 Core ML(.mlmodelc)。
   private func runYolo(on img: CGImage) -> [(box: CGRect, score: Double, cls: Int)] {
+    // ① ONNX 路径
+    if let session = ortSession {
+      guard let input = ortInput(from: img) else { return [] }
+      var outputs: [String: ORTValue] = [:]
+      do {
+        outputs = try session.run(
+          withInputs: [ortInputName: input],
+          outputNames: Set([ortOutputName]),
+          runOptions: nil)
+      } catch {
+        return []
+      }
+      guard let out = outputs[ortOutputName] else { return [] }
+      let shape = out.shape.map { $0.intValue }
+      let data = out.tensorData as Data
+      let count = data.count / MemoryLayout<Float>.size
+      guard count > 0 else { return [] }
+      var out_: [(box: CGRect, score: Double, cls: Int)] = []
+      data.withUnsafeBytes { raw in
+        guard let p = raw.bindMemory(to: Float.self).baseAddress else { return }
+        for d in decodeYoloRaw(p, count: count, shape: shape, threshold: 0.3) {
+          out_.append((
+            CGRect(x: d[0], y: d[1], width: d[2], height: d[3]), d[4], Int(d[5])))
+        }
+      }
+      return out_
+    }
+    // ② Core ML 路径
     guard let vn = yoloModel else { return [] }
     let req = VNCoreMLRequest(model: vn)
     req.imageCropAndScaleOption = .scaleFill
