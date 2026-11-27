@@ -1,12 +1,12 @@
 name: export-coreml
 # 在 GitHub 的 macOS runner 上把 models/best.pt 转成 Core ML(.mlmodelc)。
 #
-# 为什么要走 ONNX 中转:直接把 .pt 交给 coremltools 会失败 ——
-#   ERROR - converting 'int' op (located at: '.../attn/...'):
-#   TypeError: only 0-dimensional arrays can be converted to Python scalars
-# YOLO11 注意力块里的 int() 无法被 TorchScript 前端降级。
-# 先导 ONNX 再转 Core ML,可以绕开这个问题,而且输出布局 [1,84,8400]
-# 正好是 App 解码器已支持的那种。
+# 踩过的两个坑,这里都绕开了:
+#   1) coremltools 9.0 直转 .pt 会失败:YOLO11 注意力块里的 int() 无法降级
+#      → TypeError: only 0-dimensional arrays can be converted to Python scalars
+#   2) coremltools 9.0 移除了 ONNX 前端
+#      → ValueError: Unable to determine the type of the model ... source
+# 所以固定 coremltools 7.2(两个前端都还在),先试直转,失败再走 ONNX 中转。
 on:
   workflow_dispatch:
 
@@ -23,41 +23,44 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: 安装依赖
+      - name: 安装依赖(coremltools 固定 7.2)
         run: |
           python -m pip install --upgrade pip
-          python -m pip install "numpy<2.3" ultralytics onnx coremltools
+          python -m pip install "numpy<2.3" "coremltools==7.2" ultralytics onnx
+          python -c "import coremltools as ct; print('coremltools', ct.__version__)"
 
-      - name: 导出 ONNX(opset 13,兼容性最好)
+      - name: 尝试一:直接 .pt → Core ML
         run: |
           cd models
-          yolo export model=best.pt format=onnx imgsz=640 simplify=False opset=13
-          echo "--- 产物 ---"
+          yolo export model=best.pt format=coreml imgsz=640 nms=False || true
           ls -la
 
-      - name: ONNX → Core ML
+      - name: 尝试二:ONNX 中转(仅当尝试一没产物)
         run: |
+          cd models
+          if ls *.mlpackage >/dev/null 2>&1; then
+            echo "尝试一已成功,跳过"
+            exit 0
+          fi
+          echo "尝试一失败,改走 ONNX"
+          yolo export model=best.pt format=onnx imgsz=640 simplify=False opset=13
           python - <<'PY'
-          import coremltools as ct
-
-          src = "models/best.onnx"
-          m = ct.convert(
-              src,
-              convert_to="mlprogram",
-              minimum_deployment_target=ct.target.iOS16,
-          )
-          out = "models/best.mlpackage"
-          m.save(out)
-          print("saved:", out)
-          print("inputs:", m.get_spec().description.input)
-              # 供日志核对输入名/形状,方便排查
+          import coremltools as ct, onnx
+          m = onnx.load("models/best.onnx")
+          ml = ct.convert(m, convert_to="mlprogram",
+                          minimum_deployment_target=ct.target.iOS16)
+          ml.save("models/best.mlpackage")
+          print("saved models/best.mlpackage")
           PY
-          ls -la models
+          ls -la
 
       - name: 编译为 mlmodelc
         run: |
           cd models
-          xcrun coremlcompiler compile best.mlpackage out
+          PKG=$(ls -d *.mlpackage | head -1)
+          if [ -z "$PKG" ]; then echo "没有 mlpackage,转换失败"; exit 1; fi
+          echo "编译 $PKG"
+          xcrun coremlcompiler compile "$PKG" out
           ls -la out
 
       - name: 打包并发布
