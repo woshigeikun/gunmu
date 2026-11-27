@@ -1,4 +1,4 @@
-﻿import Flutter
+import Flutter
 import UIKit
 import Vision
 import CoreGraphics
@@ -564,7 +564,10 @@ public class VisionTrackerPlugin: NSObject, FlutterPlugin {  public static func 
     // Must send numbers, not Bool: the Dart side parses every value as num,
     // so a stray bool would throw on the whole stream mapping and the box
     // would stop updating forever.
-    payload["lost"] = (trackingRan && liveLostStreak > 5) ? 1.0 : 0.0
+    // 没有跟踪请求(纯 YOLO 模式)时**必须标记 lost**:否则回传的是
+    // liveRequestBBox 的默认占位框(0,0,0.05,0.05,Vision 原点在左下),
+    // Dart 会把那个小方块画在画面左下角 —— 之前"框一直困在左下角"就是这个。
+    payload["lost"] = (!trackingRan || liveLostStreak > 5) ? 1.0 : 0.0
 
     // ── ② YOLO:加载了模型就在抓屏帧上跑检测,把框推给 Dart 实时绘制 ──
     // 节流到每 2 帧一次(约 30fps 抓屏 → 15fps 检测),省电且够用;
