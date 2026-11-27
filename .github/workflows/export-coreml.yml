@@ -1,7 +1,12 @@
 name: export-coreml
-# 在 GitHub 的 macOS runner 上把 models/best.pt 转成 Core ML(.mlmodelc),
-# 打包后发布到 Release,供手机端下载安装。
-# 为什么用 macOS runner:coremltools 与 xcrun coremlcompiler 只有 macOS 能用。
+# 在 GitHub 的 macOS runner 上把 models/best.pt 转成 Core ML(.mlmodelc)。
+#
+# 为什么要走 ONNX 中转:直接把 .pt 交给 coremltools 会失败 ——
+#   ERROR - converting 'int' op (located at: '.../attn/...'):
+#   TypeError: only 0-dimensional arrays can be converted to Python scalars
+# YOLO11 注意力块里的 int() 无法被 TorchScript 前端降级。
+# 先导 ONNX 再转 Core ML,可以绕开这个问题,而且输出布局 [1,84,8400]
+# 正好是 App 解码器已支持的那种。
 on:
   workflow_dispatch:
 
@@ -18,42 +23,54 @@ jobs:
         with:
           python-version: '3.11'
 
-      # ultralytics 负责读 .pt 并导出;coremltools 是导出后端;onnx 是中间格式
       - name: 安装依赖
         run: |
           python -m pip install --upgrade pip
-          python -m pip install ultralytics coremltools onnx
+          python -m pip install "numpy<2.3" ultralytics onnx coremltools
 
-      - name: 导出 Core ML
+      - name: 导出 ONNX(opset 13,兼容性最好)
         run: |
           cd models
-          yolo export model=best.pt format=coreml imgsz=640
+          yolo export model=best.pt format=onnx imgsz=640 simplify=False opset=13
           echo "--- 产物 ---"
           ls -la
 
-      # 导出结果是 .mlpackage(目录)。编译成 .mlmodelc 后 App 加载更快,
-      # 而且我们的插件对两者都支持(见 VisionTrackerPlugin.loadYoloModel)。
+      - name: ONNX → Core ML
+        run: |
+          python - <<'PY'
+          import coremltools as ct
+
+          src = "models/best.onnx"
+          m = ct.convert(
+              src,
+              convert_to="mlprogram",
+              minimum_deployment_target=ct.target.iOS16,
+          )
+          out = "models/best.mlpackage"
+          m.save(out)
+          print("saved:", out)
+          print("inputs:", m.get_spec().description.input)
+              # 供日志核对输入名/形状,方便排查
+          PY
+          ls -la models
+
       - name: 编译为 mlmodelc
         run: |
           cd models
-          PKG=$(ls -d *.mlpackage | head -1)
-          echo "编译 $PKG"
-          xcrun coremlcompiler compile "$PKG" out
+          xcrun coremlcompiler compile best.mlpackage out
           ls -la out
 
-      - name: 打包
+      - name: 打包并发布
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           cd models
           mkdir -p bundle
           cp -r out/*.mlmodelc bundle/
           cd bundle
           zip -r ../best-coreml.zip .
-
-      - name: 发布到 Release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
+          cd ../..
           gh release view tools >/dev/null 2>&1 || gh release create tools \
             --title "导出产物" --notes "模型等转换产物"
           gh release upload tools models/best-coreml.zip --clobber
-          echo "下载地址: https://github.com/${{ github.repository }}/releases/download/tools/best-coreml.zip"
+          echo "下载: https://github.com/${{ github.repository }}/releases/download/tools/best-coreml.zip"
