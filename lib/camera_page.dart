@@ -1320,8 +1320,11 @@ class _CameraPageState extends State<CameraPage> {
   }
 
   /// 每 0.1 秒跑一次:取最新帧 → 灰度 → Vision 检测 → 刷新候选框
+  /// 同时也跑 YOLO(如果加载了模型):这样**没录像时也能看到框**,
+  /// 不必等 ReplayKit 抓屏启动。
   Future<void> _liveTick() async {
-    if (!_liveDetect || _detecting || _recording || _busy) return;
+    if (_recording || _busy || _detecting) return;
+    if (!_liveDetect && !_yoloOn) return;
     final f = _liveFrame;
     if (f == null || !mounted) return;
     // 跨 await 前先读上下文
@@ -1331,6 +1334,31 @@ class _CameraPageState extends State<CameraPage> {
       final turns = (portrait && f.width > f.height) ? 1 : 0;
       final g = _frameToGray(f, turns, 1024);
       if (g == null) return;
+      // ── YOLO 预览(录像前)──
+      if (_yoloOn) {
+        final yd = await VisionTracker.detectYolo(
+          bytes: g.$1,
+          w: g.$2,
+          h: g.$3,
+          threshold: 0.35,
+        );
+        if (!mounted || _recording) return;
+        final boxes = <(Rect, double, int)>[];
+        for (var i = 0; i + 5 < yd.length; i += 6) {
+          // YOLO 坐标相对"旋转后的相机帧" = 图像归一化坐标,
+          // 用 _imageRectToScreen 换算到屏幕,才能和预览对齐。
+          final r = _imageRectToScreen(
+            Rect.fromLTWH(yd[i], yd[i + 1], yd[i + 2], yd[i + 3]),
+          );
+          boxes.add((r, yd[i + 4], yd[i + 5].toInt()));
+        }
+        boxes.sort((a, b) => b.$2.compareTo(a.$2));
+        setState(() {
+          _yoloBoxes = boxes.take(4).toList();
+          _yoloBest = boxes.isEmpty ? 0 : boxes.first.$2;
+        });
+      }
+      if (!_liveDetect) return;
       final list = await VisionTracker.detectTargets(
         bytes: g.$1,
         w: g.$2,
@@ -1536,7 +1564,10 @@ class _CameraPageState extends State<CameraPage> {
   List<(Rect, double, int)> _yoloBoxes = const [];
 
   /// 最近一次检出的最高分数(诊断显示用)
-  double _yoloBest = 0; // ignore: unused_field
+  double _yoloBest = 0;
+
+  /// 是否加载了 YOLO 模型(决定录像前是否跑预览检测)
+  bool get _yoloOn => _yoloStatus.startsWith('已加载');
 
   /// 实时跟踪得到的框(预览控件坐标),用于录制中画框
   Rect? _liveBoxScreen;
@@ -1627,6 +1658,20 @@ class _CameraPageState extends State<CameraPage> {
         list.sort((a, b) => b.$2.compareTo(a.$2));
         _yoloBoxes = list.take(4).toList();
         _yoloBest = list.isEmpty ? 0 : list.first.$2;
+        // 录像中:把 YOLO 检出的目标(优先 screen 类)记进轨迹。
+        // 这样**没画框**也有视觉轨迹可用 → 导出可以跳过检查点重识别。
+        if (_recording && list.isNotEmpty) {
+          final pick = list.firstWhere(
+            (b) => b.$3 == 1,
+            orElse: () => list.first,
+          );
+          final img = _screenToImage(pick.$1.center);
+          _liveLog.add([
+            DateTime.now().millisecondsSinceEpoch / 1000.0 - _liveLogStart,
+            img.dx,
+            img.dy,
+          ]);
+        }
         setState(() {});
       }
       if (m['lost'] == 1) return;
@@ -1717,7 +1762,8 @@ class _CameraPageState extends State<CameraPage> {
         // ── 开始录像 ──
         // iOS 不允许"取图像流 + 录像"并存,必须先把实时识别停掉,
         // 否则 startVideoRecording 会直接抛错。
-        final wasLive = _liveDetect;
+        // YOLO 预览也占着图像流,录像前必须一起停掉,否则 startVideoRecording 会失败
+        final wasLive = _liveDetect || _yoloOn;
         if (wasLive) await _pauseLive();
         try {
           await cam.startVideoRecording();
@@ -1777,7 +1823,7 @@ class _CameraPageState extends State<CameraPage> {
         await _stopLiveTracking();
         final liveTrackSnapshot = List<List<double>>.from(_liveLog);
         // 录像结束,恢复实时识别
-        if (_liveDetect) unawaited(_resumeLive());
+        if (_liveDetect || _yoloOn) unawaited(_resumeLive());
         // 快照本段数据:后台渲染期间可以继续拍摄,不能被下一段覆盖
         final samplesSnapshot = List<_HrSample>.from(_samples);
         final hadBleSnapshot = _recordHadBle;
@@ -2428,7 +2474,9 @@ class _CameraPageState extends State<CameraPage> {
     // 1.35) 多遍识别:检查点重新识别(每 10 秒一次)+ 用户没选时在 5 秒自动选目标
     // 录制中实时抓屏已经拿到了完整轨迹(时间基准和陀螺仪同源、坐标已换算到
     // 成片帧),那就完全不需要这一步 —— 省掉整段 OCR,导出明显变快。
-    final bool useLiveTrack = liveTrack.length >= 20 && lockBox != null;
+    // 只要录制期间拿到了视觉轨迹就跳过检查点重识别;
+    // 不再要求用户画框 —— YOLO 检出的目标同样会被记进轨迹。
+    final bool useLiveTrack = liveTrack.length >= 20;
     List<List<double>>? anchors;
     var effBox = lockBox;
     var ckInfo = useLiveTrack ? '实时抓屏轨迹 ${liveTrack.length} 点' : '';
@@ -3920,7 +3968,12 @@ class _CameraPageState extends State<CameraPage> {
                             style: TextStyle(color: Colors.white, fontSize: 15),
                           ),
                           subtitle: Text(
-                            _yoloStatus,
+                            // 已加载时顺带显示实时检出情况,方便判断模型在
+                            // 当前画面上到底认不认得出目标
+                            _yoloOn
+                                ? '$_yoloStatus · 实时检出 ${_yoloBoxes.length} 个'
+                                      '${_yoloBest > 0 ? ' · 最高 ${_yoloBest.toStringAsFixed(2)}' : ''}'
+                                : _yoloStatus,
                             style: const TextStyle(
                               color: Colors.white38,
                               fontSize: 11,
@@ -3977,6 +4030,9 @@ class _CameraPageState extends State<CameraPage> {
                                   : (r['message'] ?? '加载失败'),
                             );
                             setSheetState(() {});
+                            // 加载成功后立刻开启预览检测:这样**没录像也能看到框**
+                            // (走相机图像流 + detectYolo,不依赖 ReplayKit)
+                            if (r['ok'] == 'true') unawaited(_resumeLive());
                           },
                         ),
                         // 抓屏可行性探针:验证 iOS 能否用 ReplayKit 拿到
