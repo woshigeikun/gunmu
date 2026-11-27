@@ -1627,6 +1627,9 @@ class _CameraPageState extends State<CameraPage> {
   /// 用户反馈识别率不行且导出慢,现在只走实时轨迹(YOLO)+ 纯陀螺仪。
   bool _textTrackOn = false; // ignore: prefer_final_fields
 
+  /// 抓屏区域诊断(归一化到整屏):坐标换算出错时,这行数字能直接定位
+  String _regionText = '';
+
   /// 是否加载了 YOLO 模型(决定录像前是否跑预览检测)
   bool get _yoloOn => _yoloStatus.startsWith('已加载');
 
@@ -1667,9 +1670,11 @@ class _CameraPageState extends State<CameraPage> {
     );
     _liveLog.clear();
     _liveLogStart = DateTime.now().millisecondsSinceEpoch / 1000.0;
-    // 用户框存的是"图像归一化"坐标,而抓屏区域是**预览控件**的矩形 ——
-    // 两者在 cover 裁切下并不等价,必须先换算到控件坐标再归一化,
-    // 否则跟踪器一开始就瞄错位置。
+    // 诊断:把抓屏区域(相对整屏的归一化)显示在 HUD 上。
+    // 坐标换算如果出错,这 4 个数字能直接看出问题(比如 top 不是 0)。
+    _regionText =
+        '${region.left.toStringAsFixed(3)},${region.top.toStringAsFixed(3)},'
+        '${region.width.toStringAsFixed(3)},${region.height.toStringAsFixed(3)}';
     Rect ctrlBox = Rect.zero;
     if (box != null) {
       final sr = _imageRectToScreen(box);
@@ -5107,6 +5112,13 @@ class _CameraPageState extends State<CameraPage> {
                             'YOLO ${_yoloBoxes.length}'
                             '${_yoloBest > 0 ? ' (${_yoloBest.toStringAsFixed(2)})' : ''}'
                             ' · 抓屏 ${_liveSub != null ? '开' : '关'}',
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 11,
+                            ),
+                          ),
+                          Text(
+                            '区域 $_regionText',
                             style: const TextStyle(
                               color: Colors.white,
                               fontSize: 11,
