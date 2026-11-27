@@ -3688,6 +3688,34 @@ class _CameraPageState extends State<CameraPage> {
     _gyroSub = null;
   }
 
+  /// 开始/停止稳定(弹窗内的动作)。
+  /// 顶部的小按钮和底部的固定按钮**共用这一份逻辑**,避免两处行为不一致
+  /// (比如一处重置了陀螺仪、另一处忘了)。
+  void _toggleStabFromSheet(StateSetter setSheetState, BuildContext sheetCtx) {
+    setState(() {
+      if (_stabRunning) {
+        _stabRunning = false;
+        _stabOffsetX = 0;
+        _stabOffsetY = 0;
+      } else {
+        _onlineStab.reset();
+        _stabOffsetX = 0;
+        _stabOffsetY = 0;
+        // 立刻生效:裁切放大这一帧就位,不等第一个陀螺仪样本
+        // (否则会先空等几秒才看到画面被裁切)
+        _stabAutoZoom = GyroStabilizer.zoomForMargin(_effMargin);
+        _stabCorrDeg = 0;
+        _stabLog.clear();
+        _stabLast = DateTime.now();
+        _stabRunning = true;
+      }
+    });
+    // 确保陀螺仪订阅此刻就是活的,避免几秒空档
+    if (_stabRunning) _startGyroSession();
+    setSheetState(() {});
+    if (_stabRunning && Navigator.canPop(sheetCtx)) Navigator.pop(sheetCtx);
+  }
+
   /// 运动稳定弹窗(开关 + 陀螺仪测试 + 开始稳定)
   Future<void> _showStabilizeSheet() async {
     await _loadZoomRange();
@@ -3721,7 +3749,9 @@ class _CameraPageState extends State<CameraPage> {
 
           return ConstrainedBox(
             constraints: BoxConstraints(
-              maxHeight: MediaQuery.of(context2).size.height * 0.88,
+              // 94%:选项变多之后,给底部固定栏留出足够空间,
+              // 避免"开始稳定"按钮被挤出可见区域(88% 时出现过点不到)
+              maxHeight: MediaQuery.of(context2).size.height * 0.94,
             ),
             child: Column(
               mainAxisSize: MainAxisSize.min,
@@ -3733,13 +3763,52 @@ class _CameraPageState extends State<CameraPage> {
                       mainAxisSize: MainAxisSize.min,
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        const Text(
-                          '运动稳定',
-                          style: TextStyle(
-                            color: Colors.white,
-                            fontSize: 18,
-                            fontWeight: FontWeight.bold,
-                          ),
+                        Row(
+                          children: [
+                            const Expanded(
+                              child: Text(
+                                '运动稳定',
+                                style: TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 18,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                            ),
+                            // 顶部也放一个开始/停止按钮:选项太多时底栏可能被挤出
+                            // 可见区域,这样就永远不需要滚动也能点到。
+                            if (_stabilizeEnabled)
+                              SizedBox(
+                                height: 34,
+                                child: FilledButton.icon(
+                                  style: FilledButton.styleFrom(
+                                    backgroundColor: _stabRunning
+                                        ? Colors.white24
+                                        : Colors.redAccent,
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 12,
+                                    ),
+                                  ),
+                                  onPressed: () {
+                                    if (_recording) {
+                                      lockedHint();
+                                      return;
+                                    }
+                                    _toggleStabFromSheet(setSheetState, ctx);
+                                  },
+                                  icon: Icon(
+                                    _stabRunning
+                                        ? Icons.stop
+                                        : Icons.play_arrow,
+                                    size: 16,
+                                  ),
+                                  label: Text(
+                                    _stabRunning ? '停止' : '开始稳定',
+                                    style: const TextStyle(fontSize: 12),
+                                  ),
+                                ),
+                              ),
+                          ],
                         ),
                         const SizedBox(height: 4),
                         const Text(
@@ -4251,30 +4320,7 @@ class _CameraPageState extends State<CameraPage> {
                                 lockedHint();
                                 return;
                               }
-                              setState(() {
-                                if (_stabRunning) {
-                                  _stabRunning = false;
-                                  _stabOffsetX = 0;
-                                  _stabOffsetY = 0;
-                                } else {
-                                  _onlineStab.reset();
-                                  _stabOffsetX = 0;
-                                  _stabOffsetY = 0;
-                                  // 立刻生效:裁切放大这一帧就位,不等第一个陀螺仪样本
-                                  // (否则会先空等几秒才看到画面被裁切)
-                                  _stabAutoZoom = GyroStabilizer.zoomForMargin(
-                                    _effMargin,
-                                  );
-                                  _stabCorrDeg = 0;
-                                  _stabLog.clear();
-                                  _stabLast = DateTime.now();
-                                  _stabRunning = true;
-                                }
-                              });
-                              // 确保陀螺仪订阅此刻就是活的,避免几秒空档
-                              if (_stabRunning) _startGyroSession();
-                              setSheetState(() {});
-                              if (_stabRunning) Navigator.pop(ctx);
+                              _toggleStabFromSheet(setSheetState, ctx);
                             },
                             icon: Icon(
                               _stabRunning ? Icons.stop : Icons.play_arrow,
