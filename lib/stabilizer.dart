@@ -5,6 +5,11 @@ import 'dart:math' as math;
 /// "转向"的概率略增(误判的后果是画面轻微回中一次)。
 const double kHoldSec = 0.5;
 
+/// 基准泄漏时间常数(秒):陀螺仪零漂会让"锁死的基准"累积成画面漂移,
+/// 用 25 秒的泄漏把漂移缓慢吃掉,同时保留短时间内的锁定手感。
+/// 调小 → 抗漂更强但更容易自己回中;调大 → 更"锁死"但漂移更明显。
+const double kLeakSec = 25.0;
+
 /// 四元数(姿态积分用)
 class Quat {
   final double w, x, y, z;
@@ -213,6 +218,15 @@ class GyroStabilizer {
         final a = 1 - math.exp(-dt / 0.6);
         refX += (rawX[i] - refX) * a;
         refY += (rawY[i] - refY) * a;
+      } else {
+        // 漏积分(关键):陀螺仪有零漂,积分会缓慢累积偏差。
+        // 基准如果"完全锁死",这个漂移就会变成**画面持续往一个方向移动**
+        // (实测表现:成片整体偏上)。
+        // 用一个很长的时间常数慢慢把基准拉向当前姿态 —— 漂移被吃掉,
+        // 而几十秒内的"锁定"感觉仍然保留。
+        final leak = 1 - math.exp(-dt / kLeakSec);
+        refX += (rawX[i] - refX) * leak;
+        refY += (rawY[i] - refY) * leak;
       }
       smX[i] = refX;
       smY[i] = refY;
@@ -370,6 +384,11 @@ class OnlineStabilizer {
       final ab = 1 - math.exp(-dt / 0.6);
       _refX += dX * ab;
       _refY += dY * ab;
+    } else {
+      // 与离线 analyze 完全一致:长泄漏,吃掉陀螺仪零漂
+      final leak = 1 - math.exp(-dt / kLeakSec);
+      _refX += dX * leak;
+      _refY += dY * leak;
     }
     corrX = rv[0] - _refX;
     corrY = rv[1] - _refY;
