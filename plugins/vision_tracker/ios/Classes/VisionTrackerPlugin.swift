@@ -1,4 +1,4 @@
-﻿import Flutter
+import Flutter
 import UIKit
 import Vision
 import CoreGraphics
@@ -583,12 +583,22 @@ public class VisionTrackerPlugin: NSObject, FlutterPlugin {  public static func 
     // 约 7fps(原来 16fps):检测不需要那么快,降频明显减少发热
     if yoloModel != nil, now - yoloLastRun > 0.15 {
       yoloLastRun = now
-      let dets = runYolo(on: cg)
+      // 关键:只把**预览区域**送去检测,而不是整屏。
+      // 整屏里机台只占一小块,模型(训练的是"机台占满画面"的构图)很容易
+      // 完全检不出东西 —— 这正是"录像前有框、录像时没框"的原因。
+      // 裁到区域后喂给模型的就是"相机画面",与录像前的输入一致。
+      let src = cropToRegion(cg) ?? cg
+      let dets = runYolo(on: src)
       var flat: [Double] = []
       for d in dets {
+        // 区域归一化 → 整屏归一化(Dart 侧仍按整屏映射,不用改)
+        let bx = liveRegion.minX + d.box.minX * liveRegion.width
+        let by = liveRegion.minY + d.box.minY * liveRegion.height
+        let bw = d.box.width * liveRegion.width
+        let bh = d.box.height * liveRegion.height
         flat.append(contentsOf: [
-          Double(d.box.minX), Double(d.box.minY),
-          Double(d.box.width), Double(d.box.height),
+          Double(bx), Double(by),
+          Double(bw), Double(bh),
           d.score, Double(d.cls),
         ])
       }
@@ -770,6 +780,21 @@ public class VisionTrackerPlugin: NSObject, FlutterPlugin {  public static func 
         CGRect(x: d[0], y: d[1], width: d[2], height: d[3]), d[4], Int(d[5])))
     }
     return out
+  }
+
+  /// 把抓屏帧裁到预览区域(liveRegion,相对整屏的归一化矩形)。
+  /// 送给 YOLO 的必须是相机画面而不是整屏 —— 否则机台在整屏里太小,
+  /// 模型几乎检不出来,这就是录像中丢框的根因。
+  private func cropToRegion(_ img: CGImage) -> CGImage? {
+    let W = CGFloat(img.width), H = CGFloat(img.height)
+    let r = liveRegion
+    guard r.width > 0.05, r.height > 0.05 else { return nil }
+    let px = CGRect(
+      x: r.minX * W, y: r.minY * H,
+      width: r.width * W, height: r.height * H
+    ).integral
+    guard px.width > 32, px.height > 32 else { return nil }
+    return img.cropping(to: px)
   }
 
   /// 把屏幕帧等比缩到 targetW 宽(保持比例,归一化坐标因此仍然有效)
