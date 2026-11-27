@@ -249,9 +249,13 @@ public class VisionTrackerPlugin: NSObject, FlutterPlugin {  public static func 
           return idx >= 0 && idx < arr.count ? p[idx] : 0
         }
         var best = 0.0
+        var bestCls = 0
         for c in 4..<ch {
           let s = val(c)
-          if s > best { best = s }
+          if s > best {
+            best = s
+            bestCls = c - 4
+          }
         }
         if best < threshold { continue }
         let cx = val(0) / inW
@@ -259,7 +263,7 @@ public class VisionTrackerPlugin: NSObject, FlutterPlugin {  public static func 
         let bw = val(2) / inW
         let bh = val(3) / inH
         if bw <= 0 || bh <= 0 { continue }
-        cands.append([cx - bw / 2, cy - bh / 2, bw, bh, best, 0])
+        cands.append([cx - bw / 2, cy - bh / 2, bw, bh, best, Double(bestCls)])
       }
     } else {
       let p = arr.dataPointer.bindMemory(to: Float.self, capacity: arr.count)
@@ -269,9 +273,13 @@ public class VisionTrackerPlugin: NSObject, FlutterPlugin {  public static func 
           return idx >= 0 && idx < arr.count ? Double(p[idx]) : 0
         }
         var best = 0.0
+        var bestCls = 0
         for c in 4..<ch {
           let s = val(c)
-          if s > best { best = s }
+          if s > best {
+            best = s
+            bestCls = c - 4
+          }
         }
         if best < threshold { continue }
         let cx = val(0) / inW
@@ -279,7 +287,7 @@ public class VisionTrackerPlugin: NSObject, FlutterPlugin {  public static func 
         let bw = val(2) / inW
         let bh = val(3) / inH
         if bw <= 0 || bh <= 0 { continue }
-        cands.append([cx - bw / 2, cy - bh / 2, bw, bh, best, 0])
+        cands.append([cx - bw / 2, cy - bh / 2, bw, bh, best, Double(bestCls)])
       }
     }
     // NMS(IoU > 0.45 抑制)
@@ -287,7 +295,9 @@ public class VisionTrackerPlugin: NSObject, FlutterPlugin {  public static func 
     var kept: [[Double]] = []
     for c in cands {
       var dup = false
-      for k in kept where iouNorm(k, c) > 0.45 {
+      // NMS 必须**分类别**:bound 与 screen 的框几乎完全重叠(IoU 常 >0.8),
+      // 跨类别抑制会把 screen 整个吃掉 —— 表现就是「只识别 bound」。
+      for k in kept where k[5] == c[5] && iouNorm(k, c) > 0.5 {
         dup = true
         break
       }
@@ -693,9 +703,13 @@ public class VisionTrackerPlugin: NSObject, FlutterPlugin {  public static func 
         return idx >= 0 && idx < count ? Double(p[idx]) : 0
       }
       var best = 0.0
+      var bestCls = 0
       for c in 4..<ch {
         let s = val(c)
-        if s > best { best = s }
+        if s > best {
+          best = s
+          bestCls = c - 4
+        }
       }
       if best < threshold { continue }
       let cx = val(0) / inW
@@ -703,13 +717,15 @@ public class VisionTrackerPlugin: NSObject, FlutterPlugin {  public static func 
       let bw = val(2) / inW
       let bh = val(3) / inH
       if bw <= 0 || bh <= 0 { continue }
-      cands.append([cx - bw / 2, cy - bh / 2, bw, bh, best, 0])
+      cands.append([cx - bw / 2, cy - bh / 2, bw, bh, best, Double(bestCls)])
     }
     cands.sort { $0[4] > $1[4] }
     var kept: [[Double]] = []
     for c in cands {
       var dup = false
-      for k in kept where iouNorm(k, c) > 0.45 {
+      // NMS 必须**分类别**:bound 与 screen 的框几乎完全重叠(IoU 常 >0.8),
+      // 跨类别抑制会把 screen 整个吃掉 —— 表现就是「只识别 bound」。
+      for k in kept where k[5] == c[5] && iouNorm(k, c) > 0.5 {
         dup = true
         break
       }
