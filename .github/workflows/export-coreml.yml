@@ -1,0 +1,59 @@
+name: export-coreml
+# 在 GitHub 的 macOS runner 上把 models/best.pt 转成 Core ML(.mlmodelc),
+# 打包后发布到 Release,供手机端下载安装。
+# 为什么用 macOS runner:coremltools 与 xcrun coremlcompiler 只有 macOS 能用。
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  export:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # ultralytics 负责读 .pt 并导出;coremltools 是导出后端;onnx 是中间格式
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ultralytics coremltools onnx
+
+      - name: 导出 Core ML
+        run: |
+          cd models
+          yolo export model=best.pt format=coreml imgsz=640
+          echo "--- 产物 ---"
+          ls -la
+
+      # 导出结果是 .mlpackage(目录)。编译成 .mlmodelc 后 App 加载更快,
+      # 而且我们的插件对两者都支持(见 VisionTrackerPlugin.loadYoloModel)。
+      - name: 编译为 mlmodelc
+        run: |
+          cd models
+          PKG=$(ls -d *.mlpackage | head -1)
+          echo "编译 $PKG"
+          xcrun coremlcompiler compile "$PKG" out
+          ls -la out
+
+      - name: 打包
+        run: |
+          cd models
+          mkdir -p bundle
+          cp -r out/*.mlmodelc bundle/
+          cd bundle
+          zip -r ../best-coreml.zip .
+
+      - name: 发布到 Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view tools >/dev/null 2>&1 || gh release create tools \
+            --title "导出产物" --notes "模型等转换产物"
+          gh release upload tools models/best-coreml.zip --clobber
+          echo "下载地址: https://github.com/${{ github.repository }}/releases/download/tools/best-coreml.zip"
