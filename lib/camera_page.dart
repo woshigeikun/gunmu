@@ -10,6 +10,7 @@ import 'package:ffmpeg_kit_flutter_new/ffmpeg_kit.dart';
 import 'package:ffmpeg_kit_flutter_new/ffprobe_kit.dart';
 import 'package:ffmpeg_kit_flutter_new/return_code.dart';
 import 'package:flutter/foundation.dart' show kIsWeb;
+import 'package:flutter/scheduler.dart';
 import 'package:flutter/material.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
@@ -320,6 +321,18 @@ class _CameraPageState extends State<CameraPage> {
   @override
   void initState() {
     super.initState();
+    // 界面帧率统计(性能 HUD 用):用系统帧时序回调,不额外占 render 循环。
+    SchedulerBinding.instance.addTimingsCallback((timings) {
+      if (timings.isEmpty) return;
+      _fpsFrames += timings.length;
+      final ms = DateTime.now().difference(_fpsWindow).inMilliseconds;
+      if (ms >= 1000) {
+        _uiFps = _fpsFrames * 1000 / ms;
+        _fpsFrames = 0;
+        _fpsWindow = DateTime.now();
+        if (_perfHud && mounted) setState(() {});
+      }
+    });
     _initCamera();
     _loadExports(); // 启动时载入已有作品
     // 启动就清一次临时文件:导出中途失败/被杀掉会留下几百 MB 的抽帧文件,
@@ -1049,6 +1062,27 @@ class _CameraPageState extends State<CameraPage> {
                         );
                       }).toList(),
                     ),
+                    const SizedBox(height: 8),
+                    // 性能/温度 HUD:屏幕上方以 50% 透明度显示温度状态、
+                    // 界面帧率、电量与陀螺仪频率,用来判断手机是否在吃力。
+                    SwitchListTile(
+                      contentPadding: EdgeInsets.zero,
+                      value: _perfHud,
+                      activeThumbColor: Colors.redAccent,
+                      title: const Text(
+                        '显示性能/温度',
+                        style: TextStyle(color: Colors.white, fontSize: 15),
+                      ),
+                      subtitle: const Text(
+                        '屏幕上方 50% 透明悬浮:温度状态 · 帧率 · 电量 · 陀螺仪',
+                        style: TextStyle(color: Colors.white38, fontSize: 11),
+                      ),
+                      onChanged: (v) {
+                        setState(() => _perfHud = v);
+                        setSheetState(() {});
+                        if (v) _startPerfPolling();
+                      },
+                    ),
                     const SizedBox(height: 20),
                     const Text(
                       '修改后需要重新启动相机预览生效。若设备不支持所选组合,将自动回退到 高清/30fps。',
@@ -1565,6 +1599,33 @@ class _CameraPageState extends State<CameraPage> {
 
   /// 最近一次检出的最高分数(诊断显示用)
   double _yoloBest = 0;
+
+  // ── 性能/温度 HUD(设置里可开关,屏幕上方 50% 透明度显示)──
+  bool _perfHud = false; // ignore: prefer_final_fields
+  Timer? _perfTimer;
+  int _perfThermal = 0; // 0=正常 1=偏热 2=热 3=很热
+  int _perfBattery = -1;
+  bool _perfCharging = false;
+  double _uiFps = 0;
+  int _fpsFrames = 0;
+  DateTime _fpsWindow = DateTime.now();
+
+  void _startPerfPolling() {
+    _perfTimer?.cancel();
+    _perfTimer = Timer.periodic(const Duration(seconds: 3), (_) async {
+      final r = await VisionTracker.perfInfo();
+      if (!mounted || r.isEmpty) return;
+      setState(() {
+        _perfThermal = (r['thermal'] ?? 0).toInt();
+        _perfBattery = (r['battery'] ?? -1).toInt();
+        _perfCharging = (r['charging'] ?? 0) == 1;
+      });
+    });
+  }
+
+  /// 文字追踪(检查点重识别 + 数字跟踪)开关:默认关闭。
+  /// 用户反馈识别率不行且导出慢,现在只走实时轨迹(YOLO)+ 纯陀螺仪。
+  bool _textTrackOn = false; // ignore: prefer_final_fields
 
   /// 是否加载了 YOLO 模型(决定录像前是否跑预览检测)
   bool get _yoloOn => _yoloStatus.startsWith('已加载');
@@ -2476,11 +2537,14 @@ class _CameraPageState extends State<CameraPage> {
     // 成片帧),那就完全不需要这一步 —— 省掉整段 OCR,导出明显变快。
     // 只要录制期间拿到了视觉轨迹就跳过检查点重识别;
     // 不再要求用户画框 —— YOLO 检出的目标同样会被记进轨迹。
+    // 文字追踪(检查点重识别 + 数字跟踪)已关闭:
+    // 用户反馈识别率不行、而且导出很慢。现在只走
+    //   ① 录制期间的实时轨迹(YOLO 检出的目标) ② 纯陀螺仪
     final bool useLiveTrack = liveTrack.length >= 20;
     List<List<double>>? anchors;
     var effBox = lockBox;
     var ckInfo = useLiveTrack ? '实时抓屏轨迹 ${liveTrack.length} 点' : '';
-    if (!useLiveTrack && plan != null && plan.usable) {
+    if (_textTrackOn && !useLiveTrack && plan != null && plan.usable) {
       job
         ..stage = '检查点重新识别…'
         ..progress = 0.02;
@@ -2548,7 +2612,7 @@ class _CameraPageState extends State<CameraPage> {
     if (useLiveTrack) {
       // 直接用实时轨迹,跳过"后期跟踪 + 锚点重捕获"
       lockXY = liveTrack.map((e) => <double>[e[0], e[1], e[2]]).toList();
-    } else if (effBox != null && plan != null && plan.usable) {
+    } else if (_textTrackOn && effBox != null && plan != null && plan.usable) {
       job
         ..stage = '画面识别(目标锁定)…'
         ..progress = 0.02;
@@ -4979,6 +5043,67 @@ class _CameraPageState extends State<CameraPage> {
                     decoration: BoxDecoration(
                       border: Border.all(color: Colors.cyanAccent, width: 2),
                       borderRadius: BorderRadius.circular(4),
+                    ),
+                  ),
+                ),
+              ),
+
+            // ── 性能/温度 HUD(屏幕上方,50% 透明度)──
+            if (_perfHud && !_liveMode)
+              Positioned(
+                top: topPad + 52,
+                left: isLandscape ? 24 : 16,
+                child: IgnorePointer(
+                  child: Opacity(
+                    opacity: 0.5,
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 10,
+                        vertical: 6,
+                      ),
+                      decoration: BoxDecoration(
+                        color: Colors.black,
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Text(
+                            '温度 ${const ['正常', '偏热', '热', '很热'][_perfThermal >= 0 && _perfThermal <= 3 ? _perfThermal : 0]}',
+                            style: TextStyle(
+                              color: _perfThermal >= 2
+                                  ? Colors.orangeAccent
+                                  : Colors.white,
+                              fontSize: 11,
+                            ),
+                          ),
+                          Text(
+                            '帧率 ${_uiFps.toStringAsFixed(0)}'
+                            '${_uiFps > 0 && _uiFps < 40 ? '(降频)' : ''}',
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 11,
+                            ),
+                          ),
+                          Text(
+                            _perfBattery < 0
+                                ? '电量 --'
+                                : '电量 $_perfBattery%${_perfCharging ? ' 充电中' : ''}',
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 11,
+                            ),
+                          ),
+                          Text(
+                            '陀螺仪 ${_gyroHz.toStringAsFixed(0)}Hz',
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 11,
+                            ),
+                          ),
+                        ],
+                      ),
                     ),
                   ),
                 ),
