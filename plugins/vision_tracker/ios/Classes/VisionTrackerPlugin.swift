@@ -1,4 +1,4 @@
-import Flutter
+﻿import Flutter
 import UIKit
 import Vision
 import CoreGraphics
@@ -18,6 +18,11 @@ import onnxruntime_objc
 ///
 /// 坐标系注意:Vision 的 boundingBox 是**归一化且原点在左下角**,
 /// 而入参给出的框是"跟踪帧像素、原点左上角",两边要互相换算。
+/// 两个重负载开关:出问题时可以单独恢复,而不用翻代码
+/// (视觉跟踪 + 背景光流都已停用 —— 用户反馈发烫,且收益不达预期)
+let kLiveVisionOn = false
+let kLiveFlowOn = false
+
 public class VisionTrackerPlugin: NSObject, FlutterPlugin {  public static func register(with registrar: FlutterPluginRegistrar) {
     let channel = FlutterMethodChannel(
       name: "vision_tracker", binaryMessenger: registrar.messenger())
@@ -52,6 +57,8 @@ public class VisionTrackerPlugin: NSObject, FlutterPlugin {  public static func 
       result(loadYoloModel(call))
     case "detectYolo":
       handleDetectYolo(call, result: result)
+    case "perfInfo":
+      result(perfInfo())
     default:
       result(FlutterMethodNotImplemented)
     }
@@ -500,7 +507,10 @@ public class VisionTrackerPlugin: NSObject, FlutterPlugin {  public static func 
     var trackingRan = false
 
     // ── ① 手画框的 Vision 跟踪(没有画框时整段跳过,YOLO 仍可独立工作)──
-    if let req = liveRequest, let handler = liveHandler {
+    // 【已关闭】用户反馈发热严重:视觉跟踪 + 背景光流是最大的两处负载
+    // (60fps 抓屏下每帧 10~20ms),而实际收益不达预期。改成只跑 YOLO。
+    // 保留开关常量,想恢复只改这一处。
+    if kLiveVisionOn, let req = liveRequest, let handler = liveHandler {
       trackingRan = true
       do {
         try handler.perform([req], on: cg)
@@ -549,12 +559,10 @@ public class VisionTrackerPlugin: NSObject, FlutterPlugin {  public static func 
 
     var payload = fromScreenVision(box)
     payload["c"] = conf
-    // ── 背景光流:估算整幅画面的主运动(静止背景的主导位移) ──
-    // 这一路是给"没有判定线/环形判定"的音游(如舞萌DX)用的:
-    // 不认任何具体元素,只把"静止的东西"稳住。
-    // 每次抓屏都算,开销低(在 480 宽上做),结果连同置信度一起回传,
-    // 让 Dart 侧能直接看到"这一帧的光流可不可信"。
-    if let prev = livePrev {
+    // ── 背景光流【已关闭】──
+    // 原本每帧(60fps)算一次稠密光流,是最贵的负载之一(10~20ms/帧),
+    // 而且只用于诊断、没有参与稳定。用户反馈发烫后停用。
+    if kLiveFlowOn, let prev = livePrev {
       let (fx, fy, fc) = dominantFlow(from: prev, to: cg)
       payload["fx"] = fx
       payload["fy"] = fy
@@ -572,7 +580,8 @@ public class VisionTrackerPlugin: NSObject, FlutterPlugin {  public static func 
     // ── ② YOLO:加载了模型就在抓屏帧上跑检测,把框推给 Dart 实时绘制 ──
     // 节流到每 2 帧一次(约 30fps 抓屏 → 15fps 检测),省电且够用;
     // 检测坐标是"相对整屏"的归一化值,Dart 侧再换算到预览控件坐标。
-    if yoloModel != nil, now - yoloLastRun > 0.06 {
+    // 约 7fps(原来 16fps):检测不需要那么快,降频明显减少发热
+    if yoloModel != nil, now - yoloLastRun > 0.15 {
       yoloLastRun = now
       let dets = runYolo(on: cg)
       var flat: [Double] = []
@@ -588,6 +597,29 @@ public class VisionTrackerPlugin: NSObject, FlutterPlugin {  public static func 
     DispatchQueue.main.async { [weak self] in
       self?.liveSink?(payload)
     }
+  }
+
+  /// 性能/温度信息:thermal 0=正常 1=偏热 2=热 3=很热;battery 0~100;
+  /// charging 充电中=1。iOS 没有公开的电池温度 API,
+  /// ProcessInfo.thermalState 是系统给出的、最接近「热不热」的信号。
+  private func perfInfo() -> [String: Any] {
+    var t = 0
+    switch ProcessInfo.processInfo.thermalState {
+    case .nominal: t = 0
+    case .fair: t = 1
+    case .serious: t = 2
+    case .critical: t = 3
+    @unknown default: t = 0
+    }
+    UIDevice.current.isBatteryMonitoringEnabled = true
+    let lvl = Int((UIDevice.current.batteryLevel * 100).rounded())
+    let st = UIDevice.current.batteryState
+    let charging = (st == .charging || st == .full) ? 1.0 : 0.0
+    return [
+      "thermal": t,
+      "battery": lvl < 0 ? 0 : lvl,
+      "charging": charging,
+    ]
   }
 
   private var yoloLastRun: CFAbsoluteTime = 0
