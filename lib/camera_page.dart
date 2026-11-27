@@ -5102,6 +5102,16 @@ class _CameraPageState extends State<CameraPage> {
                               fontSize: 11,
                             ),
                           ),
+                          // 录像中 YOLO 的检出数:直接反映"抓屏那一路有没有在工作"
+                          Text(
+                            'YOLO ${_yoloBoxes.length}'
+                            '${_yoloBest > 0 ? ' (${_yoloBest.toStringAsFixed(2)})' : ''}'
+                            ' · 抓屏 ${_liveSub != null ? '开' : '关'}',
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 11,
+                            ),
+                          ),
                         ],
                       ),
                     ),
