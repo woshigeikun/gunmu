@@ -72,6 +72,20 @@ class VisionTracker {
     } catch (_) {}
   }
 
+  /// 性能/温度信息:{'thermal': 0..3, 'battery': 0..100, 'charging': 0/1}
+  /// thermal:0=正常 1=偏热 2=热 3=很热(iOS 无公开电池温度接口,
+  /// 用 ProcessInfo.thermalState 表示系统的热压力)
+  static Future<Map<String, double>> perfInfo() async {
+    if (!isSupported) return const {};
+    try {
+      final raw = await _ch.invokeMethod<Map<dynamic, dynamic>>('perfInfo');
+      if (raw == null) return const {};
+      return raw.map((k, v) => MapEntry(k.toString(), (v as num).toDouble()));
+    } catch (_) {
+      return const {};
+    }
+  }
+
   /// 列出 Documents 目录里可导入的 YOLO 模型(.mlmodelc / .mlpackage / .mlmodel)
   static Future<List<Map<String, String>>> listYoloModels() async {
     if (!isSupported) return const [];
